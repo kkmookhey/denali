@@ -57,6 +57,9 @@ def client() -> TestClient:
 
 def test_inventory_surface() -> None:
     with client() as test_client:
+        assert test_client.get("/", follow_redirects=False).headers["location"] == (
+            "http://127.0.0.1:3080"
+        )
         assert test_client.get("/healthz").json()["status"] == "ready"
         assert test_client.get("/v1/inventory/summary").json()["total"] == 1
         rows = test_client.get("/v1/inventory/assets?kind=ai_agent").json()["items"]

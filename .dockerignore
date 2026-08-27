@@ -6,3 +6,6 @@ __pycache__
 *.pyc
 tests
 docs
+web/node_modules
+web/dist
+web/*.tsbuildinfo

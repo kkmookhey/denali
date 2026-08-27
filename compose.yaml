@@ -22,11 +22,36 @@ services:
     environment:
       DENALI_DSN: postgresql://denali:denali-local@postgres:5432/denali
       DENALI_TENANT_ID: 00000000-0000-4000-8000-000000000001
+      DENALI_WEB_URL: http://127.0.0.1:3080
     ports:
       - "8088:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')
+      interval: 3s
+      timeout: 3s
+      retries: 20
     depends_on:
       postgres:
         condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    ports:
+      - "3080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
 volumes:
   denali-postgres:

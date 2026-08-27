@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from denali.store.db import migrate
@@ -87,6 +88,10 @@ def create_app(
         allow_methods=["GET", "PATCH", "OPTIONS"],
         allow_headers=["Content-Type"],
     )
+
+    @app.get("/", include_in_schema=False)
+    def web_application() -> RedirectResponse:
+        return RedirectResponse(os.environ.get("DENALI_WEB_URL", "http://127.0.0.1:3080"))
 
     @app.get("/healthz")
     def health(request: Request) -> dict[str, str]:

@@ -44,9 +44,10 @@ docker compose up -d --build
 DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali denali-demo-seed
 ```
 
-The API is then available at <http://127.0.0.1:8088>, with interactive documentation at
-<http://127.0.0.1:8088/docs>. The local stack deliberately uses ports `8088` and `55450`
-to avoid colliding with the earlier CISOBrief development environment.
+The Denali web application is then available at <http://127.0.0.1:3080>. The API
+remains available at <http://127.0.0.1:8088>, with interactive documentation at
+<http://127.0.0.1:8088/docs>. The local stack deliberately uses ports `3080`, `8088`,
+and `55450` to avoid colliding with the earlier CISOBrief development environment.
 
 Run the fast suite and the explicit Postgres contract gate with:
 
