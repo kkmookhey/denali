@@ -49,6 +49,19 @@ remains available at <http://127.0.0.1:8088>, with interactive documentation at
 <http://127.0.0.1:8088/docs>. The local stack deliberately uses ports `3080`, `8088`,
 and `55450` to avoid colliding with the earlier CISOBrief development environment.
 
+Scan a source repository into Denali with the first-party repository connector:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-repo-scan /path/to/repository --app-id your-application
+```
+
+The connector discovers AI frameworks, model-provider references, MCP servers, and MCP
+tools without executing repository code. It excludes tests, fixtures, generated or
+vendored directories, and symlinked source files. Evidence snippets are secret-redacted;
+read or parse failures mark coverage partial so an incomplete scan cannot withdraw
+previously observed assets.
+
 Run the fast suite and the explicit Postgres contract gate with:
 
 ```bash
@@ -58,8 +71,7 @@ DENALI_TEST_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
 ```
 
 The fast suite skips rather than disguises the Postgres integration tests when
-`DENALI_TEST_DSN` is absent. The independent web application is the next vertical
-slice.
+`DENALI_TEST_DSN` is absent.
 
 ## Principles
 

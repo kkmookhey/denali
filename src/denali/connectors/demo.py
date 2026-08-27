@@ -141,3 +141,7 @@ def _evidence(observed_at: datetime, locator: str) -> Evidence:
         observed_at=observed_at,
         payload={"fixture": True, "scenario": "inventory-preview"},
     )
+
+
+if __name__ == "__main__":
+    seed_main()

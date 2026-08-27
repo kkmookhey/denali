@@ -88,6 +88,7 @@ class RelationshipKind(StrEnum):
     PROTECTED_BY = "protected_by"
     TRAINS_ON = "trains_on"
     CONNECTS_TO = "connects_to"
+    EXPOSES = "exposes"
 
     @property
     def category(self) -> RelationshipCategory:

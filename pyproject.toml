@@ -14,6 +14,7 @@ dependencies = []
 [project.scripts]
 denali-db-migrate = "denali.store.cli:migrate_main"
 denali-demo-seed = "denali.connectors.demo:seed_main"
+denali-repo-scan = "denali.connectors.repository:scan_main"
 
 [project.optional-dependencies]
 api = [
