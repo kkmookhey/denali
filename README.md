@@ -39,7 +39,7 @@ Requires Python 3.11 or newer and Docker for the runnable stack.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[api,dev]'
+python -m pip install -e '.[api,aws,dev]'
 docker compose up -d --build
 DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali denali-demo-seed
 ```
@@ -73,6 +73,29 @@ For authenticated servers, place the bearer token in `DENALI_MCP_BEARER_TOKEN`; 
 never accepts it as a command-line value or writes it to evidence. The observer performs
 MCP initialization and paginated `tools/list` only. Cleartext HTTP is restricted to
 loopback hosts unless explicitly overridden.
+
+Discover native AWS Bedrock inventory using the normal AWS credential chain or a named
+profile:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-aws-scan --regions us-east-1,us-west-2 --profile security-audit
+```
+
+The phase-one AWS connector uses read-only `ListAgents`, `GetAgent`, `ListGuardrails`,
+and `GetGuardrail` calls. It discovers agents, their referenced foundation models,
+execution roles, guardrails, and the evidence-backed relationships between them. Each
+region and API family has an independent coverage boundary, so a failed guardrail read
+cannot erase agents and a partial scan cannot withdraw prior inventory. "Complete"
+means complete within the AWS principal's visibility; Denali cannot prove that an IAM
+policy did not filter resources outside that visibility. Grant `bedrock:ListAgents`,
+`bedrock:GetAgent`, `bedrock:ListGuardrails`, and `bedrock:GetGuardrail` in every region
+you intend to scan.
+
+Raw agent instructions, guardrail blocked messages, topic names, and regex patterns are
+not persisted. Denali stores configuration presence, normalized policy types and counts,
+and an instruction hash and length so posture can be evaluated without copying sensitive
+prompt content.
 
 Run the fast suite and the explicit Postgres contract gate with:
 
