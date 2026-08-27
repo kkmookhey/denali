@@ -62,6 +62,18 @@ vendored directories, and symlinked source files. Evidence snippets are secret-r
 read or parse failures mark coverage partial so an incomplete scan cannot withdraw
 previously observed assets.
 
+Observe a running MCP Streamable HTTP server without invoking any tools:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-mcp-observe https://mcp.example.com/mcp --app-id your-application
+```
+
+For authenticated servers, place the bearer token in `DENALI_MCP_BEARER_TOKEN`; Denali
+never accepts it as a command-line value or writes it to evidence. The observer performs
+MCP initialization and paginated `tools/list` only. Cleartext HTTP is restricted to
+loopback hosts unless explicitly overridden.
+
 Run the fast suite and the explicit Postgres contract gate with:
 
 ```bash

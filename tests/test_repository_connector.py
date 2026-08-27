@@ -156,3 +156,20 @@ def test_symlinked_sources_are_not_followed(tmp_path: Path) -> None:
 
     assert not any(item.asset.kind is AssetKind.AI_MODEL for item in batch.assets)
     outside.unlink()
+
+
+def test_colliding_declared_tool_names_make_coverage_partial(tmp_path: Path) -> None:
+    (tmp_path / "server.py").write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('files')\n"
+        "@mcp.tool(name='read-file')\n"
+        "def first(): pass\n"
+        "@mcp.tool(name='read_file')\n"
+        "def second(): pass\n"
+    )
+
+    batch = RepositoryConnector(tmp_path, repository_name="local:collisions").collect()
+
+    assert {item.state for item in batch.coverage} == {CoverageState.PARTIAL}
+    assert not batch.may_withdraw(INVENTORY_PLANE)
+    assert "collide as" in (batch.coverage[0].detail or "")

@@ -115,6 +115,10 @@ class ToolDeclaration:
     line: int
 
 
+class CanonicalIdentityCollision(ValueError):
+    """Two distinct source objects would otherwise become one Denali asset."""
+
+
 class RepositoryConnector:
     connector_id = CONNECTOR_ID
     capabilities = CAPABILITIES
@@ -184,9 +188,12 @@ class RepositoryConnector:
                 self._discover_frameworks(
                     tree, text, relative, observed_at, repo_ref, assets, relationships
                 )
-                self._discover_mcp_python(
-                    tree, text, relative, observed_at, repo_ref, assets, relationships
-                )
+                try:
+                    self._discover_mcp_python(
+                        tree, text, relative, observed_at, repo_ref, assets, relationships
+                    )
+                except CanonicalIdentityCollision as error:
+                    warnings.append(f"{relative}: {error}")
             self._discover_models(text, relative, observed_at, repo_ref, assets, relationships)
 
         for config_file in _mcp_config_files(self.root):
@@ -197,9 +204,12 @@ class RepositoryConnector:
             except (OSError, json.JSONDecodeError) as error:
                 warnings.append(f"{relative}: {error.__class__.__name__}")
                 continue
-            self._discover_mcp_config(
-                parsed, text, relative, observed_at, repo_ref, assets, relationships
-            )
+            try:
+                self._discover_mcp_config(
+                    parsed, text, relative, observed_at, repo_ref, assets, relationships
+                )
+            except CanonicalIdentityCollision as error:
+                warnings.append(f"{relative}: {error}")
 
         coverage_state = CoverageState.PARTIAL if warnings else CoverageState.COMPLETE
         detail = "; ".join(warnings[:10]) if warnings else None
@@ -517,6 +527,16 @@ class RepositoryConnector:
         attributes: dict[str, Any],
         detector: str,
     ) -> None:
+        existing = assets.get(asset_ref)
+        if (
+            existing is not None
+            and asset_ref.kind in {AssetKind.MCP_SERVER, AssetKind.AI_TOOL}
+            and existing.display_name != display_name
+        ):
+            raise CanonicalIdentityCollision(
+                f"{existing.display_name!r} and {display_name!r} collide as "
+                f"{asset_ref.natural_key!r}"
+            )
         assets.setdefault(
             asset_ref,
             AssetAssertion(
