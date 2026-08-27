@@ -27,22 +27,38 @@ This repository is intentionally new. Proven first-party components will be impo
 from the CISOBrief history only after they conform to Denali's standalone contracts.
 Shasta infrastructure and Prowler UI patches will not be carried forward.
 
-The foundation currently contains the canonical inventory and connector contracts plus
-tests for the invariants that prior work established.
+The foundation currently contains the canonical inventory and connector contracts, a
+Postgres assertion store, and the first read/write inventory API. A transparent demo
+connector provides fixture data for local product development; every fixture assertion
+is visibly identified as such in its evidence.
 
 ## Development
 
-Requires Python 3.11 or newer.
+Requires Python 3.11 or newer and Docker for the runnable stack.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
-pytest
+python -m pip install -e '.[api,dev]'
+docker compose up -d --build
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali denali-demo-seed
 ```
 
-No external service is needed for the domain tests. The runnable API, Postgres store,
-and independent web application are the next vertical slice.
+The API is then available at <http://127.0.0.1:8088>, with interactive documentation at
+<http://127.0.0.1:8088/docs>. The local stack deliberately uses ports `8088` and `55450`
+to avoid colliding with the earlier CISOBrief development environment.
+
+Run the fast suite and the explicit Postgres contract gate with:
+
+```bash
+pytest
+DENALI_TEST_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  pytest -q tests/test_inventory_postgres.py
+```
+
+The fast suite skips rather than disguises the Postgres integration tests when
+`DENALI_TEST_DSN` is absent. The independent web application is the next vertical
+slice.
 
 ## Principles
 
@@ -59,4 +75,3 @@ and independent web application are the next vertical slice.
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).
-

@@ -30,6 +30,7 @@ def evidence() -> Evidence:
 def agent() -> AssetAssertion:
     return AssetAssertion(
         asset=AssetRef(AssetKind.AI_AGENT, "aws:123:us-east-1:agent-1"),
+        coverage_plane="agents",
         display_name="Agent One",
         assertion_type=AssertionType.EXTERNALLY_VERIFIED,
         confidence=1.0,
@@ -85,6 +86,7 @@ def test_capability_and_influence_are_different_categories() -> None:
     capability = RelationshipAssertion(
         source=agent_ref,
         target=tool_ref,
+        coverage_plane="capabilities",
         kind=RelationshipKind.CAN_INVOKE,
         assertion_type=AssertionType.DECLARED,
         confidence=0.9,
@@ -94,6 +96,7 @@ def test_capability_and_influence_are_different_categories() -> None:
     influence = RelationshipAssertion(
         source=tool_ref,
         target=agent_ref,
+        coverage_plane="capabilities",
         kind=RelationshipKind.INFLUENCES,
         assertion_type=AssertionType.INFERRED,
         confidence=0.7,
@@ -111,6 +114,7 @@ def test_principal_ref_cannot_be_an_agent() -> None:
         RelationshipAssertion(
             source=agent_ref,
             target=tool_ref,
+            coverage_plane="capabilities",
             kind=RelationshipKind.CAN_INVOKE,
             assertion_type=AssertionType.DECLARED,
             confidence=1.0,
@@ -128,6 +132,7 @@ def test_conflicting_duplicate_assertions_are_rejected() -> None:
     first = agent()
     second = AssetAssertion(
         asset=first.asset,
+        coverage_plane=first.coverage_plane,
         display_name="Contradictory Name",
         assertion_type=first.assertion_type,
         confidence=first.confidence,
@@ -144,3 +149,15 @@ def test_conflicting_duplicate_assertions_are_rejected() -> None:
             assets=(first, second),
         )
 
+
+def test_assertion_plane_must_have_a_coverage_declaration() -> None:
+    with pytest.raises(ValueError, match="did not declare: agents"):
+        InventoryBatch(
+            connector_id="aws",
+            connection_id="connection-1",
+            run_id="run-1",
+            scope_key="us-east-1",
+            collected_at=datetime.now(UTC),
+            coverage=(Coverage("guardrails", CoverageState.COMPLETE, "us-east-1"),),
+            assets=(agent(),),
+        )

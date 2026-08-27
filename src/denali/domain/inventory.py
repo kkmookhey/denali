@@ -146,6 +146,7 @@ class Evidence:
 @dataclass(frozen=True, slots=True)
 class AssetAssertion:
     asset: AssetRef
+    coverage_plane: str
     display_name: str
     assertion_type: AssertionType
     confidence: float
@@ -154,6 +155,8 @@ class AssetAssertion:
     lifecycle: LifecycleState = LifecycleState.ACTIVE
 
     def __post_init__(self) -> None:
+        if not self.coverage_plane.strip():
+            raise ValueError("asset coverage_plane must be non-empty")
         if not self.display_name.strip():
             raise ValueError("asset display_name must be non-empty")
         _validate_confidence(self.confidence)
@@ -164,6 +167,7 @@ class AssetAssertion:
 class RelationshipAssertion:
     source: AssetRef
     target: AssetRef
+    coverage_plane: str
     kind: RelationshipKind
     assertion_type: AssertionType
     confidence: float
@@ -173,6 +177,8 @@ class RelationshipAssertion:
     agent_ref: AssetRef | None = None
 
     def __post_init__(self) -> None:
+        if not self.coverage_plane.strip():
+            raise ValueError("relationship coverage_plane must be non-empty")
         if self.source == self.target:
             raise ValueError("relationship source and target must differ")
         _validate_confidence(self.confidence)
@@ -251,6 +257,17 @@ class InventoryBatch:
             raise ValueError("collected_at must be timezone-aware")
         if not self.coverage:
             raise ValueError("inventory batches must state coverage")
+        declared_planes = {item.plane for item in self.coverage}
+        assertion_planes = {
+            *(item.coverage_plane for item in self.assets),
+            *(item.coverage_plane for item in self.relationships),
+        }
+        undeclared = assertion_planes - declared_planes
+        if undeclared:
+            raise ValueError(
+                "assertions use coverage planes the batch did not declare: "
+                + ", ".join(sorted(undeclared))
+            )
         _reject_conflicting_duplicates(self.assets)
 
     def may_withdraw(self, plane: str) -> bool:
