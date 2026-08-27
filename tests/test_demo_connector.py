@@ -46,3 +46,8 @@ def test_demo_findings_are_explicit_and_authoritative_fixture_evidence() -> None
     }
     assert all(finding.evidence.payload["fixture"] is True for finding in batch.findings)
     assert all(finding.affected_resources for finding in batch.findings)
+    assert {finding.attributes["denali_signal"] for finding in batch.findings} == {
+        "identity.overprivileged",
+        "tool.write_without_confirmation",
+        "guardrail.output_unverified",
+    }

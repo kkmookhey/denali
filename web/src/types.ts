@@ -152,3 +152,83 @@ export type FindingSummary = {
   by_state: Record<string, number>;
   open_by_severity: Record<string, number>;
 };
+
+export type IssueState = "open" | "resolved" | "unknown";
+
+export type Issue = {
+  id: string;
+  correlation_key: string;
+  rule_uid: string;
+  title: string;
+  description: string;
+  risk: string;
+  remediation: string;
+  severity: FindingSeverity;
+  state: IssueState;
+  confidence: number;
+  attributes: Record<string, unknown>;
+  resolution_reason: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_changed_at: string;
+  last_evaluated_at: string;
+  finding_count: number;
+  asset_count: number;
+};
+
+export type IssueFinding = {
+  id: string;
+  rule_uid: string;
+  title: string;
+  severity: FindingSeverity;
+  state: FindingState;
+  evidence: Evidence;
+  role: string;
+};
+
+export type IssuePathNode = {
+  position: number;
+  role: string;
+  id: string;
+  kind: string;
+  natural_key: string;
+  display_name: string;
+  assertion_type: string;
+  confidence: number;
+  evidence: Evidence;
+};
+
+export type IssuePathEdge = {
+  position: number;
+  id: string;
+  kind: string;
+  category: string;
+  assertion_type: string;
+  confidence: number;
+  evidence: Evidence;
+  withdrawn_at: string | null;
+  source_id: string;
+  target_id: string;
+};
+
+export type IssueDetail = Issue & {
+  findings: IssueFinding[];
+  path_nodes: IssuePathNode[];
+  path_edges: IssuePathEdge[];
+};
+
+export type IssueSummary = {
+  total: number;
+  by_state: Record<string, number>;
+  open_by_severity: Record<string, number>;
+};
+
+export type IssueEvaluation = {
+  rule_uid: string;
+  state: Coverage["state"];
+  confirmed_issues: number;
+  incomplete_candidates: number;
+  ambiguous_resource_references: number;
+  detail: string | null;
+  evaluated_at: string;
+};

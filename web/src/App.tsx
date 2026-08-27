@@ -44,13 +44,18 @@ import type {
   FindingDetail,
   FindingSeverity,
   FindingSummary,
+  Issue,
+  IssueDetail,
+  IssueEvaluation,
+  IssueSummary,
   Relationship,
   Summary,
 } from "./types";
 
-type Page = "dashboard" | "inventory" | "findings" | "sources";
+type Page = "dashboard" | "inventory" | "findings" | "issues" | "sources";
 type DetailTab = "overview" | "relationships" | "evidence";
 type FindingDetailTab = "overview" | "evidence" | "history";
+type IssueDetailTab = "overview" | "path" | "evidence";
 
 const KIND_META: Record<string, { label: string; plural: string; icon: LucideIcon; color: string }> = {
   ai_agent: { label: "AI agent", plural: "AI agents", icon: Bot, color: "coral" },
@@ -101,8 +106,12 @@ function App() {
   const [coverage, setCoverage] = useState<Coverage[]>([]);
   const [findingSummary, setFindingSummary] = useState<FindingSummary | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
+  const [issueSummary, setIssueSummary] = useState<IssueSummary | null>(null);
+  const [issues, setIssues] = useState<Issue[]>([]);
+  const [issueEvaluations, setIssueEvaluations] = useState<IssueEvaluation[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
+  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -110,19 +119,33 @@ function App() {
   const loadAll = useCallback(async () => {
     setError(null);
     try {
-      const [summaryResult, assetsResult, coverageResult, findingSummaryResult, findingsResult] =
-        await Promise.all([
+      const [
+        summaryResult,
+        assetsResult,
+        coverageResult,
+        findingSummaryResult,
+        findingsResult,
+        issueSummaryResult,
+        issuesResult,
+        issueEvaluationsResult,
+      ] = await Promise.all([
           api.summary(),
           api.assets(),
           api.coverage(),
           api.findingSummary(),
           api.findings(),
+          api.issueSummary(),
+          api.issues(),
+          api.issueEvaluations(),
         ]);
       setSummary(summaryResult);
       setAssets(assetsResult.items);
       setCoverage(coverageResult.items);
       setFindingSummary(findingSummaryResult);
       setFindings(findingsResult.items);
+      setIssueSummary(issueSummaryResult);
+      setIssues(issuesResult.items);
+      setIssueEvaluations(issueEvaluationsResult.items);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Unable to reach the Denali API");
     } finally {
@@ -168,6 +191,13 @@ function App() {
               findings={findings}
               onOpenFinding={setSelectedFindingId}
             />
+          ) : page === "issues" ? (
+            <Issues
+              summary={issueSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
+              issues={issues}
+              evaluations={issueEvaluations}
+              onOpenIssue={setSelectedIssueId}
+            />
           ) : (
             <Sources coverage={coverage} />
           )}
@@ -188,6 +218,9 @@ function App() {
           onClose={() => setSelectedFindingId(null)}
         />
       )}
+      {selectedIssueId && (
+        <IssueDrawer issueId={selectedIssueId} onClose={() => setSelectedIssueId(null)} />
+      )}
     </div>
   );
 }
@@ -206,7 +239,7 @@ function Sidebar({ page, onNavigate, open }: { page: Page; onNavigate: (page: Pa
         <NavButton active={page === "sources"} icon={Waypoints} label="Sources & coverage" onClick={() => onNavigate("sources")} />
         <p className="nav-heading">SECURITY</p>
         <NavButton active={page === "findings"} icon={CircleAlert} label="Config findings" onClick={() => onNavigate("findings")} />
-        <NavButton icon={Network} label="Issues & paths" badge="Soon" disabled />
+        <NavButton active={page === "issues"} icon={Network} label="Issues & paths" onClick={() => onNavigate("issues")} />
         <NavButton icon={Activity} label="Threats" badge="Soon" disabled />
       </nav>
 
@@ -248,6 +281,7 @@ function Topbar({ page, onMenu, onRefresh }: { page: Page; onMenu: () => void; o
     dashboard: { eyebrow: "Inventory Preview", title: "AI security overview" },
     inventory: { eyebrow: "Discovery", title: "AI inventory" },
     findings: { eyebrow: "Posture", title: "AI configuration findings" },
+    issues: { eyebrow: "Correlation", title: "AI issues & paths" },
     sources: { eyebrow: "Data confidence", title: "Sources & coverage" },
   };
   const content = titles[page];
@@ -511,6 +545,132 @@ function FindingEvidence({ detail }: { detail: FindingDetail }) {
 
 function FindingHistory({ detail }: { detail: FindingDetail }) {
   return <div className="detail-stack"><div className="history-intro"><Clock3 /><div><strong>Observation history</strong><p>A new collection time does not masquerade as a semantic finding change.</p></div></div><div className="finding-history">{detail.observations.map((observation) => <div key={`${observation.run_id}-${observation.collected_at}`}><span className={`history-dot ${observation.state}`} /><div><strong>{titleCase(observation.evaluation_result)} · {titleCase(observation.severity)}</strong><small>{formatTime(observation.collected_at)} · {observation.run_id}</small><p>{titleCase(observation.state)} in {observation.scope_key}</p></div></div>)}</div></div>;
+}
+
+function Issues({
+  summary,
+  issues,
+  evaluations,
+  onOpenIssue,
+}: {
+  summary: IssueSummary;
+  issues: Issue[];
+  evaluations: IssueEvaluation[];
+  onOpenIssue: (id: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [severity, setSeverity] = useState("all");
+  const [state, setState] = useState("open");
+  const filtered = useMemo(() => issues.filter((issue) => {
+    const haystack = `${issue.title} ${issue.rule_uid} ${issue.description}`.toLowerCase();
+    return haystack.includes(search.toLowerCase()) &&
+      (severity === "all" || issue.severity === severity) &&
+      (state === "all" || issue.state === state);
+  }), [issues, search, severity, state]);
+  const evaluation = evaluations[0];
+  const confirmed = evaluations.reduce((total, item) => total + item.confirmed_issues, 0);
+  const incomplete = evaluations.reduce((total, item) => total + item.incomplete_candidates, 0);
+
+  return <div className="page-stack issues-page">
+    <section className="page-intro"><div><span className="eyebrow">CONFIRMED CONSEQUENCES</span><h2>Prioritize what can actually happen.</h2><p>Denali combines atomic findings only when independently observed inventory and capability edges support the path.</p></div><div className="result-count"><strong>{summary.by_state.open ?? 0}</strong><span>open issues</span></div></section>
+    <section className="issue-metric-grid">
+      <FindingMetric severity="critical" count={summary.open_by_severity.critical ?? 0} />
+      <FindingMetric severity="high" count={summary.open_by_severity.high ?? 0} />
+      <div className="issue-signal-card"><span className="issue-signal-icon confirmed"><Network /></span><div><span>Confirmed paths</span><strong>{confirmed}</strong><small>Backed by independent edges</small></div></div>
+      <div className="issue-signal-card"><span className={`issue-signal-icon ${incomplete ? "attention" : "complete"}`}>{incomplete ? <CircleHelp /> : <ShieldCheck />}</span><div><span>Correlation coverage</span><strong>{evaluation ? titleCase(evaluation.state) : "Not run"}</strong><small>{incomplete ? `${incomplete} incomplete candidates` : "No hidden path gaps"}</small></div></div>
+    </section>
+    <section className={`issue-coverage-banner ${evaluation?.state ?? "unknown"}`}>
+      {evaluation?.state === "complete" ? <CircleCheck /> : <CircleHelp />}
+      <div><strong>{evaluation?.state === "complete" ? "Correlation evaluation is complete" : "Correlation evaluation has unknowns"}</strong><span>{evaluation?.detail ?? "Every displayed issue has a confirmed, evidence-bearing path. Finding references never create graph edges."}</span></div>
+      {evaluation && <small>{formatTime(evaluation.evaluated_at)}</small>}
+    </section>
+    <section className="panel issues-panel">
+      <div className="filterbar">
+        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search issue, rule, or consequence…" /></label>
+        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option>{SEVERITY_ORDER.map((item) => <option key={item} value={item}>{titleCase(item)}</option>)}</select></label>
+        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => setState(event.target.value)}><option value="all">All states</option><option value="open">Open</option><option value="unknown">Unknown</option><option value="resolved">Resolved</option></select></label>
+        {(search || severity !== "all" || state !== "open") && <button className="clear-button" onClick={() => { setSearch(""); setSeverity("all"); setState("open"); }}>Reset</button>}
+      </div>
+      <div className="issues-table" role="table" aria-label="AI issues and attack paths">
+        <div className="issues-table-head" role="row"><span>Issue</span><span>Severity</span><span>State</span><span>Path</span><span>Evidence</span><span>Last confirmed</span><span /></div>
+        {filtered.map((issue) => <IssueTableRow key={issue.id} issue={issue} onClick={() => onOpenIssue(issue.id)} />)}
+        {filtered.length === 0 && <div className="empty-state"><ShieldCheck /><strong>{issues.length === 0 ? "No confirmed issues" : "No issues match these filters"}</strong><span>{issues.length === 0 ? "Run the deterministic issue evaluator after collecting inventory and findings." : "Reset the filters or include resolved issues."}</span></div>}
+      </div>
+    </section>
+    <p className="fixture-note"><ShieldCheck size={15} /> A finding is not a path. Denali requires active, sufficiently confident capability assertions for every displayed edge.</p>
+  </div>;
+}
+
+function IssueTableRow({ issue, onClick }: { issue: Issue; onClick: () => void }) {
+  return <button className="issues-table-row" role="row" onClick={onClick}>
+    <span className="issue-title-cell"><span className={`finding-icon severity-${issue.severity}`}><Network size={18} /></span><span><strong>{issue.title}</strong><small>{issue.rule_uid} · Deterministic correlation</small></span></span>
+    <span><span className={`severity-badge ${issue.severity}`}>{titleCase(issue.severity)}</span></span>
+    <span><span className={`issue-state ${issue.state}`}>{titleCase(issue.state)}</span></span>
+    <span>{issue.asset_count} assets</span>
+    <span>{issue.finding_count} findings</span>
+    <span>{formatTime(issue.last_seen_at)}</span><span><ChevronRight size={17} /></span>
+  </button>;
+}
+
+function IssueDrawer({ issueId, onClose }: { issueId: string; onClose: () => void }) {
+  const [detail, setDetail] = useState<IssueDetail | null>(null);
+  const [tab, setTab] = useState<IssueDetailTab>("overview");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDetail(null); setError(null); setTab("overview");
+    api.issue(issueId).then(setDetail).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load issue"));
+  }, [issueId]);
+
+  return <div className="drawer-layer"><button className="drawer-scrim" onClick={onClose} aria-label="Close issue detail" /><aside className="resource-drawer issue-drawer" aria-label="Issue detail">
+    {!detail && !error ? <LoadingState compact /> : error ? <ErrorState message={error} subject="issue" /> : detail && <>
+      <div className="drawer-header issue-drawer-header"><button className="drawer-close" onClick={onClose}><X /></button><span className={`finding-icon large severity-${detail.severity}`}><Network /></span><div><span>CONFIRMED SECURITY ISSUE</span><h2>{detail.title}</h2><p>{detail.rule_uid}</p></div><span className={`severity-badge ${detail.severity}`}>{titleCase(detail.severity)}</span></div>
+      <div className="finding-summary-strip"><span className={`issue-state ${detail.state}`}>{titleCase(detail.state)}</span><span><strong>{Math.round(detail.confidence * 100)}%</strong> evidence confidence</span><span><strong>{detail.findings.length}</strong> findings</span><span><strong>{detail.path_edges.length}</strong> confirmed edges</span></div>
+      <div className="drawer-tabs">{(["overview", "path", "evidence"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{titleCase(item)}{item === "path" && <small>{detail.path_nodes.length}</small>}{item === "evidence" && <small>{detail.findings.length + detail.path_edges.length}</small>}</button>)}</div>
+      <div className="drawer-content">
+        {tab === "overview" ? <IssueOverview detail={detail} /> : tab === "path" ? <IssuePath detail={detail} /> : <IssueEvidence detail={detail} />}
+      </div>
+    </>}
+  </aside></div>;
+}
+
+function IssueOverview({ detail }: { detail: IssueDetail }) {
+  return <div className="detail-stack">
+    <div className="issue-narrative"><span>WHY THIS IS AN ISSUE</span><p>{detail.description}</p></div>
+    <DetailSection title="Risk and impact"><p className="finding-copy">{detail.risk}</p></DetailSection>
+    <DetailSection title="Recommended remediation"><p className="finding-copy">{detail.remediation}</p></DetailSection>
+    <DetailSection title="Correlation properties"><div className="property-grid"><Property label="Rule" value={detail.rule_uid} mono /><Property label="Path status" value={titleCase(String(detail.attributes.path_status ?? "unknown"))} /><Property label="Confidence" value={`${Math.round(detail.confidence * 100)}%`} /><Property label="State" value={titleCase(detail.state)} /><Property label="First confirmed" value={formatTime(detail.first_seen_at)} /><Property label="Last evaluated" value={formatTime(detail.last_evaluated_at)} /></div></DetailSection>
+    <DetailSection title="Contributing findings"><div className="issue-finding-list">{detail.findings.map((finding) => <div key={finding.id}><span className={`finding-icon severity-${finding.severity}`}><CircleAlert /></span><span><strong>{finding.title}</strong><small>{titleCase(finding.role)} · {finding.rule_uid}</small></span><span className={`severity-badge ${finding.severity}`}>{titleCase(finding.severity)}</span></div>)}</div></DetailSection>
+  </div>;
+}
+
+function IssuePath({ detail }: { detail: IssueDetail }) {
+  const byRole = Object.fromEntries(detail.path_nodes.map((node) => [node.role, node]));
+  return <div className="detail-stack">
+    <div className="evidence-principle"><Network /><div><strong>Confirmed capability path</strong><p>Every line below is an active relationship assertion. A finding reference cannot appear as an edge.</p></div></div>
+    <div className="issue-path-graph">
+      <IssueGraphNode node={byRole.agent} />
+      <div className="issue-path-branches">
+        <div><span className="graph-edge-label">RUNS AS</span><IssueGraphNode node={byRole.execution_identity} /></div>
+        <div><span className="graph-edge-label">CAN INVOKE</span><IssueGraphNode node={byRole.write_tool} /><span className="graph-edge-label inline">CAN WRITE</span><IssueGraphNode node={byRole.sensitive_data} /></div>
+      </div>
+    </div>
+    <DetailSection title="Edge assertions"><div className="issue-edge-list">{detail.path_edges.map((edge) => <div key={edge.id}><span><Network /></span><div><strong>{titleCase(edge.kind)}</strong><small>{titleCase(edge.assertion_type)} · {Math.round(edge.confidence * 100)}% confidence</small></div><em>{titleCase(edge.category)}</em></div>)}</div></DetailSection>
+  </div>;
+}
+
+function IssueGraphNode({ node }: { node?: IssueDetail["path_nodes"][number] }) {
+  if (!node) return null;
+  const itemMeta = meta(node.kind); const Icon = itemMeta.icon;
+  return <div className="issue-graph-node"><span className={`asset-icon ${itemMeta.color}`}><Icon /></span><span><small>{titleCase(node.role)}</small><strong>{node.display_name ?? shortKey(node.natural_key)}</strong><code>{node.natural_key}</code></span></div>;
+}
+
+function IssueEvidence({ detail }: { detail: IssueDetail }) {
+  return <div className="detail-stack">
+    <div className="evidence-principle"><ShieldCheck /><div><strong>{detail.findings.length + detail.path_edges.length} independent evidence links</strong><p>The issue stores references to source findings and relationship assertions; it does not copy or invent their evidence.</p></div></div>
+    <DetailSection title="Finding evidence"><div className="issue-evidence-list">{detail.findings.map((finding) => <div key={finding.id}><span>{titleCase(finding.role)}</span><strong>{finding.title}</strong><code>{finding.evidence.locator}</code></div>)}</div></DetailSection>
+    <DetailSection title="Relationship evidence"><div className="issue-evidence-list">{detail.path_edges.map((edge) => <div key={edge.id}><span>{titleCase(edge.kind)}</span><strong>{titleCase(edge.assertion_type)} · {Math.round(edge.confidence * 100)}% confidence</strong><code>{edge.evidence.locator}</code></div>)}</div></DetailSection>
+  </div>;
 }
 
 function Sources({ coverage }: { coverage: Coverage[] }) {

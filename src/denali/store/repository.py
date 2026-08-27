@@ -12,12 +12,20 @@ from psycopg.rows import dict_row
 from denali.domain import (
     AssetAssertion,
     AssetRef,
+    CorrelationAsset,
+    CorrelationFinding,
+    CorrelationRelationship,
+    CorrelationSnapshot,
     CoverageState,
     FindingAssertion,
     FindingBatch,
+    FindingSeverity,
     InventoryBatch,
+    IssueCandidate,
+    IssueEvaluation,
     RelationshipAssertion,
 )
+from denali.issues import evaluate_agent_sensitive_write
 
 _ASSERTION_RANK_SQL = """
 CASE aa.assertion_type
@@ -275,6 +283,229 @@ class PostgresInventoryRepository:
             "open_by_severity": {row["severity"]: row["count"] for row in open_by_severity},
         }
 
+    def evaluate_issues(self, tenant_id: str) -> dict[str, Any]:
+        """Recompute deterministic issues from currently active evidence."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            with connection.transaction():
+                snapshot = self._load_correlation_snapshot(connection, tenant_id)
+                evaluation = evaluate_agent_sensitive_write(snapshot)
+                active_keys: set[str] = set()
+                for candidate in evaluation.candidates:
+                    issue_id = self._upsert_issue(connection, tenant_id, candidate, evaluation)
+                    active_keys.add(candidate.correlation_key)
+                    self._replace_issue_components(connection, tenant_id, issue_id, candidate)
+
+                existing = connection.execute(
+                    """
+                    SELECT id, correlation_key
+                    FROM issue
+                    WHERE tenant_id = %s::uuid AND rule_uid = %s AND state <> 'resolved'
+                    """,
+                    (tenant_id, evaluation.rule_uid),
+                ).fetchall()
+                missing = [row for row in existing if row["correlation_key"] not in active_keys]
+                for row in missing:
+                    contributor_open = connection.execute(
+                        """
+                        SELECT bool_and(f.state = 'open' AND f.evaluation_result = 'fail') AS open
+                        FROM issue_finding link
+                        JOIN finding f ON f.id = link.finding_id AND f.tenant_id = link.tenant_id
+                        WHERE link.tenant_id = %s::uuid AND link.issue_id = %s::uuid
+                        """,
+                        (tenant_id, row["id"]),
+                    ).fetchone()["open"]
+                    if contributor_open and evaluation.state is not CoverageState.COMPLETE:
+                        state = "unknown"
+                        reason = "correlation_incomplete"
+                    elif contributor_open:
+                        state = "resolved"
+                        reason = "correlation_no_longer_confirmed"
+                    else:
+                        state = "resolved"
+                        reason = "contributing_finding_inactive"
+                    connection.execute(
+                        """
+                        UPDATE issue
+                        SET state = %s, resolution_reason = %s,
+                            last_changed_at = CASE WHEN state <> %s
+                                THEN %s ELSE last_changed_at END,
+                            last_evaluated_at = %s
+                        WHERE tenant_id = %s::uuid AND id = %s::uuid
+                        """,
+                        (
+                            state,
+                            reason,
+                            state,
+                            evaluation.evaluated_at,
+                            evaluation.evaluated_at,
+                            tenant_id,
+                            row["id"],
+                        ),
+                    )
+
+                connection.execute(
+                    """
+                    INSERT INTO issue_rule_evaluation
+                      (tenant_id, rule_uid, state, confirmed_issues, incomplete_candidates,
+                       ambiguous_resource_references, detail, evaluated_at)
+                    VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (tenant_id, rule_uid)
+                    DO UPDATE SET state = EXCLUDED.state,
+                                  confirmed_issues = EXCLUDED.confirmed_issues,
+                                  incomplete_candidates = EXCLUDED.incomplete_candidates,
+                                  ambiguous_resource_references =
+                                      EXCLUDED.ambiguous_resource_references,
+                                  detail = EXCLUDED.detail,
+                                  evaluated_at = EXCLUDED.evaluated_at
+                    """,
+                    (
+                        tenant_id,
+                        evaluation.rule_uid,
+                        evaluation.state.value,
+                        len(evaluation.candidates),
+                        evaluation.incomplete_candidates,
+                        evaluation.ambiguous_resource_references,
+                        evaluation.detail,
+                        evaluation.evaluated_at,
+                    ),
+                )
+        return {
+            "confirmed_issues": len(evaluation.candidates),
+            "evaluation_state": evaluation.state.value,
+            "incomplete_candidates": evaluation.incomplete_candidates,
+            "ambiguous_resource_references": evaluation.ambiguous_resource_references,
+        }
+
+    def list_issues(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT i.*,
+                       (SELECT count(*) FROM issue_finding f
+                        WHERE f.tenant_id = i.tenant_id AND f.issue_id = i.id)
+                           AS finding_count,
+                       (SELECT count(*) FROM issue_path_node n
+                        WHERE n.tenant_id = i.tenant_id AND n.issue_id = i.id)
+                           AS asset_count
+                FROM issue i
+                WHERE i.tenant_id = %s::uuid
+                  AND (%s::text IS NULL OR i.state = %s::text)
+                  AND (%s::text IS NULL OR i.severity = %s::text)
+                ORDER BY
+                  CASE i.state WHEN 'open' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,
+                  CASE i.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                                  WHEN 'medium' THEN 2 WHEN 'low' THEN 3
+                                  WHEN 'informational' THEN 4 ELSE 5 END,
+                  i.last_seen_at DESC, i.correlation_key
+                LIMIT %s OFFSET %s
+                """,
+                (tenant_id, state, state, severity, severity, limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_issue(self, tenant_id: str, issue_id: str) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            issue = connection.execute(
+                "SELECT * FROM issue WHERE tenant_id = %s::uuid AND id = %s::uuid",
+                (tenant_id, issue_id),
+            ).fetchone()
+            if issue is None:
+                return None
+            findings = connection.execute(
+                """
+                SELECT f.id, f.rule_uid, f.title, f.severity, f.state, f.evidence,
+                       link.role
+                FROM issue_finding link
+                JOIN finding f ON f.id = link.finding_id AND f.tenant_id = link.tenant_id
+                WHERE link.tenant_id = %s::uuid AND link.issue_id = %s::uuid
+                ORDER BY link.role, f.rule_uid
+                """,
+                (tenant_id, issue_id),
+            ).fetchall()
+            nodes = connection.execute(
+                f"""
+                SELECT n.position, n.role, a.id, a.kind, a.natural_key,
+                       winner.display_name, winner.assertion_type, winner.confidence,
+                       winner.evidence
+                FROM issue_path_node n
+                JOIN asset a ON a.id = n.asset_id AND a.tenant_id = n.tenant_id
+                LEFT JOIN LATERAL (
+                    SELECT aa.display_name, aa.assertion_type, aa.confidence, aa.evidence
+                    FROM asset_assertion aa
+                    WHERE aa.tenant_id = a.tenant_id AND aa.asset_id = a.id
+                    ORDER BY (aa.withdrawn_at IS NULL) DESC,
+                             {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC
+                    LIMIT 1
+                ) winner ON true
+                WHERE n.tenant_id = %s::uuid AND n.issue_id = %s::uuid
+                ORDER BY n.position
+                """,
+                (tenant_id, issue_id),
+            ).fetchall()
+            edges = connection.execute(
+                """
+                SELECT e.position, r.id, r.kind, r.category, r.assertion_type,
+                       r.confidence, r.evidence, r.withdrawn_at,
+                       r.source_asset_id AS source_id, r.target_asset_id AS target_id
+                FROM issue_path_edge e
+                JOIN relationship_assertion r
+                  ON r.id = e.relationship_id AND r.tenant_id = e.tenant_id
+                WHERE e.tenant_id = %s::uuid AND e.issue_id = %s::uuid
+                ORDER BY e.position
+                """,
+                (tenant_id, issue_id),
+            ).fetchall()
+        result = dict(issue)
+        result["findings"] = [dict(row) for row in findings]
+        result["path_nodes"] = [dict(row) for row in nodes]
+        result["path_edges"] = [dict(row) for row in edges]
+        return result
+
+    def issue_summary(self, tenant_id: str) -> dict[str, Any]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            by_state = connection.execute(
+                """
+                SELECT state, count(*) AS count FROM issue
+                WHERE tenant_id = %s::uuid GROUP BY state ORDER BY state
+                """,
+                (tenant_id,),
+            ).fetchall()
+            open_by_severity = connection.execute(
+                """
+                SELECT severity, count(*) AS count FROM issue
+                WHERE tenant_id = %s::uuid AND state = 'open'
+                GROUP BY severity ORDER BY severity
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return {
+            "total": sum(row["count"] for row in by_state),
+            "by_state": {row["state"]: row["count"] for row in by_state},
+            "open_by_severity": {row["severity"]: row["count"] for row in open_by_severity},
+        }
+
+    def latest_issue_evaluations(self, tenant_id: str) -> list[dict[str, Any]]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT rule_uid, state, confirmed_issues, incomplete_candidates,
+                       ambiguous_resource_references, detail, evaluated_at
+                FROM issue_rule_evaluation
+                WHERE tenant_id = %s::uuid ORDER BY rule_uid
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_assets(
         self,
         tenant_id: str,
@@ -418,6 +649,204 @@ class PostgresInventoryRepository:
                 (status, owner, notes, tenant_id, asset_id),
             ).fetchone()
         return None if row is None else dict(row)
+
+    @staticmethod
+    def _load_correlation_snapshot(connection, tenant_id: str) -> CorrelationSnapshot:
+        asset_rows = connection.execute(
+            f"""
+            SELECT a.id, a.kind, a.natural_key, winner.display_name,
+                   winner.assertion_type, winner.confidence, winner.attributes
+            FROM asset a
+            JOIN LATERAL (
+                SELECT aa.display_name, aa.assertion_type, aa.confidence, aa.attributes
+                FROM asset_assertion aa
+                WHERE aa.tenant_id = a.tenant_id AND aa.asset_id = a.id
+                  AND aa.withdrawn_at IS NULL
+                ORDER BY {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC,
+                         aa.connector_id, aa.connection_id
+                LIMIT 1
+            ) winner ON true
+            WHERE a.tenant_id = %s::uuid AND a.lifecycle_state = 'active'
+            """,
+            (tenant_id,),
+        ).fetchall()
+        relationship_rows = connection.execute(
+            """
+            SELECT r.id, r.source_asset_id, r.target_asset_id, r.kind, r.category,
+                   r.assertion_type, r.confidence
+            FROM relationship_assertion r
+            JOIN asset source ON source.id = r.source_asset_id
+            JOIN asset target ON target.id = r.target_asset_id
+            WHERE r.tenant_id = %s::uuid AND r.withdrawn_at IS NULL
+              AND source.lifecycle_state = 'active' AND target.lifecycle_state = 'active'
+            """,
+            (tenant_id,),
+        ).fetchall()
+        finding_rows = connection.execute(
+            """
+            SELECT id, source_uid, rule_uid, title, severity, state,
+                   evaluation_result, attributes
+            FROM finding
+            WHERE tenant_id = %s::uuid
+            """,
+            (tenant_id,),
+        ).fetchall()
+        resource_rows = connection.execute(
+            """
+            SELECT finding_id, resource_uid
+            FROM finding_resource
+            WHERE tenant_id = %s::uuid ORDER BY finding_id, resource_uid
+            """,
+            (tenant_id,),
+        ).fetchall()
+        resources: dict[str, list[str]] = {}
+        for row in resource_rows:
+            resources.setdefault(str(row["finding_id"]), []).append(row["resource_uid"])
+        return CorrelationSnapshot(
+            assets=tuple(
+                CorrelationAsset(
+                    id=str(row["id"]),
+                    kind=row["kind"],
+                    natural_key=row["natural_key"],
+                    display_name=row["display_name"],
+                    assertion_type=row["assertion_type"],
+                    confidence=row["confidence"],
+                    attributes=dict(row["attributes"]),
+                )
+                for row in asset_rows
+            ),
+            relationships=tuple(
+                CorrelationRelationship(
+                    id=str(row["id"]),
+                    source_id=str(row["source_asset_id"]),
+                    target_id=str(row["target_asset_id"]),
+                    kind=row["kind"],
+                    category=row["category"],
+                    assertion_type=row["assertion_type"],
+                    confidence=row["confidence"],
+                )
+                for row in relationship_rows
+            ),
+            findings=tuple(
+                CorrelationFinding(
+                    id=str(row["id"]),
+                    source_uid=row["source_uid"],
+                    rule_uid=row["rule_uid"],
+                    title=row["title"],
+                    severity=FindingSeverity(row["severity"]),
+                    state=row["state"],
+                    evaluation_result=row["evaluation_result"],
+                    resource_uids=tuple(resources.get(str(row["id"]), ())),
+                    attributes=dict(row["attributes"]),
+                )
+                for row in finding_rows
+            ),
+        )
+
+    @staticmethod
+    def _upsert_issue(
+        connection,
+        tenant_id: str,
+        candidate: IssueCandidate,
+        evaluation: IssueEvaluation,
+    ) -> str:
+        row = connection.execute(
+            """
+            INSERT INTO issue
+              (tenant_id, correlation_key, rule_uid, title, description, risk,
+               remediation, severity, state, confidence, attributes, resolution_reason,
+               first_seen_at, last_seen_at, last_changed_at, last_evaluated_at)
+            VALUES
+              (%s::uuid, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s::jsonb, NULL,
+               %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, correlation_key)
+            DO UPDATE SET
+              last_changed_at = CASE WHEN
+                (issue.rule_uid, issue.title, issue.description, issue.risk,
+                 issue.remediation, issue.severity, issue.state, issue.confidence,
+                 issue.attributes)
+                IS DISTINCT FROM
+                (EXCLUDED.rule_uid, EXCLUDED.title, EXCLUDED.description, EXCLUDED.risk,
+                 EXCLUDED.remediation, EXCLUDED.severity, EXCLUDED.state,
+                 EXCLUDED.confidence, EXCLUDED.attributes)
+                THEN EXCLUDED.last_seen_at ELSE issue.last_changed_at END,
+              rule_uid = EXCLUDED.rule_uid,
+              title = EXCLUDED.title,
+              description = EXCLUDED.description,
+              risk = EXCLUDED.risk,
+              remediation = EXCLUDED.remediation,
+              severity = EXCLUDED.severity,
+              state = 'open',
+              confidence = EXCLUDED.confidence,
+              attributes = EXCLUDED.attributes,
+              resolution_reason = NULL,
+              last_seen_at = EXCLUDED.last_seen_at,
+              last_evaluated_at = EXCLUDED.last_evaluated_at
+            RETURNING id
+            """,
+            (
+                tenant_id,
+                candidate.correlation_key,
+                candidate.rule_uid,
+                candidate.title,
+                candidate.description,
+                candidate.risk,
+                candidate.remediation,
+                candidate.severity.value,
+                candidate.confidence,
+                json.dumps(dict(candidate.attributes)),
+                evaluation.evaluated_at,
+                evaluation.evaluated_at,
+                evaluation.evaluated_at,
+                evaluation.evaluated_at,
+            ),
+        ).fetchone()
+        return str(row["id"])
+
+    @staticmethod
+    def _replace_issue_components(
+        connection,
+        tenant_id: str,
+        issue_id: str,
+        candidate: IssueCandidate,
+    ) -> None:
+        connection.execute(
+            "DELETE FROM issue_finding WHERE tenant_id = %s::uuid AND issue_id = %s::uuid",
+            (tenant_id, issue_id),
+        )
+        connection.execute(
+            "DELETE FROM issue_path_edge WHERE tenant_id = %s::uuid AND issue_id = %s::uuid",
+            (tenant_id, issue_id),
+        )
+        connection.execute(
+            "DELETE FROM issue_path_node WHERE tenant_id = %s::uuid AND issue_id = %s::uuid",
+            (tenant_id, issue_id),
+        )
+        for finding in candidate.findings:
+            connection.execute(
+                """
+                INSERT INTO issue_finding (tenant_id, issue_id, finding_id, role)
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s)
+                """,
+                (tenant_id, issue_id, finding.finding_id, finding.role),
+            )
+        for node in candidate.path_nodes:
+            connection.execute(
+                """
+                INSERT INTO issue_path_node (tenant_id, issue_id, position, asset_id, role)
+                VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s)
+                """,
+                (tenant_id, issue_id, node.position, node.asset_id, node.role),
+            )
+        for edge in candidate.path_edges:
+            connection.execute(
+                """
+                INSERT INTO issue_path_edge
+                  (tenant_id, issue_id, position, relationship_id)
+                VALUES (%s::uuid, %s::uuid, %s, %s::uuid)
+                """,
+                (tenant_id, issue_id, edge.position, edge.relationship_id),
+            )
 
     @staticmethod
     def _finding_exists(

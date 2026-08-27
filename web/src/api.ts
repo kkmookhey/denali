@@ -5,6 +5,10 @@ import type {
   Finding,
   FindingDetail,
   FindingSummary,
+  Issue,
+  IssueDetail,
+  IssueEvaluation,
+  IssueSummary,
   Summary,
 } from "./types";
 
@@ -30,6 +34,10 @@ export const api = {
   findingSummary: () => request<FindingSummary>("/v1/findings/summary"),
   findings: () => request<{ items: Finding[] }>("/v1/findings?limit=500"),
   finding: (id: string) => request<FindingDetail>(`/v1/findings/${id}`),
+  issueSummary: () => request<IssueSummary>("/v1/issues/summary"),
+  issues: () => request<{ items: Issue[] }>("/v1/issues?limit=500"),
+  issue: (id: string) => request<IssueDetail>(`/v1/issues/${id}`),
+  issueEvaluations: () => request<{ items: IssueEvaluation[] }>("/v1/issues/evaluations"),
   governance: (
     id: string,
     update: { status: Asset["governance_status"]; owner?: string | null; notes?: string | null },

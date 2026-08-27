@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import os
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from denali.connectors.demo import demo_batch, demo_findings_batch
 from denali.domain import (
     AffectedResource,
     AssertionType,
@@ -345,3 +347,52 @@ def test_reobservation_time_does_not_look_like_a_semantic_finding_change(reposit
     )
 
     assert repo.list_findings(tenant)[0]["last_changed_at"] == first_changed_at
+
+
+def test_issue_projection_requires_graph_evidence_and_tracks_finding_resolution(
+    repository,
+) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    repo.ingest(tenant, demo_batch(now))
+    original_findings = demo_findings_batch(now)
+    repo.ingest_findings(tenant, original_findings)
+
+    result = repo.evaluate_issues(tenant)
+    assert result == {
+        "confirmed_issues": 1,
+        "evaluation_state": "complete",
+        "incomplete_candidates": 0,
+        "ambiguous_resource_references": 0,
+    }
+    rows = repo.list_issues(tenant)
+    assert len(rows) == 1
+    assert rows[0]["finding_count"] == 2
+    assert rows[0]["asset_count"] == 4
+    detail = repo.get_issue(tenant, str(rows[0]["id"]))
+    assert detail is not None
+    assert [edge["kind"] for edge in detail["path_edges"]] == [
+        "runs_as",
+        "can_invoke",
+        "can_write",
+    ]
+    assert all(edge["category"] == "capability" for edge in detail["path_edges"])
+
+    later = now + timedelta(minutes=1)
+    resolved_identity = replace(
+        original_findings.findings[0],
+        state=FindingState.RESOLVED,
+        evaluation_result=EvaluationResult.PASS,
+        observed_at=later,
+        evidence=replace(original_findings.findings[0].evidence, observed_at=later),
+    )
+    updated = replace(
+        demo_findings_batch(later),
+        findings=(resolved_identity, *demo_findings_batch(later).findings[1:]),
+    )
+    repo.ingest_findings(tenant, updated)
+    repo.evaluate_issues(tenant)
+
+    resolved = repo.list_issues(tenant)[0]
+    assert resolved["state"] == "resolved"
+    assert resolved["resolution_reason"] == "contributing_finding_inactive"

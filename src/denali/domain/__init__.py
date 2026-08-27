@@ -24,6 +24,18 @@ from denali.domain.inventory import (
     RelationshipCategory,
     RelationshipKind,
 )
+from denali.domain.issues import (
+    CorrelationAsset,
+    CorrelationFinding,
+    CorrelationRelationship,
+    CorrelationSnapshot,
+    IssueCandidate,
+    IssueEvaluation,
+    IssueFindingLink,
+    IssuePathEdge,
+    IssuePathNode,
+    IssueState,
+)
 
 __all__ = [
     "AffectedResource",
@@ -32,6 +44,10 @@ __all__ = [
     "AssetKind",
     "AssetRef",
     "ConnectorCapabilities",
+    "CorrelationAsset",
+    "CorrelationFinding",
+    "CorrelationRelationship",
+    "CorrelationSnapshot",
     "Coverage",
     "CoverageState",
     "Evidence",
@@ -42,6 +58,12 @@ __all__ = [
     "FindingState",
     "GovernanceStatus",
     "InventoryBatch",
+    "IssueCandidate",
+    "IssueEvaluation",
+    "IssueFindingLink",
+    "IssuePathEdge",
+    "IssuePathNode",
+    "IssueState",
     "LifecycleState",
     "RelationshipAssertion",
     "RelationshipCategory",

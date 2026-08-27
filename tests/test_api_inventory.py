@@ -8,6 +8,7 @@ from denali.api.app import DEFAULT_LOCAL_TENANT, create_app
 
 ASSET_ID = "11111111-1111-4111-8111-111111111111"
 FINDING_ID = "22222222-2222-4222-8222-222222222222"
+ISSUE_ID = "33333333-3333-4333-8333-333333333333"
 
 
 class RepositoryStub:
@@ -66,6 +67,38 @@ class RepositoryStub:
             "open_by_severity": {"critical": 1},
         }
 
+    def list_issues(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": ISSUE_ID,
+                "state": state or "open",
+                "severity": severity or "critical",
+            }
+        ]
+
+    def get_issue(self, tenant_id: str, issue_id: str) -> dict[str, Any] | None:
+        if issue_id != ISSUE_ID:
+            return None
+        return {"id": ISSUE_ID, "state": "open", "findings": [], "path_nodes": []}
+
+    def issue_summary(self, tenant_id: str) -> dict[str, Any]:
+        return {
+            "total": 1,
+            "by_state": {"open": 1},
+            "open_by_severity": {"critical": 1},
+        }
+
+    def latest_issue_evaluations(self, tenant_id: str) -> list[dict[str, Any]]:
+        return [{"rule_uid": "rule-1", "state": "complete", "confirmed_issues": 1}]
+
     def set_governance(
         self,
         tenant_id: str,
@@ -113,6 +146,24 @@ def test_findings_surface_and_filters() -> None:
         assert test_client.get(f"/v1/findings/{FINDING_ID}").status_code == 200
         assert test_client.get("/v1/findings/not-found").status_code == 404
         assert test_client.get("/v1/findings?state=probably-open").status_code == 422
+
+
+def test_issues_surface_and_evaluation_coverage() -> None:
+    with client() as test_client:
+        assert test_client.get("/v1/issues/summary").json()["total"] == 1
+        response = test_client.get("/v1/issues?state=open&severity=critical")
+        assert response.status_code == 200
+        assert response.json()["items"][0]["id"] == ISSUE_ID
+        assert test_client.get("/v1/issues/evaluations").json()["items"][0][
+            "state"
+        ] == "complete"
+        assert test_client.get(f"/v1/issues/{ISSUE_ID}").status_code == 200
+        assert (
+            test_client.get("/v1/issues/44444444-4444-4444-8444-444444444444").status_code
+            == 404
+        )
+        assert test_client.get("/v1/issues/not-a-uuid").status_code == 422
+        assert test_client.get("/v1/issues?state=probably-open").status_code == 422
 
 
 def test_governance_update_is_validated_and_persisted() -> None:

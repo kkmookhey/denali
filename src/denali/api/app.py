@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Protocol
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,6 +48,22 @@ class InventoryReader(Protocol):
     def get_finding(self, tenant_id: str, finding_id: str) -> dict[str, Any] | None: ...
 
     def finding_summary(self, tenant_id: str) -> dict[str, Any]: ...
+
+    def list_issues(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]: ...
+
+    def get_issue(self, tenant_id: str, issue_id: str) -> dict[str, Any] | None: ...
+
+    def issue_summary(self, tenant_id: str) -> dict[str, Any]: ...
+
+    def latest_issue_evaluations(self, tenant_id: str) -> list[dict[str, Any]]: ...
 
     def set_governance(
         self,
@@ -199,6 +216,45 @@ def create_app(
         row = repo.get_finding(current_tenant, finding_id)
         if row is None:
             raise HTTPException(status_code=404, detail="finding not found")
+        return row
+
+    @app.get("/v1/issues/summary")
+    def issue_summary(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return repo.issue_summary(current_tenant)
+
+    @app.get("/v1/issues")
+    def list_issues(
+        request: Request,
+        state: str | None = Query(default=None, pattern="^(open|resolved|unknown)$"),
+        severity: str | None = Query(
+            default=None,
+            pattern="^(unknown|informational|low|medium|high|critical)$",
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        rows = repo.list_issues(
+            current_tenant,
+            state=state,
+            severity=severity,
+            limit=limit,
+            offset=offset,
+        )
+        return {"items": rows, "limit": limit, "offset": offset}
+
+    @app.get("/v1/issues/evaluations")
+    def issue_evaluations(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return {"items": repo.latest_issue_evaluations(current_tenant)}
+
+    @app.get("/v1/issues/{issue_id}")
+    def issue_detail(request: Request, issue_id: UUID) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        row = repo.get_issue(current_tenant, str(issue_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="issue not found")
         return row
 
     return app

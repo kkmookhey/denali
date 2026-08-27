@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 denali-db-migrate = "denali.store.cli:migrate_main"
+denali-evaluate-issues = "denali.store.cli:evaluate_issues_main"
 denali-demo-seed = "denali.connectors.demo:seed_main"
 denali-aws-scan = "denali.connectors.aws_bedrock:scan_main"
 denali-agentcore-scan = "denali.connectors.aws_agentcore:scan_main"

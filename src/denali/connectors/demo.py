@@ -148,6 +148,7 @@ def demo_findings_batch(at: datetime | None = None) -> FindingBatch:
                 "operations required by the approved customer workflow."
             ),
             "severity": FindingSeverity.CRITICAL,
+            "signal": "identity.overprivileged",
             "resource": AffectedResource(
                 uid="demo:customer-agent-role",
                 name="Customer Agent Role",
@@ -178,6 +179,7 @@ def demo_findings_batch(at: datetime | None = None) -> FindingBatch:
                 "at the tool boundary rather than in prompt text alone."
             ),
             "severity": FindingSeverity.HIGH,
+            "signal": "tool.write_without_confirmation",
             "resource": AffectedResource(
                 uid="demo:mcp:update-customer",
                 name="Update Customer",
@@ -206,6 +208,7 @@ def demo_findings_batch(at: datetime | None = None) -> FindingBatch:
                 "result as separate runtime evidence."
             ),
             "severity": FindingSeverity.MEDIUM,
+            "signal": "guardrail.output_unverified",
             "resource": AffectedResource(
                 uid="demo:customer-data-guardrail",
                 name="Customer Data Guardrail",
@@ -240,6 +243,7 @@ def demo_findings_batch(at: datetime | None = None) -> FindingBatch:
                 "fixture": True,
                 "category": "AI Configuration",
                 "product": "Denali Configuration Findings Preview",
+                "denali_signal": spec["signal"],
             },
         )
         for spec in specs
@@ -271,9 +275,11 @@ def seed_main() -> None:
     repository = PostgresInventoryRepository(dsn)
     counts = repository.ingest(tenant, demo_batch())
     finding_counts = repository.ingest_findings(tenant, demo_findings_batch())
+    issue_counts = repository.evaluate_issues(tenant)
     print(
         f"Seeded {counts['assets']} assets and {counts['relationships']} relationships "
-        f"and {finding_counts['findings']} findings for tenant {tenant}"
+        f"and {finding_counts['findings']} findings and "
+        f"{issue_counts['confirmed_issues']} confirmed issues for tenant {tenant}"
     )
 
 

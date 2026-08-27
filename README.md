@@ -22,6 +22,8 @@ The first public milestone is **Denali Inventory Preview**. Its definition is in
 [`docs/product/inventory-preview.md`](docs/product/inventory-preview.md).
 The configuration-findings slice is defined in
 [`docs/product/configuration-findings-preview.md`](docs/product/configuration-findings-preview.md).
+The first deterministic correlation slice is defined in
+[`docs/product/issues-preview.md`](docs/product/issues-preview.md).
 
 ## Repository status
 
@@ -31,9 +33,9 @@ Shasta infrastructure and Prowler UI patches will not be carried forward.
 
 The foundation currently contains canonical inventory and finding contracts, a Postgres
 assertion store, read/write inventory APIs, read-only finding APIs, and independent web
-experiences for inventory and AI configuration findings. A transparent demo connector
-provides fixture data for local product development; every fixture assertion and finding
-is visibly identified as such in its evidence.
+experiences for inventory, AI configuration findings, and evidence-bearing issues. A
+transparent demo connector provides fixture data for local product development; every
+fixture assertion and finding is visibly identified as such in its evidence.
 
 ## Development
 
@@ -146,6 +148,18 @@ The read API exposes `/v1/findings`, `/v1/findings/summary`, and
 and state filtering plus evidence, affected-resource, compliance, remediation, and
 observation-history views. Run `denali-demo-seed` for three clearly labelled fixture
 findings, or import a real OCSF report to replace the demonstration data.
+
+Evaluate deterministic issues after collecting inventory and findings with:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-evaluate-issues
+```
+
+The initial rule requires two atomic security signals and three independently observed
+or externally verified capability edges before it creates an issue. Missing, inferred,
+or ambiguous edges produce an unknown evaluation state rather than a reachability claim.
+The local `denali-demo-seed` command evaluates issues automatically.
 
 Run the fast suite and the explicit Postgres contract gate with:
 
