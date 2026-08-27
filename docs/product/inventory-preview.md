@@ -57,10 +57,11 @@ its relationships in under ten minutes.
 
 1. Repository detectors extracted from the previous work.
 2. Live MCP observation and tool-description integrity.
-3. Native AWS Bedrock Agents and Guardrails.
-4. Prowler findings/resources/graph adapter.
-5. Generic OCSF finding import.
-6. Eiger demo connector and fixtures.
+3. Native AWS AgentCore runtimes, gateways, identities, endpoints, targets, and memories.
+4. Native AWS Bedrock Agents Classic and Guardrails for existing estates.
+5. Prowler OCSF findings adapter.
+6. Generic OCSF finding import.
+7. Eiger demo connector and fixtures.
 
 ## Acceptance scenario
 
@@ -82,4 +83,3 @@ its relationships in under ten minutes.
 - Runtime threat investigation.
 - Automated remediation.
 - Mobile, voice, SOC, and general-purpose GRC features.
-

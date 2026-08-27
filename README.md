@@ -74,23 +74,47 @@ never accepts it as a command-line value or writes it to evidence. The observer 
 MCP initialization and paginated `tools/list` only. Cleartext HTTP is restricted to
 loopback hosts unless explicitly overridden.
 
-Discover native AWS Bedrock inventory using the normal AWS credential chain or a named
-profile:
+Discover current AWS AgentCore inventory using the normal AWS credential chain or a
+named profile:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-agentcore-scan --regions us-east-1,us-west-2 --profile security-audit
+```
+
+AgentCore is Denali's primary AWS agent path. The connector inventories runtimes,
+runtime endpoints, gateways, gateway targets, workload identities, execution roles, and
+memories. Independent coverage planes prevent a failed target, endpoint, identity, or
+memory API from shrinking unrelated inventory. It reads control-plane metadata only;
+`GetMemory` always uses `without_decryption`. Environment names and values, source
+artifacts, JWT details, request-header names, target schemas and credentials, memory
+descriptions, namespace templates, and SDK exception text are never persisted.
+
+Grant the scanning principal `bedrock-agentcore:ListAgentRuntimes`,
+`bedrock-agentcore:GetAgentRuntime`, `bedrock-agentcore:ListAgentRuntimeEndpoints`,
+`bedrock-agentcore:ListGateways`, `bedrock-agentcore:GetGateway`,
+`bedrock-agentcore:ListGatewayTargets`, `bedrock-agentcore:GetGatewayTarget`,
+`bedrock-agentcore:ListWorkloadIdentities`, `bedrock-agentcore:ListMemories`, and
+`bedrock-agentcore:GetMemory` in every scanned region. The CLI also calls
+`sts:GetCallerIdentity` to bind observations to the authenticated account.
+
+Existing Amazon Bedrock Agents estates—now named Agents Classic by AWS—remain supported
+through the separate Classic connector:
 
 ```bash
 DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
   denali-aws-scan --regions us-east-1,us-west-2 --profile security-audit
 ```
 
-The phase-one AWS connector uses read-only `ListAgents`, `GetAgent`, `ListGuardrails`,
-and `GetGuardrail` calls. It discovers agents, their referenced foundation models,
-execution roles, guardrails, and the evidence-backed relationships between them. Each
-region and API family has an independent coverage boundary, so a failed guardrail read
-cannot erase agents and a partial scan cannot withdraw prior inventory. "Complete"
-means complete within the AWS principal's visibility; Denali cannot prove that an IAM
-policy did not filter resources outside that visibility. Grant `bedrock:ListAgents`,
-`bedrock:GetAgent`, `bedrock:ListGuardrails`, and `bedrock:GetGuardrail` in every region
-you intend to scan.
+The Classic connector uses read-only `ListAgents`, `GetAgent`, `ListGuardrails`, and
+`GetGuardrail` calls. It discovers agents, their referenced foundation models, execution
+roles, guardrails, and the evidence-backed relationships between them. Each region and
+API family has an independent coverage boundary, so a failed guardrail read cannot erase
+agents and a partial scan cannot withdraw prior inventory. For both AWS connectors,
+"complete" means complete within the AWS principal's visibility; Denali cannot prove
+that an IAM policy did not filter resources outside that visibility. Grant
+`bedrock:ListAgents`, `bedrock:GetAgent`, `bedrock:ListGuardrails`, and
+`bedrock:GetGuardrail` in every region you intend to scan with the Classic connector.
 
 Raw agent instructions, guardrail blocked messages, topic names, and regex patterns are
 not persisted. Denali stores configuration presence, normalized policy types and counts,
