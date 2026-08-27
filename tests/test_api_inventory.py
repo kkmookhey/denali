@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from denali.api.app import DEFAULT_LOCAL_TENANT, create_app
 
 ASSET_ID = "11111111-1111-4111-8111-111111111111"
+FINDING_ID = "22222222-2222-4222-8222-222222222222"
 
 
 class RepositoryStub:
@@ -35,6 +36,35 @@ class RepositoryStub:
 
     def latest_coverage(self, tenant_id: str) -> list[dict[str, Any]]:
         return [{"connector_id": "fixture", "plane": "agents", "state": "complete"}]
+
+    def list_findings(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": FINDING_ID,
+                "state": state or "open",
+                "severity": severity or "critical",
+            }
+        ]
+
+    def get_finding(self, tenant_id: str, finding_id: str) -> dict[str, Any] | None:
+        if finding_id != FINDING_ID:
+            return None
+        return {"id": FINDING_ID, "state": "open", "resources": [], "observations": []}
+
+    def finding_summary(self, tenant_id: str) -> dict[str, Any]:
+        return {
+            "total": 1,
+            "by_state": {"open": 1},
+            "open_by_severity": {"critical": 1},
+        }
 
     def set_governance(
         self,
@@ -72,6 +102,17 @@ def test_missing_asset_is_404() -> None:
     with client() as test_client:
         response = test_client.get("/v1/inventory/assets/does-not-exist")
         assert response.status_code == 404
+
+
+def test_findings_surface_and_filters() -> None:
+    with client() as test_client:
+        assert test_client.get("/v1/findings/summary").json()["total"] == 1
+        response = test_client.get("/v1/findings?state=open&severity=critical")
+        assert response.status_code == 200
+        assert response.json()["items"][0]["id"] == FINDING_ID
+        assert test_client.get(f"/v1/findings/{FINDING_ID}").status_code == 200
+        assert test_client.get("/v1/findings/not-found").status_code == 404
+        assert test_client.get("/v1/findings?state=probably-open").status_code == 422
 
 
 def test_governance_update_is_validated_and_persisted() -> None:

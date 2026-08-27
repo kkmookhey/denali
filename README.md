@@ -97,6 +97,27 @@ not persisted. Denali stores configuration presence, normalized policy types and
 and an instruction hash and length so posture can be evaluated without copying sensitive
 prompt content.
 
+Import findings from a Prowler JSON-OCSF report—or another producer that emits an OCSF
+Findings class—with:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-ocsf-import ./output/prowler-output.ocsf.json \
+  --connection-id prowler-production-aws
+```
+
+The importer deliberately does not turn an OCSF resource reference into a Denali asset
+or graph edge. It stores a finding, normalized affected-resource references, compliance
+mappings, and an evidence hash. Arbitrary `resources.data` content is never persisted;
+Prowler reports can contain sensitive configuration values in that field. Imports are
+additive by default. Pass `--authoritative` only for a complete, unfiltered report when
+absence should resolve findings from the same connection and scope. A partial or failed
+import can never resolve findings by absence.
+
+The read API exposes `/v1/findings`, `/v1/findings/summary`, and
+`/v1/findings/{finding_id}`. The independent Denali findings UI will arrive with the
+configuration-findings milestone; this boundary is intentionally usable before that UI.
+
 Run the fast suite and the explicit Postgres contract gate with:
 
 ```bash

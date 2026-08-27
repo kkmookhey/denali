@@ -1,5 +1,13 @@
 """Canonical, provider-neutral Denali domain types."""
 
+from denali.domain.findings import (
+    AffectedResource,
+    EvaluationResult,
+    FindingAssertion,
+    FindingBatch,
+    FindingSeverity,
+    FindingState,
+)
 from denali.domain.inventory import (
     AssertionType,
     AssetAssertion,
@@ -18,6 +26,7 @@ from denali.domain.inventory import (
 )
 
 __all__ = [
+    "AffectedResource",
     "AssertionType",
     "AssetAssertion",
     "AssetKind",
@@ -26,6 +35,11 @@ __all__ = [
     "Coverage",
     "CoverageState",
     "Evidence",
+    "EvaluationResult",
+    "FindingAssertion",
+    "FindingBatch",
+    "FindingSeverity",
+    "FindingState",
     "GovernanceStatus",
     "InventoryBatch",
     "LifecycleState",
@@ -33,4 +47,3 @@ __all__ = [
     "RelationshipCategory",
     "RelationshipKind",
 ]
-

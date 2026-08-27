@@ -13,6 +13,8 @@ from denali.domain import (
     AssetAssertion,
     AssetRef,
     CoverageState,
+    FindingAssertion,
+    FindingBatch,
     InventoryBatch,
     RelationshipAssertion,
 )
@@ -98,6 +100,179 @@ class PostgresInventoryRepository:
             "relationships": len(batch.relationships),
             "withdrawn_assets": withdrawn_assets,
             "withdrawn_relationships": withdrawn_relationships,
+        }
+
+    def ingest_findings(self, tenant_id: str, batch: FindingBatch) -> dict[str, int]:
+        """Persist finding observations without manufacturing inventory assets."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            with connection.transaction():
+                self._insert_run(connection, tenant_id, batch)
+                persisted_findings = 0
+                for finding in batch.findings:
+                    if finding.evaluation_result.value == "pass" and not self._finding_exists(
+                        connection, tenant_id, batch, finding
+                    ):
+                        continue
+                    finding_id = self._upsert_finding(
+                        connection,
+                        tenant_id,
+                        batch,
+                        finding,
+                    )
+                    persisted_findings += 1
+                    self._replace_finding_resources(
+                        connection,
+                        tenant_id,
+                        finding_id,
+                        finding,
+                    )
+                    self._replace_finding_compliance(
+                        connection,
+                        tenant_id,
+                        finding_id,
+                        finding,
+                    )
+                    self._insert_finding_observation(
+                        connection,
+                        tenant_id,
+                        finding_id,
+                        batch,
+                        finding,
+                    )
+
+                resolved_missing = 0
+                if batch.may_resolve_missing:
+                    result = connection.execute(
+                        """
+                        UPDATE finding
+                        SET state = 'resolved',
+                            evaluation_result = 'unknown',
+                            resolution_reason = 'absent_from_authoritative_snapshot',
+                            last_changed_at = %s
+                        WHERE tenant_id = %s::uuid
+                          AND connector_id = %s
+                          AND connection_id = %s
+                          AND scope_key = %s
+                          AND last_observed_run_id <> %s
+                          AND state IN ('open', 'unknown')
+                        """,
+                        (
+                            batch.collected_at,
+                            tenant_id,
+                            batch.connector_id,
+                            batch.connection_id,
+                            batch.scope_key,
+                            batch.run_id,
+                        ),
+                    )
+                    resolved_missing = result.rowcount
+
+        return {"findings": persisted_findings, "resolved_missing": resolved_missing}
+
+    def list_findings(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT f.*,
+                       (SELECT count(*) FROM finding_resource fr
+                        WHERE fr.tenant_id = f.tenant_id AND fr.finding_id = f.id)
+                           AS resource_count
+                FROM finding f
+                WHERE f.tenant_id = %s::uuid
+                  AND (%s::text IS NULL OR f.state = %s::text)
+                  AND (%s::text IS NULL OR f.severity = %s::text)
+                ORDER BY
+                  CASE f.state WHEN 'open' THEN 0 WHEN 'unknown' THEN 1
+                               WHEN 'suppressed' THEN 2 ELSE 3 END,
+                  CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                                  WHEN 'medium' THEN 2 WHEN 'low' THEN 3
+                                  WHEN 'informational' THEN 4 ELSE 5 END,
+                  f.last_seen_at DESC, f.source_uid
+                LIMIT %s OFFSET %s
+                """,
+                (tenant_id, state, state, severity, severity, limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_finding(self, tenant_id: str, finding_id: str) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            finding = connection.execute(
+                "SELECT * FROM finding WHERE tenant_id = %s::uuid AND id = %s::uuid",
+                (tenant_id, finding_id),
+            ).fetchone()
+            if finding is None:
+                return None
+            resources = connection.execute(
+                """
+                SELECT resource_uid AS uid, resource_name AS name,
+                       resource_type, provider, account_uid, region
+                FROM finding_resource
+                WHERE tenant_id = %s::uuid AND finding_id = %s::uuid
+                ORDER BY resource_uid
+                """,
+                (tenant_id, finding_id),
+            ).fetchall()
+            compliance = connection.execute(
+                """
+                SELECT framework, control
+                FROM finding_compliance
+                WHERE tenant_id = %s::uuid AND finding_id = %s::uuid
+                ORDER BY framework, control
+                """,
+                (tenant_id, finding_id),
+            ).fetchall()
+            observations = connection.execute(
+                """
+                SELECT run_id, scope_key, collected_at, source_observed_at,
+                       severity, state, evaluation_result, evidence, attributes,
+                       affected_resources, compliance
+                FROM finding_observation
+                WHERE tenant_id = %s::uuid AND finding_id = %s::uuid
+                ORDER BY collected_at DESC
+                LIMIT 50
+                """,
+                (tenant_id, finding_id),
+            ).fetchall()
+        result = dict(finding)
+        result["resources"] = [dict(row) for row in resources]
+        grouped: dict[str, list[str]] = {}
+        for row in compliance:
+            grouped.setdefault(row["framework"], []).append(row["control"])
+        result["compliance"] = grouped
+        result["observations"] = [dict(row) for row in observations]
+        return result
+
+    def finding_summary(self, tenant_id: str) -> dict[str, Any]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            by_state = connection.execute(
+                """
+                SELECT state, count(*) AS count
+                FROM finding WHERE tenant_id = %s::uuid
+                GROUP BY state ORDER BY state
+                """,
+                (tenant_id,),
+            ).fetchall()
+            open_by_severity = connection.execute(
+                """
+                SELECT severity, count(*) AS count
+                FROM finding WHERE tenant_id = %s::uuid AND state = 'open'
+                GROUP BY severity ORDER BY severity
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return {
+            "total": sum(row["count"] for row in by_state),
+            "by_state": {row["state"]: row["count"] for row in by_state},
+            "open_by_severity": {row["severity"]: row["count"] for row in open_by_severity},
         }
 
     def list_assets(
@@ -245,7 +420,227 @@ class PostgresInventoryRepository:
         return None if row is None else dict(row)
 
     @staticmethod
-    def _insert_run(connection, tenant_id: str, batch: InventoryBatch) -> None:
+    def _finding_exists(
+        connection,
+        tenant_id: str,
+        batch: FindingBatch,
+        finding: FindingAssertion,
+    ) -> bool:
+        return (
+            connection.execute(
+                """
+                SELECT 1 FROM finding
+                WHERE tenant_id = %s::uuid AND connector_id = %s
+                  AND connection_id = %s AND source_uid = %s
+                """,
+                (
+                    tenant_id,
+                    batch.connector_id,
+                    batch.connection_id,
+                    finding.source_uid,
+                ),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _upsert_finding(
+        connection,
+        tenant_id: str,
+        batch: FindingBatch,
+        finding: FindingAssertion,
+    ) -> str:
+        evidence = _evidence_json(finding.evidence)
+        resolution_reason = "source_status" if finding.state.value == "resolved" else None
+        row = connection.execute(
+            """
+            INSERT INTO finding
+              (tenant_id, connector_id, connection_id, scope_key, source_uid, rule_uid,
+               title, description, risk, remediation, remediation_references, severity,
+               state, evaluation_result, class_uid, class_name, source_observed_at,
+               evidence, attributes, resolution_reason, first_seen_at, last_seen_at,
+               last_changed_at, last_observed_run_id)
+            VALUES
+              (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+               %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, connector_id, connection_id, source_uid)
+            DO UPDATE SET
+              last_changed_at = CASE WHEN
+                (finding.scope_key, finding.rule_uid, finding.title, finding.description,
+                 finding.risk, finding.remediation, finding.remediation_references,
+                 finding.severity, finding.state, finding.evaluation_result,
+                 finding.class_uid, finding.class_name, finding.attributes)
+                IS DISTINCT FROM
+                (EXCLUDED.scope_key, EXCLUDED.rule_uid, EXCLUDED.title,
+                 EXCLUDED.description, EXCLUDED.risk, EXCLUDED.remediation,
+                 EXCLUDED.remediation_references, EXCLUDED.severity, EXCLUDED.state,
+                 EXCLUDED.evaluation_result, EXCLUDED.class_uid, EXCLUDED.class_name,
+                 EXCLUDED.attributes)
+                THEN EXCLUDED.last_seen_at ELSE finding.last_changed_at END,
+              scope_key = EXCLUDED.scope_key,
+              rule_uid = EXCLUDED.rule_uid,
+              title = EXCLUDED.title,
+              description = EXCLUDED.description,
+              risk = EXCLUDED.risk,
+              remediation = EXCLUDED.remediation,
+              remediation_references = EXCLUDED.remediation_references,
+              severity = EXCLUDED.severity,
+              state = EXCLUDED.state,
+              evaluation_result = EXCLUDED.evaluation_result,
+              class_uid = EXCLUDED.class_uid,
+              class_name = EXCLUDED.class_name,
+              source_observed_at = EXCLUDED.source_observed_at,
+              evidence = EXCLUDED.evidence,
+              attributes = EXCLUDED.attributes,
+              resolution_reason = EXCLUDED.resolution_reason,
+              last_seen_at = EXCLUDED.last_seen_at,
+              last_observed_run_id = EXCLUDED.last_observed_run_id
+            RETURNING id
+            """,
+            (
+                tenant_id,
+                batch.connector_id,
+                batch.connection_id,
+                batch.scope_key,
+                finding.source_uid,
+                finding.rule_uid,
+                finding.title,
+                finding.description,
+                finding.risk,
+                finding.remediation,
+                json.dumps(finding.remediation_references),
+                finding.severity.value,
+                finding.state.value,
+                finding.evaluation_result.value,
+                finding.class_uid,
+                finding.class_name,
+                finding.observed_at,
+                json.dumps(evidence),
+                json.dumps(dict(finding.attributes)),
+                resolution_reason,
+                batch.collected_at,
+                batch.collected_at,
+                batch.collected_at,
+                batch.run_id,
+            ),
+        ).fetchone()
+        return str(row["id"])
+
+    @staticmethod
+    def _replace_finding_resources(
+        connection,
+        tenant_id: str,
+        finding_id: str,
+        finding: FindingAssertion,
+    ) -> None:
+        connection.execute(
+            "DELETE FROM finding_resource WHERE tenant_id = %s::uuid AND finding_id = %s::uuid",
+            (tenant_id, finding_id),
+        )
+        for resource in finding.affected_resources:
+            connection.execute(
+                """
+                INSERT INTO finding_resource
+                  (tenant_id, finding_id, resource_uid, resource_name, resource_type,
+                   provider, account_uid, region)
+                VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    tenant_id,
+                    finding_id,
+                    resource.uid,
+                    resource.name,
+                    resource.resource_type,
+                    resource.provider,
+                    resource.account_uid,
+                    resource.region,
+                ),
+            )
+
+    @staticmethod
+    def _replace_finding_compliance(
+        connection,
+        tenant_id: str,
+        finding_id: str,
+        finding: FindingAssertion,
+    ) -> None:
+        connection.execute(
+            "DELETE FROM finding_compliance WHERE tenant_id = %s::uuid AND finding_id = %s::uuid",
+            (tenant_id, finding_id),
+        )
+        for framework, controls in finding.compliance.items():
+            for control in controls:
+                connection.execute(
+                    """
+                    INSERT INTO finding_compliance
+                      (tenant_id, finding_id, framework, control)
+                    VALUES (%s::uuid, %s::uuid, %s, %s)
+                    """,
+                    (tenant_id, finding_id, framework, control),
+                )
+
+    @staticmethod
+    def _insert_finding_observation(
+        connection,
+        tenant_id: str,
+        finding_id: str,
+        batch: FindingBatch,
+        finding: FindingAssertion,
+    ) -> None:
+        resources = [
+            {
+                "uid": resource.uid,
+                "name": resource.name,
+                "resource_type": resource.resource_type,
+                "provider": resource.provider,
+                "account_uid": resource.account_uid,
+                "region": resource.region,
+            }
+            for resource in finding.affected_resources
+        ]
+        connection.execute(
+            """
+            INSERT INTO finding_observation
+              (tenant_id, finding_id, connector_id, connection_id, run_id, scope_key,
+               collected_at, source_observed_at, severity, state, evaluation_result,
+               evidence, attributes, affected_resources, compliance)
+            VALUES
+              (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+               %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)
+            ON CONFLICT
+              (tenant_id, finding_id, connector_id, connection_id, run_id)
+            DO UPDATE SET
+              collected_at = EXCLUDED.collected_at,
+              source_observed_at = EXCLUDED.source_observed_at,
+              severity = EXCLUDED.severity,
+              state = EXCLUDED.state,
+              evaluation_result = EXCLUDED.evaluation_result,
+              evidence = EXCLUDED.evidence,
+              attributes = EXCLUDED.attributes,
+              affected_resources = EXCLUDED.affected_resources,
+              compliance = EXCLUDED.compliance
+            """,
+            (
+                tenant_id,
+                finding_id,
+                batch.connector_id,
+                batch.connection_id,
+                batch.run_id,
+                batch.scope_key,
+                batch.collected_at,
+                finding.observed_at,
+                finding.severity.value,
+                finding.state.value,
+                finding.evaluation_result.value,
+                json.dumps(_evidence_json(finding.evidence)),
+                json.dumps(dict(finding.attributes)),
+                json.dumps(resources),
+                json.dumps(dict(finding.compliance)),
+            ),
+        )
+
+    @staticmethod
+    def _insert_run(connection, tenant_id: str, batch: InventoryBatch | FindingBatch) -> None:
         connection.execute(
             """
             INSERT INTO collection_run

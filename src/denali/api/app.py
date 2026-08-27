@@ -34,6 +34,20 @@ class InventoryReader(Protocol):
 
     def latest_coverage(self, tenant_id: str) -> list[dict[str, Any]]: ...
 
+    def list_findings(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]: ...
+
+    def get_finding(self, tenant_id: str, finding_id: str) -> dict[str, Any] | None: ...
+
+    def finding_summary(self, tenant_id: str) -> dict[str, Any]: ...
+
     def set_governance(
         self,
         tenant_id: str,
@@ -149,6 +163,43 @@ def create_app(
     def source_coverage(request: Request) -> dict[str, Any]:
         repo, current_tenant = _context(request)
         return {"items": repo.latest_coverage(current_tenant)}
+
+    @app.get("/v1/findings/summary")
+    def finding_summary(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return repo.finding_summary(current_tenant)
+
+    @app.get("/v1/findings")
+    def list_findings(
+        request: Request,
+        state: str | None = Query(
+            default=None,
+            pattern="^(open|resolved|suppressed|unknown)$",
+        ),
+        severity: str | None = Query(
+            default=None,
+            pattern="^(unknown|informational|low|medium|high|critical)$",
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        rows = repo.list_findings(
+            current_tenant,
+            state=state,
+            severity=severity,
+            limit=limit,
+            offset=offset,
+        )
+        return {"items": rows, "limit": limit, "offset": offset}
+
+    @app.get("/v1/findings/{finding_id}")
+    def finding_detail(request: Request, finding_id: str) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        row = repo.get_finding(current_tenant, finding_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="finding not found")
+        return row
 
     return app
 

@@ -16,6 +16,7 @@ denali-db-migrate = "denali.store.cli:migrate_main"
 denali-demo-seed = "denali.connectors.demo:seed_main"
 denali-aws-scan = "denali.connectors.aws_bedrock:scan_main"
 denali-mcp-observe = "denali.connectors.mcp_http:observe_main"
+denali-ocsf-import = "denali.connectors.ocsf_findings:import_main"
 denali-repo-scan = "denali.connectors.repository:scan_main"
 
 [project.optional-dependencies]
