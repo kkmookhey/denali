@@ -79,3 +79,76 @@ export type Coverage = {
   run_id: string;
   collected_at: string;
 };
+
+export type FindingSeverity =
+  | "unknown"
+  | "informational"
+  | "low"
+  | "medium"
+  | "high"
+  | "critical";
+
+export type FindingState = "open" | "resolved" | "suppressed" | "unknown";
+
+export type Finding = {
+  id: string;
+  connector_id: string;
+  connection_id: string;
+  scope_key: string;
+  source_uid: string;
+  rule_uid: string;
+  title: string;
+  description: string | null;
+  risk: string | null;
+  remediation: string | null;
+  remediation_references: string[];
+  severity: FindingSeverity;
+  state: FindingState;
+  evaluation_result: string;
+  class_uid: number;
+  class_name: string;
+  source_observed_at: string;
+  evidence: Evidence;
+  attributes: Record<string, unknown>;
+  resolution_reason: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_changed_at: string;
+  last_observed_run_id: string;
+  resource_count: number;
+};
+
+export type FindingResource = {
+  uid: string;
+  name: string | null;
+  resource_type: string | null;
+  provider: string | null;
+  account_uid: string | null;
+  region: string | null;
+};
+
+export type FindingObservation = {
+  run_id: string;
+  scope_key: string;
+  collected_at: string;
+  source_observed_at: string;
+  severity: FindingSeverity;
+  state: FindingState;
+  evaluation_result: string;
+  evidence: Evidence;
+  attributes: Record<string, unknown>;
+  affected_resources: FindingResource[];
+  compliance: Record<string, string[]>;
+};
+
+export type FindingDetail = Finding & {
+  resources: FindingResource[];
+  compliance: Record<string, string[]>;
+  observations: FindingObservation[];
+};
+
+export type FindingSummary = {
+  total: number;
+  by_state: Record<string, number>;
+  open_by_severity: Record<string, number>;
+};

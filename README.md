@@ -20,6 +20,8 @@ while Denali owns a richer canonical model for durable inventory and relationshi
 
 The first public milestone is **Denali Inventory Preview**. Its definition is in
 [`docs/product/inventory-preview.md`](docs/product/inventory-preview.md).
+The configuration-findings slice is defined in
+[`docs/product/configuration-findings-preview.md`](docs/product/configuration-findings-preview.md).
 
 ## Repository status
 
@@ -27,9 +29,10 @@ This repository is intentionally new. Proven first-party components will be impo
 from the CISOBrief history only after they conform to Denali's standalone contracts.
 Shasta infrastructure and Prowler UI patches will not be carried forward.
 
-The foundation currently contains the canonical inventory and connector contracts, a
-Postgres assertion store, and the first read/write inventory API. A transparent demo
-connector provides fixture data for local product development; every fixture assertion
+The foundation currently contains canonical inventory and finding contracts, a Postgres
+assertion store, read/write inventory APIs, read-only finding APIs, and independent web
+experiences for inventory and AI configuration findings. A transparent demo connector
+provides fixture data for local product development; every fixture assertion and finding
 is visibly identified as such in its evidence.
 
 ## Development
@@ -139,8 +142,10 @@ absence should resolve findings from the same connection and scope. A partial or
 import can never resolve findings by absence.
 
 The read API exposes `/v1/findings`, `/v1/findings/summary`, and
-`/v1/findings/{finding_id}`. The independent Denali findings UI will arrive with the
-configuration-findings milestone; this boundary is intentionally usable before that UI.
+`/v1/findings/{finding_id}`. The independent Denali web application provides severity
+and state filtering plus evidence, affected-resource, compliance, remediation, and
+observation-history views. Run `denali-demo-seed` for three clearly labelled fixture
+findings, or import a real OCSF report to replace the demonstration data.
 
 Run the fast suite and the explicit Postgres contract gate with:
 

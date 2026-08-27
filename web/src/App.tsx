@@ -36,10 +36,21 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
-import type { Asset, AssetDetail, Coverage, Relationship, Summary } from "./types";
+import type {
+  Asset,
+  AssetDetail,
+  Coverage,
+  Finding,
+  FindingDetail,
+  FindingSeverity,
+  FindingSummary,
+  Relationship,
+  Summary,
+} from "./types";
 
-type Page = "dashboard" | "inventory" | "sources";
+type Page = "dashboard" | "inventory" | "findings" | "sources";
 type DetailTab = "overview" | "relationships" | "evidence";
+type FindingDetailTab = "overview" | "evidence" | "history";
 
 const KIND_META: Record<string, { label: string; plural: string; icon: LucideIcon; color: string }> = {
   ai_agent: { label: "AI agent", plural: "AI agents", icon: Bot, color: "coral" },
@@ -88,7 +99,10 @@ function App() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [coverage, setCoverage] = useState<Coverage[]>([]);
+  const [findingSummary, setFindingSummary] = useState<FindingSummary | null>(null);
+  const [findings, setFindings] = useState<Finding[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -96,14 +110,19 @@ function App() {
   const loadAll = useCallback(async () => {
     setError(null);
     try {
-      const [summaryResult, assetsResult, coverageResult] = await Promise.all([
-        api.summary(),
-        api.assets(),
-        api.coverage(),
-      ]);
+      const [summaryResult, assetsResult, coverageResult, findingSummaryResult, findingsResult] =
+        await Promise.all([
+          api.summary(),
+          api.assets(),
+          api.coverage(),
+          api.findingSummary(),
+          api.findings(),
+        ]);
       setSummary(summaryResult);
       setAssets(assetsResult.items);
       setCoverage(coverageResult.items);
+      setFindingSummary(findingSummaryResult);
+      setFindings(findingsResult.items);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Unable to reach the Denali API");
     } finally {
@@ -143,6 +162,12 @@ function App() {
             />
           ) : page === "inventory" ? (
             <Inventory assets={assets} onOpenAsset={setSelectedId} />
+          ) : page === "findings" ? (
+            <Findings
+              summary={findingSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
+              findings={findings}
+              onOpenFinding={setSelectedFindingId}
+            />
           ) : (
             <Sources coverage={coverage} />
           )}
@@ -155,6 +180,12 @@ function App() {
           onClose={() => setSelectedId(null)}
           onOpenAsset={setSelectedId}
           onUpdated={loadAll}
+        />
+      )}
+      {selectedFindingId && (
+        <FindingDrawer
+          findingId={selectedFindingId}
+          onClose={() => setSelectedFindingId(null)}
         />
       )}
     </div>
@@ -174,7 +205,7 @@ function Sidebar({ page, onNavigate, open }: { page: Page; onNavigate: (page: Pa
         <NavButton active={page === "inventory"} icon={Boxes} label="Inventory" onClick={() => onNavigate("inventory")} />
         <NavButton active={page === "sources"} icon={Waypoints} label="Sources & coverage" onClick={() => onNavigate("sources")} />
         <p className="nav-heading">SECURITY</p>
-        <NavButton icon={CircleAlert} label="Findings" badge="Soon" disabled />
+        <NavButton active={page === "findings"} icon={CircleAlert} label="Config findings" onClick={() => onNavigate("findings")} />
         <NavButton icon={Network} label="Issues & paths" badge="Soon" disabled />
         <NavButton icon={Activity} label="Threats" badge="Soon" disabled />
       </nav>
@@ -216,6 +247,7 @@ function Topbar({ page, onMenu, onRefresh }: { page: Page; onMenu: () => void; o
   const titles: Record<Page, { eyebrow: string; title: string }> = {
     dashboard: { eyebrow: "Inventory Preview", title: "AI security overview" },
     inventory: { eyebrow: "Discovery", title: "AI inventory" },
+    findings: { eyebrow: "Posture", title: "AI configuration findings" },
     sources: { eyebrow: "Data confidence", title: "Sources & coverage" },
   };
   const content = titles[page];
@@ -376,6 +408,111 @@ function AssetTableRow({ asset, onClick }: { asset: Asset; onClick: () => void }
   </button>;
 }
 
+const SEVERITY_ORDER: FindingSeverity[] = ["critical", "high", "medium", "low", "informational", "unknown"];
+
+function Findings({
+  summary,
+  findings,
+  onOpenFinding,
+}: {
+  summary: FindingSummary;
+  findings: Finding[];
+  onOpenFinding: (id: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [severity, setSeverity] = useState("all");
+  const [state, setState] = useState("open");
+  const filtered = useMemo(
+    () =>
+      findings.filter((finding) => {
+        const haystack = `${finding.title} ${finding.rule_uid} ${finding.connector_id} ${finding.class_name}`.toLowerCase();
+        return (
+          haystack.includes(search.toLowerCase()) &&
+          (severity === "all" || finding.severity === severity) &&
+          (state === "all" || finding.state === state)
+        );
+      }),
+    [findings, search, severity, state],
+  );
+
+  return <div className="page-stack findings-page">
+    <section className="page-intro"><div><span className="eyebrow">ATOMIC, EVIDENCE-BEARING FACTS</span><h2>AI configuration findings</h2><p>Provider-neutral posture findings from Prowler, OCSF producers, and Denali-native checks—kept separate from inventory claims.</p></div><div className="result-count"><strong>{summary.by_state.open ?? 0}</strong><span>open findings</span></div></section>
+    <section className="finding-metric-grid">
+      {SEVERITY_ORDER.slice(0, 4).map((item) => <FindingMetric key={item} severity={item} count={summary.open_by_severity[item] ?? 0} />)}
+    </section>
+    <section className="panel findings-panel">
+      <div className="filterbar">
+        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search finding, rule, class, or source…" /></label>
+        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option>{SEVERITY_ORDER.map((item) => <option key={item} value={item}>{titleCase(item)}</option>)}</select></label>
+        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => setState(event.target.value)}><option value="all">All states</option><option value="open">Open</option><option value="unknown">Unknown</option><option value="suppressed">Suppressed</option><option value="resolved">Resolved</option></select></label>
+        {(search || severity !== "all" || state !== "open") && <button className="clear-button" onClick={() => { setSearch(""); setSeverity("all"); setState("open"); }}>Reset</button>}
+      </div>
+      <div className="findings-table" role="table" aria-label="AI configuration findings">
+        <div className="findings-table-head" role="row"><span>Finding</span><span>Severity</span><span>State</span><span>Affected</span><span>Source</span><span>Last seen</span><span /></div>
+        {filtered.map((finding) => <FindingTableRow key={finding.id} finding={finding} onClick={() => onOpenFinding(finding.id)} />)}
+        {filtered.length === 0 && <div className="empty-state"><ShieldCheck /><strong>{findings.length === 0 ? "No findings have been imported" : "No findings match these filters"}</strong><span>{findings.length === 0 ? "Import a Prowler JSON-OCSF report or run the transparent demo seed." : "Reset the filters or include resolved findings."}</span></div>}
+      </div>
+    </section>
+    <p className="fixture-note"><CircleHelp size={15} /> Findings are evaluated conditions. Resource references do not create inventory assets or graph edges.</p>
+  </div>;
+}
+
+function FindingMetric({ severity, count }: { severity: FindingSeverity; count: number }) {
+  return <div className={`finding-metric severity-${severity}`}><span className="severity-mark"><CircleAlert /></span><div><span>{titleCase(severity)}</span><strong>{count}</strong><small>open {count === 1 ? "finding" : "findings"}</small></div></div>;
+}
+
+function FindingTableRow({ finding, onClick }: { finding: Finding; onClick: () => void }) {
+  return <button className="findings-table-row" role="row" onClick={onClick}>
+    <span className="finding-title-cell"><span className={`finding-icon severity-${finding.severity}`}><CircleAlert size={18} /></span><span><strong>{finding.title}</strong><small>{finding.rule_uid} · {finding.class_name}</small></span></span>
+    <span><span className={`severity-badge ${finding.severity}`}>{titleCase(finding.severity)}</span></span>
+    <span><span className={`finding-state ${finding.state}`}>{titleCase(finding.state)}</span></span>
+    <span>{finding.resource_count} {finding.resource_count === 1 ? "resource" : "resources"}</span>
+    <span className="finding-source"><strong>{finding.connector_id}</strong><small>{finding.connection_id}</small></span>
+    <span>{formatTime(finding.last_seen_at)}</span><span><ChevronRight size={17} /></span>
+  </button>;
+}
+
+function FindingDrawer({ findingId, onClose }: { findingId: string; onClose: () => void }) {
+  const [detail, setDetail] = useState<FindingDetail | null>(null);
+  const [tab, setTab] = useState<FindingDetailTab>("overview");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDetail(null); setError(null); setTab("overview");
+    api.finding(findingId).then(setDetail).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load finding"));
+  }, [findingId]);
+
+  return <div className="drawer-layer"><button className="drawer-scrim" onClick={onClose} aria-label="Close finding detail" /><aside className="resource-drawer finding-drawer" aria-label="Finding detail">
+    {!detail && !error ? <LoadingState compact /> : error ? <ErrorState message={error} subject="finding" /> : detail && <>
+      <div className="drawer-header finding-drawer-header"><button className="drawer-close" onClick={onClose}><X /></button><span className={`finding-icon large severity-${detail.severity}`}><CircleAlert /></span><div><span>{detail.class_name}</span><h2>{detail.title}</h2><p>{detail.rule_uid} · {detail.connector_id}</p></div><span className={`severity-badge ${detail.severity}`}>{titleCase(detail.severity)}</span></div>
+      <div className="finding-summary-strip"><span className={`finding-state ${detail.state}`}>{titleCase(detail.state)}</span><span><strong>{detail.resources.length}</strong> affected {detail.resources.length === 1 ? "resource" : "resources"}</span><span><strong>{Object.keys(detail.compliance).length}</strong> frameworks</span><span>Last seen <strong>{formatTime(detail.last_seen_at)}</strong></span></div>
+      <div className="drawer-tabs">{(["overview", "evidence", "history"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{titleCase(item)}{item === "history" && <small>{detail.observations.length}</small>}</button>)}</div>
+      <div className="drawer-content">
+        {tab === "overview" ? <FindingOverview detail={detail} /> : tab === "evidence" ? <FindingEvidence detail={detail} /> : <FindingHistory detail={detail} />}
+      </div>
+    </>}
+  </aside></div>;
+}
+
+function FindingOverview({ detail }: { detail: FindingDetail }) {
+  return <div className="detail-stack">
+    <div className="finding-narrative"><span>WHAT DENALI OBSERVED</span><p>{detail.description ?? "The source did not provide a description."}</p></div>
+    {detail.risk && <DetailSection title="Risk and impact"><p className="finding-copy">{detail.risk}</p></DetailSection>}
+    {detail.remediation && <DetailSection title="Recommended remediation"><p className="finding-copy">{detail.remediation}</p>{detail.remediation_references.length > 0 && <div className="reference-list">{detail.remediation_references.map((reference) => <a key={reference} href={reference} target="_blank" rel="noreferrer"><Link2 />{reference}</a>)}</div>}</DetailSection>}
+    <DetailSection title="Finding properties"><div className="property-grid"><Property label="Rule" value={detail.rule_uid} mono /><Property label="Evaluation" value={titleCase(detail.evaluation_result)} /><Property label="First seen" value={formatTime(detail.first_seen_at)} /><Property label="Last changed" value={formatTime(detail.last_changed_at)} /><Property label="Source" value={detail.connector_id} /><Property label="Connection" value={detail.connection_id} /><Property label="OCSF class" value={`${detail.class_name} (${detail.class_uid})`} /><Property label="Scope" value={detail.scope_key} mono /></div></DetailSection>
+    <DetailSection title="Affected resources"><div className="affected-list">{detail.resources.map((resource) => <div key={resource.uid}><span className="affected-icon"><Boxes /></span><span><strong>{resource.name ?? shortKey(resource.uid)}</strong><small>{resource.resource_type ?? "Resource"} · {resource.provider ?? "Unknown provider"}</small><code>{resource.uid}</code></span>{resource.region && <em>{resource.region}</em>}</div>)}</div></DetailSection>
+    {Object.keys(detail.compliance).length > 0 && <DetailSection title="Related frameworks"><div className="compliance-list">{Object.entries(detail.compliance).map(([framework, controls]) => <div key={framework}><strong>{framework}</strong><span>{controls.map((control) => <i key={control}>{control}</i>)}</span></div>)}</div></DetailSection>}
+  </div>;
+}
+
+function FindingEvidence({ detail }: { detail: FindingDetail }) {
+  return <div className="detail-stack"><div className="evidence-principle"><ShieldCheck /><div><strong>Source evidence remains intact</strong><p>Denali normalizes the security fact without copying arbitrary OCSF resource data or turning references into inventory.</p></div></div><DetailSection title="Evidence"><div className="evidence-card"><Property label="Source type" value={detail.evidence.source_type} /><Property label="Observed at" value={formatTime(detail.evidence.observed_at)} /><Property label="Locator" value={detail.evidence.locator} mono /><Property label="Source UID" value={detail.source_uid} mono /><details><summary>Normalized evidence payload</summary><pre>{JSON.stringify(detail.evidence.payload, null, 2)}</pre></details></div></DetailSection>{Object.keys(detail.attributes).length > 0 && <DetailSection title="Source metadata"><div className="attribute-list">{Object.entries(detail.attributes).map(([key, value]) => <div key={key}><span>{titleCase(key)}</span><strong>{String(value)}</strong></div>)}</div></DetailSection>}</div>;
+}
+
+function FindingHistory({ detail }: { detail: FindingDetail }) {
+  return <div className="detail-stack"><div className="history-intro"><Clock3 /><div><strong>Observation history</strong><p>A new collection time does not masquerade as a semantic finding change.</p></div></div><div className="finding-history">{detail.observations.map((observation) => <div key={`${observation.run_id}-${observation.collected_at}`}><span className={`history-dot ${observation.state}`} /><div><strong>{titleCase(observation.evaluation_result)} · {titleCase(observation.severity)}</strong><small>{formatTime(observation.collected_at)} · {observation.run_id}</small><p>{titleCase(observation.state)} in {observation.scope_key}</p></div></div>)}</div></div>;
+}
+
 function Sources({ coverage }: { coverage: Coverage[] }) {
   const grouped = coverage.reduce<Map<string, Coverage[]>>((result, item) => {
     const key = `${item.connector_id}:${item.connection_id}`;
@@ -447,7 +584,7 @@ function EvidenceTab({ detail }: { detail: AssetDetail }) {
 function DetailSection({ title, children }: { title: string; children: React.ReactNode }) { return <section className="detail-section"><h3>{title}</h3>{children}</section>; }
 function Property({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) { return <div className={`property ${mono ? "mono" : ""}`}><span>{label}</span><strong>{value}</strong></div>; }
 
-function ErrorState({ message, onRetry }: { message: string; onRetry?: () => void }) { return <div className="state-page"><CircleAlert /><h2>Denali could not load inventory</h2><p>{message}</p>{onRetry && <button onClick={() => void onRetry()}><RefreshCw />Try again</button>}</div>; }
+function ErrorState({ message, onRetry, subject = "inventory" }: { message: string; onRetry?: () => void; subject?: string }) { return <div className="state-page"><CircleAlert /><h2>Denali could not load {subject}</h2><p>{message}</p>{onRetry && <button onClick={() => void onRetry()}><RefreshCw />Try again</button>}</div>; }
 function LoadingState({ compact = false }: { compact?: boolean }) { return <div className={`loading-state ${compact ? "compact" : ""}`}><Mountain /><span /><p>Mapping the AI system…</p></div>; }
 
 export default App;

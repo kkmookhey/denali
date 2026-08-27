@@ -1,4 +1,12 @@
-import type { Asset, AssetDetail, Coverage, Summary } from "./types";
+import type {
+  Asset,
+  AssetDetail,
+  Coverage,
+  Finding,
+  FindingDetail,
+  FindingSummary,
+  Summary,
+} from "./types";
 
 const API_BASE = "/api";
 
@@ -19,6 +27,9 @@ export const api = {
   assets: () => request<{ items: Asset[] }>("/v1/inventory/assets?limit=500"),
   asset: (id: string) => request<AssetDetail>(`/v1/inventory/assets/${id}`),
   coverage: () => request<{ items: Coverage[] }>("/v1/sources/coverage"),
+  findingSummary: () => request<FindingSummary>("/v1/findings/summary"),
+  findings: () => request<{ items: Finding[] }>("/v1/findings?limit=500"),
+  finding: (id: string) => request<FindingDetail>(`/v1/findings/${id}`),
   governance: (
     id: string,
     update: { status: Asset["governance_status"]; owner?: string | null; notes?: string | null },
