@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
+import json
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from threading import Lock
 from time import monotonic, sleep
 from typing import Annotated, Any, Literal, Protocol
@@ -19,9 +25,14 @@ from denali.connections import (
     AWS_COVERAGE_AUTOMATIC,
     AWS_COVERAGE_SELECTED,
     AWS_SCOPES,
+    AZURE_CLOUD_PUBLIC,
+    AZURE_SCOPES,
     AwsCloudFormationLauncher,
     AwsConnectionValidator,
+    AzureConnectionValidator,
+    AzureSetupScriptLauncher,
     aws_connection_coverage_plan,
+    azure_coverage_plan,
 )
 from denali.connections.aws import render_cloudformation
 from denali.store.db import migrate
@@ -59,6 +70,27 @@ class InventoryReader(Protocol):
 
     def record_connection_launch(
         self, tenant_id: str, connection_id: str, launch: dict[str, Any]
+    ) -> dict[str, Any] | None: ...
+
+    def record_connection_setup_launch(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        launch: dict[str, Any],
+        setup_token_sha256: str,
+    ) -> dict[str, Any] | None: ...
+
+    def complete_azure_connection_setup(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_setup_token_sha256: str,
+        service_principal_id: str,
+        subscriptions: list[dict[str, str]],
+        coverage_plan: list[dict[str, Any]],
+        completed_at: datetime,
     ) -> dict[str, Any] | None: ...
 
     def disable_connection(self, tenant_id: str, connection_id: str) -> dict[str, Any] | None: ...
@@ -205,11 +237,37 @@ class AwsConnectionCreate(BaseModel):
     )
 
 
+class AzureConnectionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["azure"] = "azure"
+    display_name: str = Field(min_length=1, max_length=120)
+    tenant_id: UUID
+    cloud: Literal["AzureCloud"] = AZURE_CLOUD_PUBLIC
+    declared_scopes: list[str] = Field(
+        default_factory=lambda: list(AZURE_SCOPES), min_length=1, max_length=len(AZURE_SCOPES)
+    )
+
+
+class AzureSetupCompletion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    completion_code: str = Field(min_length=16, max_length=32768)
+
+
+ConnectionCreate = Annotated[
+    AwsConnectionCreate | AzureConnectionCreate,
+    Field(discriminator="provider"),
+]
+
+
 def create_app(
     *,
     repository: InventoryReader | None = None,
     connection_validator: AwsConnectionValidator | None = None,
+    azure_connection_validator: AzureConnectionValidator | None = None,
     cloudformation_launcher: AwsCloudFormationLauncher | None = None,
+    azure_setup_launcher: AzureSetupScriptLauncher | None = None,
     onboarding_validation_timeout_seconds: int | None = None,
     onboarding_validation_retry_seconds: int | None = None,
     tenant_id: str | None = None,
@@ -218,6 +276,7 @@ def create_app(
     configured_dsn = os.environ.get("DENALI_DSN")
     configured_tenant = tenant_id or os.environ.get("DENALI_TENANT_ID", DEFAULT_LOCAL_TENANT)
     configured_launcher = cloudformation_launcher or _cloudformation_launcher_from_environment()
+    configured_azure_launcher = azure_setup_launcher or _azure_setup_launcher_from_environment()
     onboarding_validation_timeout = (
         onboarding_validation_timeout_seconds
         if onboarding_validation_timeout_seconds is not None
@@ -248,7 +307,11 @@ def create_app(
             app.state.repository = None
         app.state.tenant_id = configured_tenant
         app.state.connection_validator = connection_validator or AwsConnectionValidator()
+        app.state.azure_connection_validator = (
+            azure_connection_validator or AzureConnectionValidator()
+        )
         app.state.cloudformation_launcher = configured_launcher
+        app.state.azure_setup_launcher = configured_azure_launcher
         app.state.onboarding_validation_timeout = onboarding_validation_timeout
         app.state.onboarding_validation_retry = onboarding_validation_retry
         app.state.active_connection_validations = set()
@@ -287,7 +350,11 @@ def create_app(
                 return {"status": "already_running", "connection_id": connection_id}
             active_validations.add(connection_key)
 
-        validator = request.app.state.connection_validator
+        validator = (
+            request.app.state.connection_validator
+            if target["provider"] == "aws"
+            else request.app.state.azure_connection_validator
+        )
         retry_seconds = request.app.state.onboarding_validation_retry
         timeout_seconds = request.app.state.onboarding_validation_timeout
 
@@ -331,11 +398,50 @@ def create_app(
         }
 
     @app.post("/v1/connections", status_code=201)
-    def create_connection(request: Request, connection: AwsConnectionCreate) -> dict[str, Any]:
+    def create_connection(request: Request, connection: ConnectionCreate) -> dict[str, Any]:
         repo, current_tenant = _context(request)
         display_name = connection.display_name.strip()
         if not display_name:
             raise HTTPException(status_code=422, detail="display_name must not be blank")
+        if isinstance(connection, AzureConnectionCreate):
+            launcher = request.app.state.azure_setup_launcher
+            if launcher is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Azure onboarding is not configured; set DENALI_AZURE_CLIENT_ID, "
+                        "DENALI_AZURE_ONBOARDING_BUCKET, and the consent redirect URI"
+                    ),
+                )
+            scopes = list(dict.fromkeys(connection.declared_scopes))
+            unsupported_scopes = [scope for scope in scopes if scope not in AZURE_SCOPES]
+            if unsupported_scopes:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"unsupported Azure scope: {', '.join(unsupported_scopes)}",
+                )
+            connection_id = str(uuid4())
+            try:
+                created = repo.create_connection(
+                    current_tenant,
+                    connection_id=connection_id,
+                    provider="azure",
+                    display_name=display_name,
+                    credential_type="azure_multitenant_app",
+                    credential_reference={"client_id": launcher.client_id},
+                    declared_scopes=scopes,
+                    coverage_plan=[],
+                    configuration={
+                        "tenant_id": str(connection.tenant_id),
+                        "cloud": connection.cloud,
+                        "coverage_mode": "selected-subscriptions",
+                        "subscriptions": [],
+                    },
+                )
+                return _with_validation_state(request, current_tenant, created)
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+
         if not _valid_aws_region(connection.deployment_region, partition=connection.partition):
             raise HTTPException(
                 status_code=422,
@@ -492,6 +598,129 @@ def create_app(
             "validation_status": validation["status"],
         }
 
+    @app.post("/v1/connections/{connection_id}/azure/setup/launch", status_code=201)
+    def launch_azure_setup(
+        request: Request,
+        response: Response,
+        connection_id: UUID,
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "azure":
+            raise HTTPException(status_code=404, detail="Azure connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot be launched")
+        launcher = request.app.state.azure_setup_launcher
+        if launcher is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Azure Cloud Shell onboarding is not configured",
+            )
+        try:
+            launch = launcher.create_launch(
+                tenant_id=current_tenant,
+                connection_id=str(connection_id),
+                connection=target,
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=502, detail="Unable to prepare the Azure setup script"
+            ) from error
+
+        recorded = repo.record_connection_setup_launch(
+            current_tenant,
+            str(connection_id),
+            launch={
+                "method": "azure_cloud_shell",
+                "script_version": launch["script_version"],
+                "script_sha256": launch["script_sha256"],
+                "client_id": launch["client_id"],
+                "published_at": launch["published_at"].isoformat(),
+                "url_expires_at": launch["expires_at"].isoformat(),
+            },
+            setup_token_sha256=launch["callback_token_sha256"],
+        )
+        if recorded is None:
+            raise HTTPException(status_code=409, detail="connection changed during launch")
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "consent_url": launch["consent_url"],
+            "cloud_shell_url": launch["cloud_shell_url"],
+            "script_url": launch["script_url"],
+            "setup_command": launch["setup_command"],
+            "script_version": launch["script_version"],
+            "script_sha256": launch["script_sha256"],
+            "expires_at": launch["expires_at"],
+        }
+
+    @app.post("/v1/connections/{connection_id}/azure/setup/complete", status_code=202)
+    def complete_azure_setup(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        connection_id: UUID,
+        completion: AzureSetupCompletion,
+    ) -> dict[str, str]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "azure":
+            raise HTTPException(status_code=404, detail="Azure connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot be completed")
+        payload = _decode_azure_completion_code(completion.completion_code)
+        expected_token_hash = target["credential_reference"].get("setup_token_sha256")
+        presented_token = payload.get("token")
+        token_matches = (
+            bool(expected_token_hash)
+            and isinstance(presented_token, str)
+            and hmac.compare_digest(
+                expected_token_hash, hashlib.sha256(presented_token.encode()).hexdigest()
+            )
+        )
+        if not token_matches:
+            raise HTTPException(status_code=409, detail="Azure setup completion code is invalid")
+        onboarding = target["configuration"].get("onboarding", {})
+        try:
+            expires_at = datetime.fromisoformat(onboarding["url_expires_at"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=409, detail="Azure setup launch is not current"
+            ) from error
+        if datetime.now(UTC) > expires_at:
+            raise HTTPException(status_code=409, detail="Azure setup completion code has expired")
+        if str(payload.get("tenant_id", "")).lower() != target["configuration"][
+            "tenant_id"
+        ].lower():
+            raise HTTPException(status_code=409, detail="Azure tenant does not match the plan")
+        service_principal_id = str(payload.get("service_principal_id", ""))
+        if not _valid_uuid_text(service_principal_id):
+            raise HTTPException(status_code=422, detail="Azure service principal ID is invalid")
+        subscriptions = _azure_subscriptions_from_completion(payload)
+        completed_at = datetime.now(UTC)
+        updated = repo.complete_azure_connection_setup(
+            current_tenant,
+            str(connection_id),
+            expected_setup_token_sha256=expected_token_hash,
+            service_principal_id=service_principal_id,
+            subscriptions=subscriptions,
+            coverage_plan=azure_coverage_plan(target["declared_scopes"], subscriptions),
+            completed_at=completed_at,
+        )
+        if updated is None:
+            raise HTTPException(status_code=409, detail="connection changed during setup")
+        validation_target = repo.get_connection_validation_target(
+            current_tenant, str(connection_id)
+        )
+        if validation_target is None:
+            raise HTTPException(status_code=409, detail="connection changed during setup")
+        return queue_validation(
+            request,
+            background_tasks,
+            repo,
+            current_tenant,
+            validation_target,
+            wait_for_credentials=True,
+        )
+
     @app.post("/v1/connections/{connection_id}/validate", status_code=202)
     def validate_connection(
         request: Request,
@@ -505,8 +734,13 @@ def create_app(
             raise HTTPException(status_code=404, detail="connection not found")
         if target["lifecycle_state"] != "active":
             raise HTTPException(status_code=409, detail="disabled connections cannot be validated")
-        if target["provider"] != "aws":
+        if target["provider"] not in {"aws", "azure"}:
             raise HTTPException(status_code=422, detail="connection provider is not supported")
+        if target["provider"] == "azure" and not target["configuration"].get("subscriptions"):
+            raise HTTPException(
+                status_code=409,
+                detail="complete Azure subscription selection before validation",
+            )
         return queue_validation(
             request,
             background_tasks,
@@ -825,7 +1059,14 @@ def _with_validation_state(
         running = connection_key in request.app.state.active_connection_validations
     result["validation_state"] = "running" if running else "idle"
     result["setup_capabilities"] = {
-        "cloudformation_quick_create": request.app.state.cloudformation_launcher is not None
+        "cloudformation_quick_create": (
+            result["provider"] == "aws"
+            and request.app.state.cloudformation_launcher is not None
+        ),
+        "azure_cloud_shell": (
+            result["provider"] == "azure"
+            and request.app.state.azure_setup_launcher is not None
+        ),
     }
     return result
 
@@ -843,6 +1084,72 @@ def _cloudformation_launcher_from_environment() -> AwsCloudFormationLauncher | N
         principal_arn=principal_arn,
         expires_in_seconds=expires_in_seconds,
     )
+
+
+def _azure_setup_launcher_from_environment() -> AzureSetupScriptLauncher | None:
+    bucket_name = os.environ.get("DENALI_AZURE_ONBOARDING_BUCKET")
+    client_id = os.environ.get("DENALI_AZURE_CLIENT_ID")
+    redirect_uri = os.environ.get("DENALI_AZURE_CONSENT_REDIRECT_URI") or os.environ.get(
+        "DENALI_WEB_URL", "http://127.0.0.1:3080"
+    )
+    if not bucket_name or not client_id:
+        return None
+    expires_in_seconds = _bounded_environment_integer(
+        "DENALI_AZURE_ONBOARDING_URL_SECONDS",
+        default=3600,
+        minimum=300,
+        maximum=3600,
+    )
+    return AzureSetupScriptLauncher(
+        bucket_name=bucket_name,
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        expires_in_seconds=expires_in_seconds,
+    )
+
+
+def _decode_azure_completion_code(value: str) -> dict[str, Any]:
+    encoded = value.strip()
+    if encoded.startswith("DENALI_SETUP_COMPLETE="):
+        encoded = encoded.split("=", 1)[1].strip()
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded + padding))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=422, detail="Azure setup completion code is malformed"
+        ) from error
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Azure setup completion code is malformed")
+    return payload
+
+
+def _azure_subscriptions_from_completion(payload: dict[str, Any]) -> list[dict[str, str]]:
+    raw_subscriptions = payload.get("subscriptions")
+    if not isinstance(raw_subscriptions, list) or not 1 <= len(raw_subscriptions) <= 200:
+        raise HTTPException(status_code=422, detail="select between 1 and 200 subscriptions")
+    subscriptions: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_subscriptions:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=422, detail="Azure subscription selection is invalid")
+        subscription_id = str(item.get("id", ""))
+        name = str(item.get("name", "")).strip()
+        normalized_id = subscription_id.lower()
+        if not _valid_uuid_text(subscription_id) or not name or len(name) > 256:
+            raise HTTPException(status_code=422, detail="Azure subscription selection is invalid")
+        if normalized_id not in seen:
+            seen.add(normalized_id)
+            subscriptions.append({"id": subscription_id, "name": name})
+    return subscriptions
+
+
+def _valid_uuid_text(value: str) -> bool:
+    try:
+        UUID(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _bounded_environment_integer(

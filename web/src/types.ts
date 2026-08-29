@@ -92,6 +92,8 @@ export type ConnectionValidationResult = {
   discovered_regions?: string[];
   not_enabled_regions?: string[];
   excluded_enabled_regions?: string[];
+  subscription_id?: string;
+  subscription_name?: string;
 };
 
 export type ConnectionValidation = {
@@ -116,35 +118,49 @@ export type ConnectionCoveragePlan = {
 
 export type Connection = {
   id: string;
-  provider: "aws";
+  provider: "aws" | "azure";
   display_name: string;
   lifecycle_state: "active" | "disabled";
   health_state: "unknown" | "healthy" | "partial" | "unhealthy" | "disabled";
   validation_state?: "idle" | "running";
   setup_capabilities: {
     cloudformation_quick_create: boolean;
+    azure_cloud_shell: boolean;
   };
-  credential_reference: {
-    type: "aws_assume_role";
-    role_arn: string;
-  };
+  credential_reference:
+    | {
+        type: "aws_assume_role";
+        role_arn: string;
+      }
+    | {
+        type: "azure_multitenant_app";
+        client_id: string;
+        service_principal_id?: string;
+      };
   declared_scopes: string[];
   coverage_plan: ConnectionCoveragePlan[];
   configuration: {
-    account_id: string;
-    partition: "aws" | "aws-us-gov" | "aws-cn";
+    account_id?: string;
+    partition?: "aws" | "aws-us-gov" | "aws-cn";
     deployment_region?: string;
-    coverage_mode?: "automatic" | "selected";
-    regions: string[];
-    role_name: string;
-    stack_scopes: string[];
+    coverage_mode?: "automatic" | "selected" | "selected-subscriptions";
+    regions?: string[];
+    role_name?: string;
+    stack_scopes?: string[];
+    tenant_id?: string;
+    cloud?: "AzureCloud";
+    subscriptions?: Array<{ id: string; name: string }>;
     onboarding?: {
-      method: "cloudformation_quick_create";
-      template_version: string;
-      template_sha256: string;
-      principal_arn: string;
+      method: "cloudformation_quick_create" | "azure_cloud_shell";
+      template_version?: string;
+      template_sha256?: string;
+      principal_arn?: string;
+      script_version?: string;
+      script_sha256?: string;
+      client_id?: string;
       published_at: string;
       url_expires_at: string;
+      completed_at?: string;
     };
   };
   created_at?: string;
@@ -172,6 +188,24 @@ export type AwsConnectionCreate = {
   coverage_mode: "automatic" | "selected";
   regions: string[];
   declared_scopes: string[];
+};
+
+export type AzureConnectionCreate = {
+  provider: "azure";
+  display_name: string;
+  tenant_id: string;
+  cloud: "AzureCloud";
+  declared_scopes: string[];
+};
+
+export type AzureSetupLaunch = {
+  consent_url: string;
+  cloud_shell_url: string;
+  script_url: string;
+  setup_command: string;
+  script_version: string;
+  script_sha256: string;
+  expires_at: string;
 };
 
 export type FindingSeverity =

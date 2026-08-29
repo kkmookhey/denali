@@ -1,0 +1,335 @@
+from __future__ import annotations
+
+import base64
+import json
+from datetime import UTC, datetime
+from typing import Any
+
+from fastapi.testclient import TestClient
+
+from denali.api.app import DEFAULT_LOCAL_TENANT, create_app
+from denali.connections import (
+    AZURE_SCOPES,
+    AzureConnectionValidator,
+    AzureSetupScriptLauncher,
+    azure_coverage_plan,
+)
+
+TENANT_ID = "11111111-1111-4111-8111-111111111111"
+CLIENT_ID = "22222222-2222-4222-8222-222222222222"
+SERVICE_PRINCIPAL_ID = "33333333-3333-4333-8333-333333333333"
+SUBSCRIPTION_ONE = "44444444-4444-4444-8444-444444444444"
+SUBSCRIPTION_TWO = "55555555-5555-4555-8555-555555555555"
+SETUP_TOKEN = "azure-setup-token-fixture-with-enough-entropy"
+
+
+class AzureConnectionRepositoryStub:
+    def __init__(self):
+        self.targets: dict[str, dict[str, Any]] = {}
+        self.rows: dict[str, dict[str, Any]] = {}
+
+    def create_connection(self, tenant_id: str, **values: Any) -> dict[str, Any]:
+        assert tenant_id == DEFAULT_LOCAL_TENANT
+        connection_id = values["connection_id"]
+        target = {"id": connection_id, "lifecycle_state": "active", **values}
+        self.targets[connection_id] = target
+        self.rows[connection_id] = self._safe(target)
+        return self.rows[connection_id]
+
+    def list_connections(self, tenant_id: str) -> list[dict[str, Any]]:
+        return list(self.rows.values())
+
+    def get_connection(self, tenant_id: str, connection_id: str) -> dict[str, Any] | None:
+        return self.rows.get(connection_id)
+
+    def get_connection_validation_target(
+        self, tenant_id: str, connection_id: str
+    ) -> dict[str, Any] | None:
+        return self.targets.get(connection_id)
+
+    def record_connection_validation(
+        self, tenant_id: str, connection_id: str, validation: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        row = self.rows.get(connection_id)
+        if row is None:
+            return None
+        row["health_state"] = validation["health_state"]
+        row["last_validation"] = validation
+        row["last_validated_at"] = validation["completed_at"].isoformat()
+        return row
+
+    def record_connection_launch(
+        self, tenant_id: str, connection_id: str, launch: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        raise AssertionError("AWS launch must not be used for Azure")
+
+    def record_connection_setup_launch(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        launch: dict[str, Any],
+        setup_token_sha256: str,
+    ) -> dict[str, Any] | None:
+        target = self.targets.get(connection_id)
+        row = self.rows.get(connection_id)
+        if target is None or row is None:
+            return None
+        target["credential_reference"]["setup_token_sha256"] = setup_token_sha256
+        target["configuration"]["onboarding"] = launch
+        row["configuration"]["onboarding"] = launch
+        return row
+
+    def complete_azure_connection_setup(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_setup_token_sha256: str,
+        service_principal_id: str,
+        subscriptions: list[dict[str, str]],
+        coverage_plan: list[dict[str, Any]],
+        completed_at: datetime,
+    ) -> dict[str, Any] | None:
+        target = self.targets.get(connection_id)
+        row = self.rows.get(connection_id)
+        if target is None or row is None:
+            return None
+        if target["credential_reference"].get("setup_token_sha256") != expected_setup_token_sha256:
+            return None
+        target["credential_reference"].pop("setup_token_sha256", None)
+        target["credential_reference"]["service_principal_id"] = service_principal_id
+        target["configuration"]["subscriptions"] = subscriptions
+        target["configuration"]["onboarding"]["completed_at"] = completed_at.isoformat()
+        target["coverage_plan"] = coverage_plan
+        row["credential_reference"]["service_principal_id"] = service_principal_id
+        row["configuration"] = target["configuration"]
+        row["coverage_plan"] = coverage_plan
+        return row
+
+    def disable_connection(self, tenant_id: str, connection_id: str) -> dict[str, Any] | None:
+        row = self.rows.get(connection_id)
+        if row is None:
+            return None
+        row["lifecycle_state"] = "disabled"
+        row["health_state"] = "disabled"
+        self.targets[connection_id]["lifecycle_state"] = "disabled"
+        return row
+
+    def delete_connection(self, tenant_id: str, connection_id: str) -> str:
+        row = self.rows.get(connection_id)
+        if row is None:
+            return "not_found"
+        if row["lifecycle_state"] != "disabled":
+            return "active"
+        del self.rows[connection_id]
+        del self.targets[connection_id]
+        return "deleted"
+
+    @staticmethod
+    def _safe(target: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": target["id"],
+            "provider": "azure",
+            "display_name": target["display_name"],
+            "lifecycle_state": target["lifecycle_state"],
+            "health_state": "unknown",
+            "credential_reference": {
+                "type": "azure_multitenant_app",
+                "client_id": target["credential_reference"]["client_id"],
+            },
+            "declared_scopes": target["declared_scopes"],
+            "coverage_plan": target["coverage_plan"],
+            "configuration": target["configuration"],
+            "last_validation": None,
+            "last_validated_at": None,
+        }
+
+
+class FakeS3OnboardingClient:
+    def __init__(self):
+        self.put: dict[str, Any] | None = None
+
+    def put_object(self, **kwargs: Any) -> None:
+        self.put = kwargs
+
+    def generate_presigned_url(
+        self, client_method: str, *, Params: dict[str, str], ExpiresIn: int
+    ) -> str:
+        return "https://templates.example.test/azure.sh?signature=fixture"
+
+
+class PassingAzureValidator:
+    def validate(self, target: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        return {
+            "started_at": now,
+            "completed_at": now,
+            "health_state": "healthy",
+            "credential_state": "passed",
+            "account_id_observed": ",".join(
+                item["id"] for item in target["configuration"]["subscriptions"]
+            ),
+            "results": [
+                {
+                    "scope": item["scope"],
+                    "plane": item["plane"],
+                    "label": item["label"],
+                    "region": item["region"],
+                    "subscription_id": item["subscription_id"],
+                    "state": "passed",
+                    "detail": "Fixture Azure validation succeeded.",
+                }
+                for item in target["coverage_plan"]
+            ],
+            "summary": "Azure subscriptions and every declared plane validated.",
+        }
+
+
+def _completion_code(subscriptions: list[dict[str, str]]) -> str:
+    payload = json.dumps(
+        {
+            "token": SETUP_TOKEN,
+            "tenant_id": TENANT_ID,
+            "service_principal_id": SERVICE_PRINCIPAL_ID,
+            "subscriptions": subscriptions,
+        },
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def test_azure_setup_enumerates_then_binds_only_selected_subscriptions() -> None:
+    repository = AzureConnectionRepositoryStub()
+    s3 = FakeS3OnboardingClient()
+    launcher = AzureSetupScriptLauncher(
+        bucket_name="denali-onboarding",
+        client_id=CLIENT_ID,
+        redirect_uri="http://127.0.0.1:3080",
+        s3_client=s3,
+        now=lambda: datetime.now(UTC),
+        nonce=lambda: "one-time-script",
+        token=lambda: SETUP_TOKEN,
+    )
+    app = create_app(
+        repository=repository,
+        azure_connection_validator=PassingAzureValidator(),  # type: ignore[arg-type]
+        azure_setup_launcher=launcher,
+        onboarding_validation_retry_seconds=0,
+        migrate_on_start=False,
+    )
+    with TestClient(app) as client:
+        created_response = client.post(
+            "/v1/connections",
+            json={
+                "provider": "azure",
+                "display_name": "Production Azure",
+                "tenant_id": TENANT_ID,
+            },
+        )
+        assert created_response.status_code == 201
+        created = created_response.json()
+        connection_id = created["id"]
+        assert created["coverage_plan"] == []
+        assert created["configuration"]["subscriptions"] == []
+        assert created["setup_capabilities"]["azure_cloud_shell"] is True
+        assert "setup_token" not in created_response.text
+
+        assert client.post(f"/v1/connections/{connection_id}/validate").status_code == 409
+        launch_response = client.post(
+            f"/v1/connections/{connection_id}/azure/setup/launch"
+        )
+        assert launch_response.status_code == 201
+        launch = launch_response.json()
+        assert launch["cloud_shell_url"] == "https://shell.azure.com/bash"
+        assert "adminconsent" in launch["consent_url"]
+        assert "denali-azure-onboard.sh" in launch["setup_command"]
+        assert SETUP_TOKEN not in launch_response.text
+        assert launch_response.headers["cache-control"] == "no-store"
+        assert s3.put is not None
+        script = s3.put["Body"].decode()
+        assert "az account list --all" in script
+        assert "Select subscriptions by number" in script
+        assert "--assignee-principal-type ServicePrincipal" in script
+        assert "--role 'acdd72a7-3385-48ef-bd42-f606fba81ae7'" not in script
+        assert "DENALI_READER_ROLE_ID='acdd72a7-3385-48ef-bd42-f606fba81ae7'" in script
+
+        subscriptions = [
+            {"id": SUBSCRIPTION_ONE, "name": "Production"},
+            {"id": SUBSCRIPTION_TWO, "name": "AI Lab"},
+        ]
+        completed = client.post(
+            f"/v1/connections/{connection_id}/azure/setup/complete",
+            json={"completion_code": f"DENALI_SETUP_COMPLETE={_completion_code(subscriptions)}"},
+        )
+        assert completed.status_code == 202
+        detail = client.get(f"/v1/connections/{connection_id}").json()
+        assert detail["health_state"] == "healthy"
+        assert detail["configuration"]["subscriptions"] == subscriptions
+        assert len(detail["coverage_plan"]) == 5 * len(subscriptions)
+        assert len(detail["last_validation"]["results"]) == 5 * len(subscriptions)
+        assert "setup_token" not in json.dumps(detail)
+        assert (
+            client.post(
+                f"/v1/connections/{connection_id}/azure/setup/complete",
+                json={"completion_code": _completion_code(subscriptions)},
+            ).status_code
+            == 409
+        )
+
+
+class FakeToken:
+    token = "azure-access-token"
+
+
+class FakeCredential:
+    def get_token(self, *scopes: str, **kwargs: Any) -> FakeToken:
+        return FakeToken()
+
+
+class FakeResponse:
+    def __init__(self, payload: dict[str, Any], error: Exception | None = None):
+        self.payload = payload
+        self.error = error
+
+    def raise_for_status(self) -> None:
+        if self.error:
+            raise self.error
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+def test_azure_validation_is_subscription_specific_and_all_locations() -> None:
+    subscriptions = [
+        {"id": SUBSCRIPTION_ONE, "name": "Production"},
+        {"id": SUBSCRIPTION_TWO, "name": "AI Lab"},
+    ]
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    def request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        requests.append((method, url, kwargs))
+        if "/subscriptions/" in url and "/providers/" not in url:
+            subscription_id = url.rsplit("/", 1)[1]
+            return FakeResponse({"subscriptionId": subscription_id, "tenantId": TENANT_ID})
+        return FakeResponse({"data": []})
+
+    validator = AzureConnectionValidator(
+        credential_factory=lambda tenant_id: FakeCredential(),
+        request=request,
+    )
+    connection = {
+        "id": "66666666-6666-4666-8666-666666666666",
+        "provider": "azure",
+        "declared_scopes": list(AZURE_SCOPES),
+        "configuration": {"tenant_id": TENANT_ID, "subscriptions": subscriptions},
+        "coverage_plan": azure_coverage_plan(list(AZURE_SCOPES), subscriptions),
+    }
+    validation = validator.validate(connection)
+    assert validation["health_state"] == "healthy"
+    assert validation["credential_state"] == "passed"
+    assert len(validation["results"]) == 10
+    assert all(item["region"] == "all-locations" for item in validation["results"])
+    graph_calls = [item for item in requests if "ResourceGraph" in item[1]]
+    assert len(graph_calls) == 8
+    assert all(len(item[2]["json"]["subscriptions"]) == 1 for item in graph_calls)

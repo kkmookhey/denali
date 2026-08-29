@@ -50,6 +50,8 @@ import type {
   Asset,
   AssetDetail,
   AwsConnectionCreate,
+  AzureConnectionCreate,
+  AzureSetupLaunch,
   CodeToCloudDeployment,
   Connection,
   Coverage,
@@ -127,7 +129,12 @@ function formatTime(value: string) {
 }
 
 function App() {
-  const [page, setPage] = useState<Page>("dashboard");
+  const [page, setPage] = useState<Page>(() => {
+    const query = new URLSearchParams(window.location.search);
+    return query.has("state") && (query.has("admin_consent") || query.has("error"))
+      ? "connections"
+      : "dashboard";
+  });
   const [summary, setSummary] = useState<Summary | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [coverage, setCoverage] = useState<Coverage[]>([]);
@@ -1726,6 +1733,12 @@ const AWS_CONNECTION_SCOPES = [
   { id: "aws.bedrock_logging", label: "Invocation logging configuration", detail: "Configuration presence, never prompts or responses" },
 ];
 
+const AZURE_CONNECTION_SCOPES = [
+  { id: "azure.ai_services", label: "Azure AI services", detail: "AI service accounts and Azure AI Search" },
+  { id: "azure.ai_platform", label: "Azure AI platform", detail: "Machine Learning workspaces and Bot Service" },
+  { id: "azure.ai_activity", label: "Azure AI management activity", detail: "Subscription Activity Log metadata; no prompts or responses" },
+];
+
 function ConnectionsPage({
   connections,
   onChanged,
@@ -1735,6 +1748,7 @@ function ConnectionsPage({
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(connections[0]?.id ?? null);
   const [showCreate, setShowCreate] = useState(connections.length === 0);
+  const [provider, setProvider] = useState<"aws" | "azure">("aws");
   const [displayName, setDisplayName] = useState("");
   const [accountId, setAccountId] = useState("");
   const [partition, setPartition] = useState<AwsConnectionCreate["partition"]>("aws");
@@ -1742,6 +1756,9 @@ function ConnectionsPage({
   const [coverageMode, setCoverageMode] = useState<AwsConnectionCreate["coverage_mode"]>("automatic");
   const [regions, setRegions] = useState("us-east-1");
   const [scopes, setScopes] = useState(AWS_CONNECTION_SCOPES.map((scope) => scope.id));
+  const [azureTenantId, setAzureTenantId] = useState("");
+  const [azureLaunches, setAzureLaunches] = useState<Record<string, AzureSetupLaunch>>({});
+  const [azureCompletionCode, setAzureCompletionCode] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const selected = connections.find((connection) => connection.id === selectedId) ?? connections[0];
@@ -1751,21 +1768,29 @@ function ConnectionsPage({
     setBusy("create");
     setActionError(null);
     try {
-      const created = await api.createConnection({
-        provider: "aws",
-        display_name: displayName,
-        account_id: accountId,
-        partition,
-        deployment_region: deploymentRegion,
-        coverage_mode: coverageMode,
-        regions: coverageMode === "selected" ? regions.split(",").map((region) => region.trim()).filter(Boolean) : [],
-        declared_scopes: scopes,
-      });
+      const payload: AwsConnectionCreate | AzureConnectionCreate = provider === "aws" ? {
+          provider: "aws",
+          display_name: displayName,
+          account_id: accountId,
+          partition,
+          deployment_region: deploymentRegion,
+          coverage_mode: coverageMode,
+          regions: coverageMode === "selected" ? regions.split(",").map((region) => region.trim()).filter(Boolean) : [],
+          declared_scopes: scopes,
+        } : {
+          provider: "azure",
+          display_name: displayName,
+          tenant_id: azureTenantId,
+          cloud: "AzureCloud",
+          declared_scopes: scopes,
+        };
+      const created = await api.createConnection(payload);
       await onChanged();
       setSelectedId(created.id);
       setShowCreate(false);
       setDisplayName("");
       setAccountId("");
+      setAzureTenantId("");
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "Unable to create connection");
     } finally {
@@ -1824,6 +1849,39 @@ function ConnectionsPage({
     }
   }
 
+  async function prepareAzureSetup(connection: Connection) {
+    setBusy(`launch:${connection.id}`);
+    setActionError(null);
+    try {
+      const launch = await api.launchAzureSetup(connection.id);
+      setAzureLaunches((current) => ({ ...current, [connection.id]: launch }));
+      await onChanged();
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to prepare Azure setup");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function completeAzureSetup(connection: Connection) {
+    const completionCode = azureCompletionCode[connection.id]?.trim();
+    if (!completionCode) {
+      setActionError("Paste the completion code printed by the Azure setup script.");
+      return;
+    }
+    setBusy(`complete:${connection.id}`);
+    setActionError(null);
+    try {
+      await api.completeAzureSetup(connection.id, completionCode);
+      await waitForValidation(connection, 525);
+      setAzureCompletionCode((current) => ({ ...current, [connection.id]: "" }));
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to complete Azure setup");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function disableConnection(connection: Connection) {
     if (!window.confirm(`Disable ${connection.display_name}? Scheduled collection must stop using this connection.`)) return;
     setBusy(`disable:${connection.id}`);
@@ -1864,30 +1922,34 @@ function ConnectionsPage({
 
   return <div className="page-stack connections-page">
     <section className="page-intro connection-intro">
-      <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali access keys.</h2><p>AWS uses a read-only assume-role path. Authentication and every declared collection plane are validated separately.</p></div>
-      <button className="primary-action" onClick={() => setShowCreate((visible) => !visible)}><Plus /> Add AWS connection</button>
+      <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali customer credentials.</h2><p>AWS uses assume-role; Azure uses a multi-tenant application with Reader only on subscriptions the customer selects. Every declared plane is validated separately.</p></div>
+      <button className="primary-action" onClick={() => setShowCreate((visible) => !visible)}><Plus /> Add connection</button>
     </section>
     <section className="connection-boundary"><ShieldCheck /><div><strong>Connection health is not a risk verdict.</strong><span>A healthy connection means the configured role and declared validation calls worked. It does not mean collection is complete, findings are absent, or the AWS account is safe.</span></div></section>
     {actionError && <div className="connection-error"><CircleAlert /><span>{actionError}</span></div>}
     {showCreate && <form className="panel connection-create" onSubmit={(event) => void createConnection(event)}>
-      <div className="connection-create-head"><div><span>NEW CONNECTION</span><h3>Amazon Web Services</h3><p>CloudFormation creates one read-only role with an external-ID trust condition. No access keys are created or stored.</p></div><span className="provider-mark">AWS</span></div>
+      <div className="connection-provider-picker"><button type="button" className={provider === "aws" ? "active" : ""} onClick={() => { setProvider("aws"); setScopes(AWS_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Amazon Web Services</button><button type="button" className={provider === "azure" ? "active" : ""} onClick={() => { setProvider("azure"); setScopes(AZURE_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Microsoft Azure</button></div>
+      <div className="connection-create-head"><div><span>NEW CONNECTION</span><h3>{provider === "aws" ? "Amazon Web Services" : "Microsoft Azure"}</h3><p>{provider === "aws" ? "CloudFormation creates one read-only role with an external-ID trust condition. No access keys are created or stored." : "Denali’s multi-tenant application receives Reader only on subscriptions you select in Azure Cloud Shell. No customer client secret is created or stored."}</p></div><span className="provider-mark">{provider === "aws" ? "AWS" : "AZURE"}</span></div>
       <div className="connection-form-grid">
-        <label><span>Connection name</span><input required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Production AWS" /></label>
+        <label><span>Connection name</span><input required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder={provider === "aws" ? "Production AWS" : "Production Azure"} /></label>
+        {provider === "aws" ? <>
         <label><span>AWS account ID</span><input required inputMode="numeric" pattern="[0-9]{12}" maxLength={12} value={accountId} onChange={(event) => setAccountId(event.target.value)} placeholder="123456789012" /></label>
         <label><span>Partition</span><select value={partition} onChange={(event) => setPartition(event.target.value as AwsConnectionCreate["partition"])}><option value="aws">Commercial AWS</option><option value="aws-us-gov">AWS GovCloud</option><option value="aws-cn">AWS China</option></select></label>
         <label><span>Preferred CloudFormation stack location</span><input required value={deploymentRegion} onChange={(event) => setDeploymentRegion(event.target.value)} placeholder="us-east-1" /><small>This plans where the stack is managed; it does not limit inventory coverage.</small></label>
         <label><span>Inventory region coverage</span><select value={coverageMode} onChange={(event) => setCoverageMode(event.target.value as AwsConnectionCreate["coverage_mode"])}><option value="automatic">All enabled regions (recommended)</option><option value="selected">Selected regions only</option></select><small>Automatic mode rediscovers enabled and opted-in regions on every validation.</small></label>
-        {coverageMode === "selected" && <label><span>Selected inventory regions</span><input required value={regions} onChange={(event) => setRegions(event.target.value)} placeholder="us-east-1, us-west-2" /><small>Coverage outside this explicit allowlist will be reported as excluded.</small></label>}
+        {coverageMode === "selected" && <label><span>Selected inventory regions</span><input required value={regions} onChange={(event) => setRegions(event.target.value)} placeholder="us-east-1, us-west-2" /><small>Coverage outside this explicit allowlist will be reported as excluded.</small></label>}</> : <>
+        <label><span>Microsoft Entra tenant ID</span><input required pattern="[0-9a-fA-F-]{36}" maxLength={36} value={azureTenantId} onChange={(event) => setAzureTenantId(event.target.value)} placeholder="00000000-0000-0000-0000-000000000000" /><small>Cloud Shell will enumerate enabled subscriptions in this tenant and let you choose.</small></label>
+        <label><span>Resource location coverage</span><input value="All locations in selected subscriptions" disabled /><small>Azure Resource Graph queries are subscription-wide; no single region limits coverage.</small></label></>}
       </div>
-      <fieldset className="connection-scope-picker"><legend>Declared collection planes</legend>{AWS_CONNECTION_SCOPES.map((scope) => <label key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={() => toggleScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.detail}</small></span></label>)}</fieldset>
+      <fieldset className="connection-scope-picker"><legend>Declared collection planes</legend>{(provider === "aws" ? AWS_CONNECTION_SCOPES : AZURE_CONNECTION_SCOPES).map((scope) => <label key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={() => toggleScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.detail}</small></span></label>)}</fieldset>
       <div className="connection-form-actions"><button type="button" onClick={() => setShowCreate(false)}>Cancel</button><button className="primary-action" type="submit" disabled={busy === "create" || scopes.length === 0}>{busy === "create" ? "Creating…" : "Create onboarding plan"}</button></div>
     </form>}
     <div className="connections-layout">
       <section className="panel connection-list-panel">
-        <PanelHeader eyebrow="AWS" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
-        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.configuration.account_id} · {(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : connection.configuration.regions.join(", ")}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No AWS connections configured</strong><span>Create an onboarding plan to begin. Other providers are intentionally not available in this slice.</span></div>}</div>
+        <PanelHeader eyebrow="CLOUD" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
+        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No cloud connections configured</strong><span>Create an AWS or Azure onboarding plan to begin.</span></div>}</div>
       </section>
-      {selected && <ConnectionDetail connection={selected} busy={busy} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
+      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
     </div>
   </div>;
 }
@@ -1897,8 +1959,10 @@ function ConnectionHealth({ state }: { state: Connection["health_state"] }) {
   return <span className={`connection-health ${state}`}><Icon />{titleCase(state)}</span>;
 }
 
-function ConnectionDetail({ connection, busy, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+  if (connection.provider === "azure") return <AzureConnectionDetail connection={connection} busy={busy} launch={azureLaunch} completionCode={azureCompletionCode} onCompletionCode={onAzureCompletionCode} onPrepare={onPrepareAzure} onComplete={onCompleteAzure} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   const validation = connection.last_validation;
+  const awsCredential = connection.credential_reference.type === "aws_assume_role" ? connection.credential_reference : null;
   const launching = busy === `launch:${connection.id}`;
   const validating = connection.validation_state === "running" || busy === `validate:${connection.id}` || launching;
   const validatedRole = validation?.credential_state === "passed";
@@ -1917,15 +1981,37 @@ function ConnectionDetail({ connection, busy, onLaunch, onValidate, onDisable, o
   }, new Map<string, { label: string; total: number; passed: number; failed: number; unknown: number; notApplicable: number }>()).values()];
   const coverageMode = connection.configuration.coverage_mode ?? "automatic";
   return <section className="panel connection-detail">
-    <div className="connection-detail-head"><div><span>AMAZON WEB SERVICES</span><h3>{connection.display_name}</h3><code>{connection.credential_reference.role_arn}</code></div><ConnectionHealth state={connection.health_state} /></div>
+    <div className="connection-detail-head"><div><span>AMAZON WEB SERVICES</span><h3>{connection.display_name}</h3><code>{awsCredential?.role_arn}</code></div><ConnectionHealth state={connection.health_state} /></div>
     <div className="setup-progress">
       <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Account, scopes, role ARN, and {coverageMode === "automatic" ? "automatic enabled-region coverage" : "the selected-region boundary"} are recorded.</small></div></div>
-      <div className={validatedRole ? "complete" : "current"}><span>{validatedRole ? <Check /> : "2"}</span><div><strong>2. Deploy the CloudFormation stack</strong><small>The stack is managed in {connection.configuration.deployment_region ?? "us-east-1"}; its account-wide IAM role does not restrict inventory to that Region. AWS lets you inspect the exact template and permissions before creating it.</small><div className="connection-launch-actions"><button className="primary-action" disabled={launching || !connection.setup_capabilities.cloudformation_quick_create} onClick={onLaunch}><ExternalLink />{launching ? "Waiting for AWS deployment…" : "Launch in AWS"}</button><a className="secondary-action" href={api.cloudFormationUrl(connection.id)} download><Download /> Download template</a></div>{!connection.setup_capabilities.cloudformation_quick_create && <small className="launch-unavailable">One-click launch requires the Denali onboarding bucket and runtime principal configuration. Manual template download remains available.</small>}{connection.configuration.onboarding && <small className="launch-record">Last launch prepared {formatTime(connection.configuration.onboarding.published_at)} · template {connection.configuration.onboarding.template_sha256.slice(0, 12)}</small>}</div></div>
+      <div className={validatedRole ? "complete" : "current"}><span>{validatedRole ? <Check /> : "2"}</span><div><strong>2. Deploy the CloudFormation stack</strong><small>The stack is managed in {connection.configuration.deployment_region ?? "us-east-1"}; its account-wide IAM role does not restrict inventory to that Region. AWS lets you inspect the exact template and permissions before creating it.</small><div className="connection-launch-actions"><button className="primary-action" disabled={launching || !connection.setup_capabilities.cloudformation_quick_create} onClick={onLaunch}><ExternalLink />{launching ? "Waiting for AWS deployment…" : "Launch in AWS"}</button><a className="secondary-action" href={api.cloudFormationUrl(connection.id)} download><Download /> Download template</a></div>{!connection.setup_capabilities.cloudformation_quick_create && <small className="launch-unavailable">One-click launch requires the Denali onboarding bucket and runtime principal configuration. Manual template download remains available.</small>}{connection.configuration.onboarding?.template_sha256 && <small className="launch-record">Last launch prepared {formatTime(connection.configuration.onboarding.published_at)} · template {connection.configuration.onboarding.template_sha256.slice(0, 12)}</small>}</div></div>
       <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Discover Regions and validate every plane</strong><small>Role assumption and account binding run first. Enabled Regions are observed next; each applicable regional plane then succeeds or fails independently.</small>{connection.lifecycle_state === "active" && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating across AWS…" : validation ? "Validate again" : "Validate connection"}</button>}{validating && <small className="validation-progress-note">This continues in the background. Large accounts can take a few minutes.</small>}</div></div>
     </div>
     <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed account {validation.account_id_observed ?? "not established"}</small></div>{regionDiscovery && <div className={`region-discovery ${regionDiscovery.state}`}><span>{regionDiscovery.state === "passed" ? <CircleCheck /> : regionDiscovery.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{coverageMode === "automatic" ? "Automatic enabled-region coverage" : "Selected-region coverage"}</strong><p>{regionDiscovery.detail}</p>{regionDiscovery.discovered_regions && regionDiscovery.discovered_regions.length > 0 && <small>{regionDiscovery.discovered_regions.join(", ")}</small>}{regionDiscovery.excluded_enabled_regions && regionDiscovery.excluded_enabled_regions.length > 0 && <small className="excluded-regions">Outside declared scope: {regionDiscovery.excluded_enabled_regions.join(", ")}</small>}</div></div>}<div className="validation-plane-rollup">{planeSummaries.map((summary) => <div className={summary.failed || summary.unknown ? "attention" : "complete"} key={summary.label}><span>{summary.failed || summary.unknown ? <CircleAlert /> : <CircleCheck />}</span><div><strong>{summary.label}</strong><small>{summary.total} Region checks</small></div><div className="rollup-counts"><b className="passed">{summary.passed} passed</b>{summary.notApplicable > 0 && <b>{summary.notApplicable} not applicable</b>}{summary.failed > 0 && <b className="failed">{summary.failed} failed</b>}{summary.unknown > 0 && <b className="failed">{summary.unknown} unknown</b>}</div></div>)}</div><details className="plane-validation-results"><summary>View all {planeResults.length} raw plane/Region results</summary><div className="validation-grid">{planeResults.map((result) => <div key={`${result.scope}:${result.plane}:${result.region}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.region} · {result.state === "not_applicable" ? "Not applicable" : titleCase(result.plane)}</small><p>{result.detail}</p></div></div>)}</div></details></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>No coverage conclusion is available until the stack is deployed and validation runs.</small></span></div>}</div>
     <details className="connection-permissions"><summary>Review {permissions.length} declared permissions</summary><div>{permissions.map((permission) => <code key={permission}>{permission}</code>)}</div><p>The downloaded role also includes bounded read-only permissions for future explicit stack scopes. Those custom stack planes are not configured or claimed here.</p></details>
     <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes only connection configuration and validation history; collected evidence remains.</span></div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
+  </section>;
+}
+
+function AzureConnectionDetail({ connection, busy, launch, completionCode, onCompletionCode, onPrepare, onComplete, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; launch?: AzureSetupLaunch; completionCode: string; onCompletionCode: (value: string) => void; onPrepare: () => void; onComplete: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+  const validation = connection.last_validation;
+  const subscriptions = connection.configuration.subscriptions ?? [];
+  const setupComplete = subscriptions.length > 0;
+  const preparing = busy === `launch:${connection.id}`;
+  const completing = busy === `complete:${connection.id}`;
+  const validating = connection.validation_state === "running" || busy === `validate:${connection.id}` || completing;
+  const credential = connection.credential_reference.type === "azure_multitenant_app" ? connection.credential_reference : null;
+  const permissions = [...new Set(connection.coverage_plan.flatMap((item) => item.permissions))].sort();
+  return <section className="panel connection-detail">
+    <div className="connection-detail-head"><div><span>MICROSOFT AZURE</span><h3>{connection.display_name}</h3><code>Tenant {connection.configuration.tenant_id}</code></div><ConnectionHealth state={connection.health_state} /></div>
+    <div className="setup-progress">
+      <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Tenant, application ID, scopes, and subscription-selection boundary are recorded. Entra directory access is not included.</small></div></div>
+      <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Authorize Denali and select subscriptions</strong><small>Azure Cloud Shell enumerates enabled subscriptions visible to your signed-in identity. Reader is assigned only to the subscriptions you select; every resource location inside them remains in scope.</small>{!launch && <button className="primary-action" disabled={preparing || !connection.setup_capabilities.azure_cloud_shell} onClick={onPrepare}><ExternalLink />{preparing ? "Preparing Azure setup…" : "Prepare Azure setup"}</button>}{launch && <div className="azure-setup-actions"><div className="connection-launch-actions"><a className="primary-action" href={launch.consent_url} target="_blank" rel="noreferrer"><ExternalLink />1. Authorize Denali</a><a className="secondary-action" href={launch.cloud_shell_url} target="_blank" rel="noreferrer"><ExternalLink />2. Open Cloud Shell</a><a className="secondary-action" href={launch.script_url} download><Download />Download script</a></div><label className="azure-command"><span>3. Run in Cloud Shell</span><textarea readOnly value={launch.setup_command} /><button type="button" onClick={() => void navigator.clipboard.writeText(launch.setup_command)}>Copy command</button><small>The command downloads the same reviewable script shown by Download script. Its URL expires at {formatTime(launch.expires_at)}.</small></label><label className="azure-completion"><span>4. Paste the completion code printed by the script</span><textarea value={completionCode} onChange={(event) => onCompletionCode(event.target.value)} placeholder="DENALI_SETUP_COMPLETE=…" /><button className="primary-action" type="button" disabled={completing || !completionCode.trim()} onClick={onComplete}>{completing ? "Validating Azure…" : "Complete setup and validate"}</button></label></div>}{!connection.setup_capabilities.azure_cloud_shell && <small className="launch-unavailable">Cloud Shell setup requires Denali’s multi-tenant Azure application and private onboarding-script publisher.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{subscriptions.length} selected subscription{subscriptions.length === 1 ? "" : "s"}</strong>{subscriptions.map((subscription) => <code key={subscription.id}>{subscription.name} · {subscription.id}</code>)}</div>}</div></div>
+      <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every selected subscription</strong><small>Denali binds the customer tenant and each exact subscription first, then validates every declared subscription-wide plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating Azure…" : validation ? "Validate again" : "Validate connection"}</button>}</div></div>
+    </div>
+    <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed subscriptions {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.subscription_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.subscription_name ?? result.subscription_id} · all resource locations</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Authorize the application, select subscriptions, and paste the Cloud Shell completion code first.</small></span></div>}</div>
+    <details className="connection-permissions"><summary>Review {permissions.length || 2} declared Azure permissions</summary><div>{(permissions.length ? permissions : ["Microsoft.Resources/subscriptions/read", "Microsoft.Authorization/roleAssignments/read"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>The customer grants Azure Reader only at selected subscription scopes. This does not grant Microsoft Graph/Entra directory reads, data-plane access, secret access, prompt access, response access, or remediation.</p></details>
+    <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes only connection configuration and validation history; Azure role assignments must be removed in Azure and collected evidence remains.</span>{credential?.service_principal_id && <code>Service principal {credential.service_principal_id}</code>}</div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
   </section>;
 }
 

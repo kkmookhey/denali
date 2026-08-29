@@ -45,7 +45,7 @@ Requires Python 3.11 or newer and Docker for the runnable stack.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[api,aws,dev]'
+python -m pip install -e '.[api,aws,azure,dev]'
 docker compose up -d --build
 DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali denali-demo-seed
 ```
@@ -100,6 +100,40 @@ Connections must be disabled before deletion, and deletion requires the exact di
 name. Deleting connection configuration retains evidence already collected through that
 connection. The contract and its evidence boundary are documented in
 [`docs/architecture/0018-self-service-aws-connections.md`](docs/architecture/0018-self-service-aws-connections.md).
+
+### Self-service Azure connection
+
+Azure uses Denali's multi-tenant Entra application plus ordinary Azure RBAC, not a customer
+secret and not Azure Lighthouse. Open **Connections**, select **Microsoft Azure**, and enter
+the customer tenant ID. **Prepare Azure setup** provides two views of the same exact artifact:
+a command to run from Azure Cloud Shell and a script download for inspection/manual execution.
+The script enumerates enabled subscriptions in that tenant, lets the customer select one,
+several, or all, and assigns Azure Reader only at those selected subscription scopes. It then
+prints a one-time completion code to paste back into Denali.
+
+Configure the Denali API with its multi-tenant application and private script publisher:
+
+```bash
+export DENALI_AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000
+export DENALI_AZURE_CLIENT_SECRET='operator-managed-denali-app-secret'
+export DENALI_AZURE_CONSENT_REDIRECT_URI=http://127.0.0.1:3080
+export DENALI_AZURE_ONBOARDING_BUCKET=denali-onboarding-templates
+```
+
+The application registration must support accounts in any organizational directory and the
+redirect URI must be registered exactly. Prefer a certificate or workload-federated runtime
+credential in production; the client secret above belongs to Denali's infrastructure and is
+never supplied by a customer or returned by the API. The script publisher needs only the same
+private, encrypted, short-lived object controls described for AWS, under
+`denali/onboarding/azure/*`.
+
+Azure validation binds every selected subscription to the declared customer tenant, then
+tests five independent Azure AI/control-plane entrypoints. Resource Graph coverage is
+subscription-wide and therefore includes every Azure resource location; no preferred Region
+limits visibility. Reader grants no remediation or Azure data-plane role. Microsoft Graph,
+Entra sign-ins and applications, prompts, responses, and secrets remain outside this Azure
+connection. See
+[`docs/architecture/0019-self-service-azure-connections.md`](docs/architecture/0019-self-service-azure-connections.md).
 
 Scan a source repository into Denali with the first-party repository connector:
 

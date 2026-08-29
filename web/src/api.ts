@@ -3,6 +3,8 @@ import type {
   AssetDetail,
   AwsConnectionCreate,
   AwsCloudFormationLaunch,
+  AzureConnectionCreate,
+  AzureSetupLaunch,
   Connection,
   Coverage,
   CodeToCloudDeployment,
@@ -48,7 +50,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   connections: () => request<{ items: Connection[] }>("/v1/connections"),
   connection: (id: string) => request<Connection>(`/v1/connections/${id}`),
-  createConnection: (connection: AwsConnectionCreate) =>
+  createConnection: (connection: AwsConnectionCreate | AzureConnectionCreate) =>
     request<Connection>("/v1/connections", {
       method: "POST",
       body: JSON.stringify(connection),
@@ -71,6 +73,16 @@ export const api = {
     request<AwsCloudFormationLaunch>(
       `/v1/connections/${id}/aws/cloudformation/launch`,
       { method: "POST" },
+    ),
+  launchAzureSetup: (id: string) =>
+    request<AzureSetupLaunch>(
+      `/v1/connections/${id}/azure/setup/launch`,
+      { method: "POST" },
+    ),
+  completeAzureSetup: (id: string, completionCode: string) =>
+    request<{ status: "started" | "already_running"; connection_id: string }>(
+      `/v1/connections/${id}/azure/setup/complete`,
+      { method: "POST", body: JSON.stringify({ completion_code: completionCode }) },
     ),
   summary: () => request<Summary>("/v1/inventory/summary"),
   assets: () => request<{ items: Asset[] }>("/v1/inventory/assets?limit=500"),

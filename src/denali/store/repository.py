@@ -58,11 +58,18 @@ END
 
 def _connection_response(row: dict[str, Any]) -> dict[str, Any]:
     result = dict(row)
-    role_arn = result.pop("role_arn")
-    result["credential_reference"] = {
-        "type": result.pop("credential_type"),
-        "role_arn": role_arn,
-    }
+    credential_type = result.pop("credential_type")
+    internal_reference = result.pop("credential_reference")
+    credential_reference: dict[str, Any] = {"type": credential_type}
+    if credential_type == "aws_assume_role":
+        credential_reference["role_arn"] = internal_reference["role_arn"]
+    elif credential_type == "azure_multitenant_app":
+        credential_reference["client_id"] = internal_reference["client_id"]
+        if internal_reference.get("service_principal_id"):
+            credential_reference["service_principal_id"] = internal_reference[
+                "service_principal_id"
+            ]
+    result["credential_reference"] = credential_reference
     return result
 
 
@@ -1785,8 +1792,7 @@ class PostgresInventoryRepository:
             rows = connection.execute(
                 """
                 SELECT c.id, c.provider, c.display_name, c.lifecycle_state, c.health_state,
-                       c.credential_type,
-                       c.credential_reference->>'role_arn' AS role_arn,
+                       c.credential_type, c.credential_reference,
                        c.declared_scopes, c.coverage_plan, c.configuration,
                        c.created_at, c.updated_at, c.last_validated_at,
                        latest.validation AS last_validation
@@ -1819,8 +1825,7 @@ class PostgresInventoryRepository:
             row = connection.execute(
                 """
                 SELECT c.id, c.provider, c.display_name, c.lifecycle_state, c.health_state,
-                       c.credential_type,
-                       c.credential_reference->>'role_arn' AS role_arn,
+                       c.credential_type, c.credential_reference,
                        c.declared_scopes, c.coverage_plan, c.configuration,
                        c.created_at, c.updated_at, c.last_validated_at,
                        latest.validation AS last_validation
@@ -1940,6 +1945,101 @@ class PostgresInventoryRepository:
                 RETURNING id
                 """,
                 (json.dumps(launch), tenant_id, connection_id),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def record_connection_setup_launch(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        launch: dict[str, Any],
+        setup_token_sha256: str,
+    ) -> dict[str, Any] | None:
+        """Record a setup artifact and only the hash of its one-time completion token."""
+
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET credential_reference = jsonb_set(
+                        credential_reference,
+                        '{setup_token_sha256}',
+                        to_jsonb(%s::text),
+                        true
+                    ),
+                    configuration = jsonb_set(
+                        configuration,
+                        '{onboarding}',
+                        %s::jsonb,
+                        true
+                    ),
+                    updated_at = now()
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                  AND provider = 'azure' AND lifecycle_state = 'active'
+                RETURNING id
+                """,
+                (
+                    setup_token_sha256,
+                    json.dumps(launch),
+                    tenant_id,
+                    connection_id,
+                ),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def complete_azure_connection_setup(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_setup_token_sha256: str,
+        service_principal_id: str,
+        subscriptions: list[dict[str, str]],
+        coverage_plan: list[dict[str, Any]],
+        completed_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Bind the selected subscriptions and consume the setup completion capability."""
+
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET credential_reference = jsonb_set(
+                        credential_reference - 'setup_token_sha256',
+                        '{service_principal_id}',
+                        to_jsonb(%s::text),
+                        true
+                    ),
+                    configuration = jsonb_set(
+                        jsonb_set(
+                            configuration,
+                            '{subscriptions}',
+                            %s::jsonb,
+                            true
+                        ),
+                        '{onboarding,completed_at}',
+                        to_jsonb(%s::text),
+                        true
+                    ),
+                    coverage_plan = %s::jsonb,
+                    health_state = 'unknown',
+                    updated_at = %s
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                  AND provider = 'azure' AND lifecycle_state = 'active'
+                  AND credential_reference->>'setup_token_sha256' = %s
+                RETURNING id
+                """,
+                (
+                    service_principal_id,
+                    json.dumps(subscriptions),
+                    completed_at.isoformat(),
+                    json.dumps(coverage_plan),
+                    completed_at,
+                    tenant_id,
+                    connection_id,
+                    expected_setup_token_sha256,
+                ),
             ).fetchone()
         return None if row is None else self.get_connection(tenant_id, connection_id)
 

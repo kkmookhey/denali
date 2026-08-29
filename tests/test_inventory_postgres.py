@@ -14,7 +14,12 @@ from pathlib import Path
 
 import pytest
 
-from denali.connections import AWS_SCOPE_BEDROCK_AGENTS, aws_coverage_plan
+from denali.connections import (
+    AWS_SCOPE_BEDROCK_AGENTS,
+    AZURE_SCOPES,
+    aws_coverage_plan,
+    azure_coverage_plan,
+)
 from denali.connectors.code_to_cloud import CodeToCloudConnector, DeploymentTarget
 from denali.connectors.demo import demo_batch, demo_findings_batch
 from denali.connectors.repository_posture import RepositoryPostureConnector
@@ -338,6 +343,89 @@ def test_connection_lifecycle_retains_collected_evidence(repository) -> None:
     assert repo.delete_connection(tenant, connection_id) == "deleted"
     assert repo.get_connection(tenant, connection_id) is None
     assert repo.summary(tenant)["total"] == 1
+
+
+def test_azure_setup_completion_consumes_token_and_binds_selected_subscriptions(
+    repository,
+) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    connection_id = str(uuid.uuid4())
+    client_id = str(uuid.uuid4())
+    service_principal_id = str(uuid.uuid4())
+    setup_token_sha256 = "b" * 64
+    subscriptions = [
+        {"id": str(uuid.uuid4()), "name": "Production"},
+        {"id": str(uuid.uuid4()), "name": "AI Lab"},
+    ]
+    created = repo.create_connection(
+        tenant,
+        connection_id=connection_id,
+        provider="azure",
+        display_name="Fixture Azure",
+        credential_type="azure_multitenant_app",
+        credential_reference={"client_id": client_id},
+        declared_scopes=list(AZURE_SCOPES),
+        coverage_plan=[],
+        configuration={
+            "tenant_id": str(uuid.uuid4()),
+            "cloud": "AzureCloud",
+            "coverage_mode": "selected-subscriptions",
+            "subscriptions": [],
+        },
+    )
+    assert created["credential_reference"] == {
+        "type": "azure_multitenant_app",
+        "client_id": client_id,
+    }
+
+    launched = repo.record_connection_setup_launch(
+        tenant,
+        connection_id,
+        launch={
+            "method": "azure_cloud_shell",
+            "script_version": "denali-azure-subscription-reader-v1",
+            "script_sha256": "c" * 64,
+            "client_id": client_id,
+            "published_at": now.isoformat(),
+            "url_expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+        setup_token_sha256=setup_token_sha256,
+    )
+    assert launched is not None
+    assert "setup_token" not in str(launched)
+    target = repo.get_connection_validation_target(tenant, connection_id)
+    assert target is not None
+    assert target["credential_reference"]["setup_token_sha256"] == setup_token_sha256
+
+    plan = azure_coverage_plan(list(AZURE_SCOPES), subscriptions)
+    completed = repo.complete_azure_connection_setup(
+        tenant,
+        connection_id,
+        expected_setup_token_sha256=setup_token_sha256,
+        service_principal_id=service_principal_id,
+        subscriptions=subscriptions,
+        coverage_plan=plan,
+        completed_at=now,
+    )
+    assert completed is not None
+    assert completed["configuration"]["subscriptions"] == subscriptions
+    assert completed["credential_reference"]["service_principal_id"] == service_principal_id
+    assert len(completed["coverage_plan"]) == 10
+    completed_target = repo.get_connection_validation_target(tenant, connection_id)
+    assert completed_target is not None
+    assert "setup_token_sha256" not in completed_target["credential_reference"]
+
+    replay = repo.complete_azure_connection_setup(
+        tenant,
+        connection_id,
+        expected_setup_token_sha256=setup_token_sha256,
+        service_principal_id=service_principal_id,
+        subscriptions=subscriptions,
+        coverage_plan=plan,
+        completed_at=now,
+    )
+    assert replay is None
 
 
 def test_activity_can_be_filtered_by_correlated_asset(repository) -> None:
