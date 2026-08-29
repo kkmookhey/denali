@@ -115,13 +115,27 @@ lifecycle and cause Denali consent to exceed this slice's no-Graph evidence boun
 
 The live acceptance pass must:
 
-1. create a test Azure connection for the exact tenant;
-2. verify consent, Cloud Shell subscription enumeration/selection, role assignments, and
-   one-time completion-code replay rejection;
-3. validate both a selected-subscription path and an intentionally unselected subscription;
-4. visually verify setup, partial coverage, disable, and delete safeguards; and
-5. remove test role assignments and the customer enterprise application if the acceptance
+1. verify the revised consent-return success/failure notice in a connected browser;
+2. validate an intentionally unselected-subscription path;
+3. visually verify partial coverage, disable, and delete safeguards; and
+4. remove test role assignments and the customer enterprise application if the acceptance
    environment should not retain them.
+
+The first live connection is `4f0600b2-78ef-4bd6-bf62-6fb67d81ddbd` (`Test Azure`). The
+customer flow successfully selected both test subscriptions and assigned Reader to the
+Denali service principal at each exact subscription scope. The immediate validation reached
+both subscriptions but recorded six `AccessDenied` plane results. Direct diagnostics with
+the same application token subsequently returned HTTP 200 for all eight Resource Graph
+queries, and **Validate again** produced a healthy result with all ten declared checks
+passing. This was Azure RBAC propagation, not missing permissions.
+
+The product now treats those two observed UX issues explicitly:
+
+- the Entra redirect selects the connection and displays a clear success/failure notice,
+  while explaining that consent and subscription RBAC are separate; and
+- initial setup completion retries partial Azure coverage during the bounded onboarding
+  window, persists only the final attempt, and still records independent failures if the
+  window expires.
 
 ## Local runtime
 

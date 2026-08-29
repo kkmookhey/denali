@@ -128,7 +128,36 @@ function formatTime(value: string) {
   }).format(new Date(value));
 }
 
+type AzureConsentReturn = {
+  connectionId: string;
+  state: "succeeded" | "failed";
+  tenantId?: string;
+  detail?: string;
+};
+
+function readAzureConsentReturn(): AzureConsentReturn | null {
+  const query = new URLSearchParams(window.location.search);
+  const connectionId = query.get("state") ?? "";
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(connectionId)) return null;
+  if (query.get("admin_consent")?.toLowerCase() === "true") {
+    return {
+      connectionId,
+      state: "succeeded",
+      tenantId: query.get("tenant") ?? undefined,
+    };
+  }
+  const error = query.get("error");
+  if (!error) return null;
+  const description = query.get("error_description")?.trim();
+  return {
+    connectionId,
+    state: "failed",
+    detail: `${error}${description ? `: ${description.slice(0, 500)}` : ""}`,
+  };
+}
+
 function App() {
+  const [azureConsentReturn] = useState(readAzureConsentReturn);
   const [page, setPage] = useState<Page>(() => {
     const query = new URLSearchParams(window.location.search);
     return query.has("state") && (query.has("admin_consent") || query.has("error"))
@@ -233,6 +262,15 @@ function App() {
     void loadAll();
   }, [loadAll]);
 
+  useEffect(() => {
+    if (!azureConsentReturn) return;
+    const returnUrl = new URL(window.location.href);
+    ["admin_consent", "tenant", "state", "error", "error_description"].forEach((key) =>
+      returnUrl.searchParams.delete(key),
+    );
+    window.history.replaceState({}, "", `${returnUrl.pathname}${returnUrl.search}${returnUrl.hash}`);
+  }, [azureConsentReturn]);
+
   async function toggleActivityFixtures() {
     const next = !includeActivityFixtures;
     setError(null);
@@ -298,7 +336,7 @@ function App() {
               onNavigate={navigate}
             />
           ) : page === "connections" ? (
-            <ConnectionsPage connections={connections} onChanged={loadAll} />
+            <ConnectionsPage connections={connections} onChanged={loadAll} azureConsentReturn={azureConsentReturn} />
           ) : page === "inventory" ? (
             <Inventory
               assets={assets}
@@ -1742,11 +1780,17 @@ const AZURE_CONNECTION_SCOPES = [
 function ConnectionsPage({
   connections,
   onChanged,
+  azureConsentReturn,
 }: {
   connections: Connection[];
   onChanged: () => Promise<void>;
+  azureConsentReturn: AzureConsentReturn | null;
 }) {
-  const [selectedId, setSelectedId] = useState<string | null>(connections[0]?.id ?? null);
+  const [selectedId, setSelectedId] = useState<string | null>(() =>
+    connections.some((connection) => connection.id === azureConsentReturn?.connectionId)
+      ? azureConsentReturn?.connectionId ?? null
+      : connections[0]?.id ?? null,
+  );
   const [showCreate, setShowCreate] = useState(connections.length === 0);
   const [provider, setProvider] = useState<"aws" | "azure">("aws");
   const [displayName, setDisplayName] = useState("");
@@ -1925,7 +1969,11 @@ function ConnectionsPage({
       <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali customer credentials.</h2><p>AWS uses assume-role; Azure uses a multi-tenant application with Reader only on subscriptions the customer selects. Every declared plane is validated separately.</p></div>
       <button className="primary-action" onClick={() => setShowCreate((visible) => !visible)}><Plus /> Add connection</button>
     </section>
-    <section className="connection-boundary"><ShieldCheck /><div><strong>Connection health is not a risk verdict.</strong><span>A healthy connection means the configured role and declared validation calls worked. It does not mean collection is complete, findings are absent, or the AWS account is safe.</span></div></section>
+    <section className="connection-boundary"><ShieldCheck /><div><strong>Connection health is not a risk verdict.</strong><span>A healthy connection means the configured role and declared validation calls worked. It does not mean collection is complete, findings are absent, or the connected environment is safe.</span></div></section>
+    {azureConsentReturn && <div className={`connection-consent-return ${azureConsentReturn.state}`}>
+      {azureConsentReturn.state === "succeeded" ? <CircleCheck /> : <CircleAlert />}
+      <span><strong>{azureConsentReturn.state === "succeeded" ? "Microsoft Entra authorization returned successfully" : "Microsoft Entra authorization did not complete"}</strong><small>{azureConsentReturn.state === "succeeded" ? `Entra confirmed the tenant consent step${azureConsentReturn.tenantId ? ` for tenant ${azureConsentReturn.tenantId}` : ""}. Subscription access is granted separately by the Cloud Shell script and verified by Denali.` : azureConsentReturn.detail}</small></span>
+    </div>}
     {actionError && <div className="connection-error"><CircleAlert /><span>{actionError}</span></div>}
     {showCreate && <form className="panel connection-create" onSubmit={(event) => void createConnection(event)}>
       <div className="connection-provider-picker"><button type="button" className={provider === "aws" ? "active" : ""} onClick={() => { setProvider("aws"); setScopes(AWS_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Amazon Web Services</button><button type="button" className={provider === "azure" ? "active" : ""} onClick={() => { setProvider("azure"); setScopes(AZURE_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Microsoft Azure</button></div>
@@ -2006,7 +2054,7 @@ function AzureConnectionDetail({ connection, busy, launch, completionCode, onCom
     <div className="connection-detail-head"><div><span>MICROSOFT AZURE</span><h3>{connection.display_name}</h3><code>Tenant {connection.configuration.tenant_id}</code></div><ConnectionHealth state={connection.health_state} /></div>
     <div className="setup-progress">
       <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Tenant, application ID, scopes, and subscription-selection boundary are recorded. Entra directory access is not included.</small></div></div>
-      <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Authorize Denali and select subscriptions</strong><small>Azure Cloud Shell enumerates enabled subscriptions visible to your signed-in identity. Reader is assigned only to the subscriptions you select; every resource location inside them remains in scope.</small>{!launch && <button className="primary-action" disabled={preparing || !connection.setup_capabilities.azure_cloud_shell} onClick={onPrepare}><ExternalLink />{preparing ? "Preparing Azure setup…" : "Prepare Azure setup"}</button>}{launch && <div className="azure-setup-actions"><div className="connection-launch-actions"><a className="primary-action" href={launch.consent_url} target="_blank" rel="noreferrer"><ExternalLink />1. Authorize Denali</a><a className="secondary-action" href={launch.cloud_shell_url} target="_blank" rel="noreferrer"><ExternalLink />2. Open Cloud Shell</a><a className="secondary-action" href={launch.script_url} download><Download />Download script</a></div><label className="azure-command"><span>3. Run in Cloud Shell</span><textarea readOnly value={launch.setup_command} /><button type="button" onClick={() => void navigator.clipboard.writeText(launch.setup_command)}>Copy command</button><small>The command downloads the same reviewable script shown by Download script. Its URL expires at {formatTime(launch.expires_at)}.</small></label><label className="azure-completion"><span>4. Paste the completion code printed by the script</span><textarea value={completionCode} onChange={(event) => onCompletionCode(event.target.value)} placeholder="DENALI_SETUP_COMPLETE=…" /><button className="primary-action" type="button" disabled={completing || !completionCode.trim()} onClick={onComplete}>{completing ? "Validating Azure…" : "Complete setup and validate"}</button></label></div>}{!connection.setup_capabilities.azure_cloud_shell && <small className="launch-unavailable">Cloud Shell setup requires Denali’s multi-tenant Azure application and private onboarding-script publisher.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{subscriptions.length} selected subscription{subscriptions.length === 1 ? "" : "s"}</strong>{subscriptions.map((subscription) => <code key={subscription.id}>{subscription.name} · {subscription.id}</code>)}</div>}</div></div>
+      <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Authorize Denali and select subscriptions</strong><small>Azure Cloud Shell enumerates enabled subscriptions visible to your signed-in identity. Reader is assigned only to the subscriptions you select; every resource location inside them remains in scope.</small>{!launch && <button className="primary-action" disabled={preparing || !connection.setup_capabilities.azure_cloud_shell} onClick={onPrepare}><ExternalLink />{preparing ? "Preparing Azure setup…" : setupComplete ? "Prepare Azure setup again" : "Prepare Azure setup"}</button>}{launch && <div className="azure-setup-actions"><div className="connection-launch-actions"><a className="primary-action" href={launch.consent_url} target="_blank" rel="noreferrer"><ExternalLink />1. Authorize Denali</a><a className="secondary-action" href={launch.cloud_shell_url} target="_blank" rel="noreferrer"><ExternalLink />2. Open Cloud Shell</a><a className="secondary-action" href={launch.script_url} download><Download />Download script</a></div><small className="azure-consent-guidance">Authorization opens in a new tab. Microsoft Entra returns to Denali with an explicit success or failure notice; subscription Reader access is still assigned separately in Cloud Shell.</small><label className="azure-command"><span>3. Run in Cloud Shell</span><textarea readOnly value={launch.setup_command} /><button type="button" onClick={() => void navigator.clipboard.writeText(launch.setup_command)}>Copy command</button><small>The command downloads the same reviewable script shown by Download script. Its URL expires at {formatTime(launch.expires_at)}.</small></label><label className="azure-completion"><span>4. Paste the completion code printed by the script</span><textarea value={completionCode} onChange={(event) => onCompletionCode(event.target.value)} placeholder="DENALI_SETUP_COMPLETE=…" /><button className="primary-action" type="button" disabled={completing || !completionCode.trim()} onClick={onComplete}>{completing ? "Waiting for Azure access propagation…" : "Complete setup and validate"}</button><small>New Azure role assignments can take several minutes to propagate. Denali retries the declared checks before recording a partial result.</small></label></div>}{!connection.setup_capabilities.azure_cloud_shell && <small className="launch-unavailable">Cloud Shell setup requires Denali’s multi-tenant Azure application and private onboarding-script publisher.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{subscriptions.length} selected subscription{subscriptions.length === 1 ? "" : "s"}</strong>{subscriptions.map((subscription) => <code key={subscription.id}>{subscription.name} · {subscription.id}</code>)}</div>}</div></div>
       <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every selected subscription</strong><small>Denali binds the customer tenant and each exact subscription first, then validates every declared subscription-wide plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating Azure…" : validation ? "Validate again" : "Validate connection"}</button>}</div></div>
     </div>
     <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed subscriptions {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.subscription_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.subscription_name ?? result.subscription_id} · all resource locations</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Authorize the application, select subscriptions, and paste the Cloud Shell completion code first.</small></span></div>}</div>

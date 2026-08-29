@@ -32,6 +32,11 @@ The customer workflow is:
    subscription identifiers and names, consumes the completion capability atomically, and
    validates each selected subscription independently.
 
+The Entra admin-consent redirect is visible setup feedback, not proof of Azure subscription
+access. Denali selects the connection named by the returned state and shows the returned
+success or failure explicitly. Actual access is established separately by customer-created
+RBAC assignments and proved only by subsequent subscription and plane validation.
+
 The setup script is published under an unguessable key in a private object store. Its URL
 expires within one hour. The API response containing that URL and command is `no-store`.
 Denali records the script version, exact SHA-256, application client ID, publication time,
@@ -64,6 +69,13 @@ binds each selected subscription to that tenant. A failed subscription binding l
 subscription's planes unknown without suppressing results for other subscriptions. Each
 declared read-only entrypoint then succeeds or fails independently. SDK/HTTP failures are
 reduced to an error code or exception class; response bodies and messages are not retained.
+
+New Azure role assignments can return transient `AccessDenied` responses while RBAC
+propagates. Immediately after setup completion, Denali retries credential, subscription,
+and plane validation within the same bounded onboarding window and persists only the final
+attempt. A manual **Validate again** remains a single evidence-bearing attempt. If access is
+still partial when the window ends, the independent failures are recorded rather than
+converted to success.
 
 Successful validation proves only that the configured application could bind the selected
 subscriptions and call the declared entrypoints at that time. It is not collection evidence,

@@ -111,6 +111,12 @@ The script enumerates enabled subscriptions in that tenant, lets the customer se
 several, or all, and assigns Azure Reader only at those selected subscription scopes. It then
 prints a one-time completion code to paste back into Denali.
 
+The Entra authorization step returns to Denali with an explicit success or failure notice;
+it does not itself grant subscription access. The Cloud Shell script creates those selected
+subscription role assignments. Because new Azure RBAC assignments can take several minutes
+to propagate, Denali retries the initial post-setup validation within a bounded window and
+records the final independent plane results.
+
 Configure the Denali API with its multi-tenant application and private script publisher:
 
 ```bash

@@ -186,6 +186,23 @@ class PassingAzureValidator:
         }
 
 
+class PropagatingAzureValidator(PassingAzureValidator):
+    def __init__(self):
+        self.calls = 0
+
+    def validate(self, target: dict[str, Any]) -> dict[str, Any]:
+        self.calls += 1
+        validation = super().validate(target)
+        if self.calls == 1:
+            validation["health_state"] = "partial"
+            validation["results"][0].update(
+                state="failed",
+                detail="Validation call failed (AccessDenied).",
+            )
+            validation["summary"] = "Azure Reader assignment is still propagating."
+        return validation
+
+
 def _completion_code(subscriptions: list[dict[str, str]]) -> str:
     payload = json.dumps(
         {
@@ -202,6 +219,7 @@ def _completion_code(subscriptions: list[dict[str, str]]) -> str:
 def test_azure_setup_enumerates_then_binds_only_selected_subscriptions() -> None:
     repository = AzureConnectionRepositoryStub()
     s3 = FakeS3OnboardingClient()
+    validator = PropagatingAzureValidator()
     launcher = AzureSetupScriptLauncher(
         bucket_name="denali-onboarding",
         client_id=CLIENT_ID,
@@ -213,7 +231,7 @@ def test_azure_setup_enumerates_then_binds_only_selected_subscriptions() -> None
     )
     app = create_app(
         repository=repository,
-        azure_connection_validator=PassingAzureValidator(),  # type: ignore[arg-type]
+        azure_connection_validator=validator,  # type: ignore[arg-type]
         azure_setup_launcher=launcher,
         onboarding_validation_retry_seconds=0,
         migrate_on_start=False,
@@ -265,6 +283,7 @@ def test_azure_setup_enumerates_then_binds_only_selected_subscriptions() -> None
         assert completed.status_code == 202
         detail = client.get(f"/v1/connections/{connection_id}").json()
         assert detail["health_state"] == "healthy"
+        assert validator.calls == 2
         assert detail["configuration"]["subscriptions"] == subscriptions
         assert len(detail["coverage_plan"]) == 5 * len(subscriptions)
         assert len(detail["last_validation"]["results"]) == 5 * len(subscriptions)

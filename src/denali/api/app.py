@@ -340,6 +340,7 @@ def create_app(
         target: dict[str, Any],
         *,
         wait_for_credentials: bool,
+        wait_for_healthy: bool = False,
     ) -> dict[str, str]:
         connection_id = str(target["id"])
         connection_key = (current_tenant, connection_id)
@@ -363,11 +364,14 @@ def create_app(
             try:
                 while True:
                     validation = validator.validate(target)
-                    if (
-                        not wait_for_credentials
-                        or validation["credential_state"] == "passed"
-                        or monotonic() >= deadline
-                    ):
+                    credentials_pending = (
+                        wait_for_credentials
+                        and validation["credential_state"] != "passed"
+                    )
+                    coverage_pending = (
+                        wait_for_healthy and validation["health_state"] != "healthy"
+                    )
+                    if not (credentials_pending or coverage_pending) or monotonic() >= deadline:
                         repo.record_connection_validation(
                             current_tenant, connection_id, validation
                         )
@@ -719,6 +723,7 @@ def create_app(
             current_tenant,
             validation_target,
             wait_for_credentials=True,
+            wait_for_healthy=True,
         )
 
     @app.post("/v1/connections/{connection_id}/validate", status_code=202)
