@@ -21,8 +21,10 @@ subscriptions they select.
 The customer workflow is:
 
 1. Create an Azure connection plan for one customer tenant.
-2. Grant tenant consent to Denali's multi-tenant application. Consent creates the local
-   enterprise application; it does not by itself grant access to Azure subscriptions.
+2. Add Denali's multi-tenant application to the customer tenant. Microsoft's admin-consent
+   endpoint creates or confirms the tenant-local enterprise application/service principal:
+   the identity Azure RBAC can assign a role to. Denali requests no Microsoft Graph
+   permissions in this slice, and this step does not grant access to Azure subscriptions.
 3. Open Azure Cloud Shell and run the connection-specific, reviewable setup script. The
    script uses the customer's signed-in Azure CLI context to enumerate enabled subscriptions
    in the declared tenant and asks the customer to select one, several, or all.

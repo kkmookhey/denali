@@ -44,8 +44,11 @@ tenant-local service-principal object ID, but not the raw code.
   weakening the existing AWS contract.
 - Azure create/list/detail/validate/disable/delete behavior, with normal responses exposing
   no client secret or setup token.
-- Provider-native setup controls in the Connections UI: **Authorize Denali**, **Open Azure
-  Cloud Shell**, a copyable command, and **Download setup script** for inspection/manual use.
+- Provider-native setup controls in the Connections UI: **Add Denali to tenant**, **Open
+  Azure Cloud Shell**, a copyable command, and **Download setup script** for
+  inspection/manual use. The UI explains that the first step creates the tenant-local
+  enterprise application identity, requests no Graph permissions, and grants no subscription
+  access by itself.
 - A private, short-lived setup-script publisher with exact version and SHA-256 launch
   metadata. The primary command downloads the script to a file before execution rather than
   using an opaque `curl | bash` pipeline.
