@@ -69,6 +69,12 @@ def _connection_response(row: dict[str, Any]) -> dict[str, Any]:
             credential_reference["service_principal_id"] = internal_reference[
                 "service_principal_id"
             ]
+    elif credential_type == "gcp_service_account":
+        credential_reference["principal_email"] = internal_reference["principal_email"]
+        if internal_reference.get("principal_unique_id"):
+            credential_reference["principal_unique_id"] = internal_reference[
+                "principal_unique_id"
+            ]
     result["credential_reference"] = credential_reference
     return result
 
@@ -2033,6 +2039,94 @@ class PostgresInventoryRepository:
                 (
                     service_principal_id,
                     json.dumps(subscriptions),
+                    completed_at.isoformat(),
+                    json.dumps(coverage_plan),
+                    completed_at,
+                    tenant_id,
+                    connection_id,
+                    expected_setup_token_sha256,
+                ),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def record_gcp_connection_setup_launch(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        launch: dict[str, Any],
+        setup_token_sha256: str,
+    ) -> dict[str, Any] | None:
+        """Record a GCP setup artifact and only the completion-token hash."""
+
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET credential_reference = jsonb_set(
+                        credential_reference,
+                        '{setup_token_sha256}',
+                        to_jsonb(%s::text),
+                        true
+                    ),
+                    configuration = jsonb_set(
+                        configuration,
+                        '{onboarding}',
+                        %s::jsonb,
+                        true
+                    ),
+                    updated_at = now()
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                  AND provider = 'gcp' AND lifecycle_state = 'active'
+                RETURNING id
+                """,
+                (
+                    setup_token_sha256,
+                    json.dumps(launch),
+                    tenant_id,
+                    connection_id,
+                ),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def complete_gcp_connection_setup(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_setup_token_sha256: str,
+        projects: list[dict[str, str]],
+        coverage_plan: list[dict[str, Any]],
+        completed_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Bind selected GCP projects and consume the setup completion capability."""
+
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET credential_reference = credential_reference - 'setup_token_sha256',
+                    configuration = jsonb_set(
+                        jsonb_set(
+                            configuration,
+                            '{projects}',
+                            %s::jsonb,
+                            true
+                        ),
+                        '{onboarding,completed_at}',
+                        to_jsonb(%s::text),
+                        true
+                    ),
+                    coverage_plan = %s::jsonb,
+                    health_state = 'unknown',
+                    updated_at = %s
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                  AND provider = 'gcp' AND lifecycle_state = 'active'
+                  AND credential_reference->>'setup_token_sha256' = %s
+                RETURNING id
+                """,
+                (
+                    json.dumps(projects),
                     completed_at.isoformat(),
                     json.dumps(coverage_plan),
                     completed_at,

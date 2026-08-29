@@ -448,6 +448,7 @@ dev = [
     { name = "ruff" },
 ]
 gcp = [
+    { name = "google-auth" },
     { name = "google-cloud-logging" },
 ]
 
@@ -456,6 +457,7 @@ requires-dist = [
     { name = "azure-identity", marker = "extra == 'azure'", specifier = ">=1.17" },
     { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.43.9" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115" },
+    { name = "google-auth", marker = "extra == 'gcp'", specifier = ">=2.35" },
     { name = "google-cloud-logging", marker = "extra == 'gcp'", specifier = ">=3.12" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },

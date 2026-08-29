@@ -94,6 +94,9 @@ export type ConnectionValidationResult = {
   excluded_enabled_regions?: string[];
   subscription_id?: string;
   subscription_name?: string;
+  project_id?: string;
+  project_name?: string;
+  project_number?: string;
 };
 
 export type ConnectionValidation = {
@@ -118,7 +121,7 @@ export type ConnectionCoveragePlan = {
 
 export type Connection = {
   id: string;
-  provider: "aws" | "azure";
+  provider: "aws" | "azure" | "gcp";
   display_name: string;
   lifecycle_state: "active" | "disabled";
   health_state: "unknown" | "healthy" | "partial" | "unhealthy" | "disabled";
@@ -126,6 +129,7 @@ export type Connection = {
   setup_capabilities: {
     cloudformation_quick_create: boolean;
     azure_cloud_shell: boolean;
+    gcp_cloud_shell: boolean;
   };
   credential_reference:
     | {
@@ -136,6 +140,11 @@ export type Connection = {
         type: "azure_multitenant_app";
         client_id: string;
         service_principal_id?: string;
+      }
+    | {
+        type: "gcp_service_account";
+        principal_email: string;
+        principal_unique_id?: string;
       };
   declared_scopes: string[];
   coverage_plan: ConnectionCoveragePlan[];
@@ -143,21 +152,23 @@ export type Connection = {
     account_id?: string;
     partition?: "aws" | "aws-us-gov" | "aws-cn";
     deployment_region?: string;
-    coverage_mode?: "automatic" | "selected" | "selected-subscriptions";
+    coverage_mode?: "automatic" | "selected" | "selected-subscriptions" | "selected-projects";
     regions?: string[];
     role_name?: string;
     stack_scopes?: string[];
     tenant_id?: string;
     cloud?: "AzureCloud";
     subscriptions?: Array<{ id: string; name: string }>;
+    projects?: Array<{ id: string; name: string; number: string }>;
     onboarding?: {
-      method: "cloudformation_quick_create" | "azure_cloud_shell";
+      method: "cloudformation_quick_create" | "azure_cloud_shell" | "gcp_cloud_shell";
       template_version?: string;
       template_sha256?: string;
       principal_arn?: string;
       script_version?: string;
       script_sha256?: string;
       client_id?: string;
+      principal_email?: string;
       published_at: string;
       url_expires_at: string;
       completed_at?: string;
@@ -205,6 +216,22 @@ export type AzureSetupLaunch = {
   setup_command: string;
   script_version: string;
   script_sha256: string;
+  expires_at: string;
+};
+
+export type GcpConnectionCreate = {
+  provider: "gcp";
+  display_name: string;
+  declared_scopes: string[];
+};
+
+export type GcpSetupLaunch = {
+  cloud_shell_url: string;
+  script_url: string;
+  setup_command: string;
+  script_version: string;
+  script_sha256: string;
+  principal_email: string;
   expires_at: string;
 };
 

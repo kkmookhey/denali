@@ -5,6 +5,8 @@ import type {
   AwsCloudFormationLaunch,
   AzureConnectionCreate,
   AzureSetupLaunch,
+  GcpConnectionCreate,
+  GcpSetupLaunch,
   Connection,
   Coverage,
   CodeToCloudDeployment,
@@ -50,7 +52,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   connections: () => request<{ items: Connection[] }>("/v1/connections"),
   connection: (id: string) => request<Connection>(`/v1/connections/${id}`),
-  createConnection: (connection: AwsConnectionCreate | AzureConnectionCreate) =>
+  createConnection: (connection: AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate) =>
     request<Connection>("/v1/connections", {
       method: "POST",
       body: JSON.stringify(connection),
@@ -82,6 +84,16 @@ export const api = {
   completeAzureSetup: (id: string, completionCode: string) =>
     request<{ status: "started" | "already_running"; connection_id: string }>(
       `/v1/connections/${id}/azure/setup/complete`,
+      { method: "POST", body: JSON.stringify({ completion_code: completionCode }) },
+    ),
+  launchGcpSetup: (id: string) =>
+    request<GcpSetupLaunch>(
+      `/v1/connections/${id}/gcp/setup/launch`,
+      { method: "POST" },
+    ),
+  completeGcpSetup: (id: string, completionCode: string) =>
+    request<{ status: "started" | "already_running"; connection_id: string }>(
+      `/v1/connections/${id}/gcp/setup/complete`,
       { method: "POST", body: JSON.stringify({ completion_code: completionCode }) },
     ),
   summary: () => request<Summary>("/v1/inventory/summary"),

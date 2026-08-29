@@ -27,14 +27,20 @@ from denali.connections import (
     AWS_SCOPES,
     AZURE_CLOUD_PUBLIC,
     AZURE_SCOPES,
+    GCP_SCOPES,
     AwsCloudFormationLauncher,
     AwsConnectionValidator,
     AzureConnectionValidator,
     AzureSetupScriptLauncher,
+    GcpConnectionPrincipalProvisioner,
+    GcpConnectionValidator,
+    GcpSetupScriptLauncher,
     aws_connection_coverage_plan,
     azure_coverage_plan,
+    gcp_coverage_plan,
 )
 from denali.connections.aws import render_cloudformation
+from denali.connections.gcp import valid_gcp_project_id
 from denali.store.db import migrate
 from denali.store.repository import PostgresInventoryRepository
 
@@ -81,6 +87,15 @@ class InventoryReader(Protocol):
         setup_token_sha256: str,
     ) -> dict[str, Any] | None: ...
 
+    def record_gcp_connection_setup_launch(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        launch: dict[str, Any],
+        setup_token_sha256: str,
+    ) -> dict[str, Any] | None: ...
+
     def complete_azure_connection_setup(
         self,
         tenant_id: str,
@@ -89,6 +104,17 @@ class InventoryReader(Protocol):
         expected_setup_token_sha256: str,
         service_principal_id: str,
         subscriptions: list[dict[str, str]],
+        coverage_plan: list[dict[str, Any]],
+        completed_at: datetime,
+    ) -> dict[str, Any] | None: ...
+
+    def complete_gcp_connection_setup(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_setup_token_sha256: str,
+        projects: list[dict[str, str]],
         coverage_plan: list[dict[str, Any]],
         completed_at: datetime,
     ) -> dict[str, Any] | None: ...
@@ -255,8 +281,24 @@ class AzureSetupCompletion(BaseModel):
     completion_code: str = Field(min_length=16, max_length=32768)
 
 
+class GcpConnectionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["gcp"] = "gcp"
+    display_name: str = Field(min_length=1, max_length=120)
+    declared_scopes: list[str] = Field(
+        default_factory=lambda: list(GCP_SCOPES), min_length=1, max_length=len(GCP_SCOPES)
+    )
+
+
+class GcpSetupCompletion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    completion_code: str = Field(min_length=16, max_length=32768)
+
+
 ConnectionCreate = Annotated[
-    AwsConnectionCreate | AzureConnectionCreate,
+    AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate,
     Field(discriminator="provider"),
 ]
 
@@ -266,8 +308,11 @@ def create_app(
     repository: InventoryReader | None = None,
     connection_validator: AwsConnectionValidator | None = None,
     azure_connection_validator: AzureConnectionValidator | None = None,
+    gcp_connection_validator: GcpConnectionValidator | None = None,
     cloudformation_launcher: AwsCloudFormationLauncher | None = None,
     azure_setup_launcher: AzureSetupScriptLauncher | None = None,
+    gcp_principal_provisioner: GcpConnectionPrincipalProvisioner | None = None,
+    gcp_setup_launcher: GcpSetupScriptLauncher | None = None,
     onboarding_validation_timeout_seconds: int | None = None,
     onboarding_validation_retry_seconds: int | None = None,
     tenant_id: str | None = None,
@@ -277,6 +322,10 @@ def create_app(
     configured_tenant = tenant_id or os.environ.get("DENALI_TENANT_ID", DEFAULT_LOCAL_TENANT)
     configured_launcher = cloudformation_launcher or _cloudformation_launcher_from_environment()
     configured_azure_launcher = azure_setup_launcher or _azure_setup_launcher_from_environment()
+    configured_gcp_provisioner = (
+        gcp_principal_provisioner or _gcp_principal_provisioner_from_environment()
+    )
+    configured_gcp_launcher = gcp_setup_launcher or _gcp_setup_launcher_from_environment()
     onboarding_validation_timeout = (
         onboarding_validation_timeout_seconds
         if onboarding_validation_timeout_seconds is not None
@@ -310,8 +359,11 @@ def create_app(
         app.state.azure_connection_validator = (
             azure_connection_validator or AzureConnectionValidator()
         )
+        app.state.gcp_connection_validator = gcp_connection_validator or GcpConnectionValidator()
         app.state.cloudformation_launcher = configured_launcher
         app.state.azure_setup_launcher = configured_azure_launcher
+        app.state.gcp_principal_provisioner = configured_gcp_provisioner
+        app.state.gcp_setup_launcher = configured_gcp_launcher
         app.state.onboarding_validation_timeout = onboarding_validation_timeout
         app.state.onboarding_validation_retry = onboarding_validation_retry
         app.state.active_connection_validations = set()
@@ -351,11 +403,12 @@ def create_app(
                 return {"status": "already_running", "connection_id": connection_id}
             active_validations.add(connection_key)
 
-        validator = (
-            request.app.state.connection_validator
-            if target["provider"] == "aws"
-            else request.app.state.azure_connection_validator
-        )
+        validators = {
+            "aws": request.app.state.connection_validator,
+            "azure": request.app.state.azure_connection_validator,
+            "gcp": request.app.state.gcp_connection_validator,
+        }
+        validator = validators[target["provider"]]
         retry_seconds = request.app.state.onboarding_validation_retry
         timeout_seconds = request.app.state.onboarding_validation_timeout
 
@@ -440,6 +493,58 @@ def create_app(
                         "cloud": connection.cloud,
                         "coverage_mode": "selected-subscriptions",
                         "subscriptions": [],
+                    },
+                )
+                return _with_validation_state(request, current_tenant, created)
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+
+        if isinstance(connection, GcpConnectionCreate):
+            launcher = request.app.state.gcp_setup_launcher
+            provisioner = request.app.state.gcp_principal_provisioner
+            if launcher is None or provisioner is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Google Cloud onboarding is not configured; set "
+                        "DENALI_GCP_OPERATOR_PROJECT_ID and "
+                        "DENALI_GCP_ONBOARDING_BUCKET"
+                    ),
+                )
+            scopes = list(dict.fromkeys(connection.declared_scopes))
+            unsupported_scopes = [scope for scope in scopes if scope not in GCP_SCOPES]
+            if unsupported_scopes:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"unsupported Google Cloud scope: {', '.join(unsupported_scopes)}",
+                )
+            connection_id = str(uuid4())
+            try:
+                principal = provisioner.create_principal(
+                    connection_id=connection_id,
+                    display_name=display_name,
+                )
+            except Exception as error:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Unable to create the keyless Google Cloud connection principal",
+                ) from error
+            try:
+                created = repo.create_connection(
+                    current_tenant,
+                    connection_id=connection_id,
+                    provider="gcp",
+                    display_name=display_name,
+                    credential_type="gcp_service_account",
+                    credential_reference={
+                        **principal,
+                        "operator_project_id": provisioner.operator_project_id,
+                    },
+                    declared_scopes=scopes,
+                    coverage_plan=[],
+                    configuration={
+                        "coverage_mode": "selected-projects",
+                        "projects": [],
                     },
                 )
                 return _with_validation_state(request, current_tenant, created)
@@ -726,6 +831,130 @@ def create_app(
             wait_for_healthy=True,
         )
 
+    @app.post("/v1/connections/{connection_id}/gcp/setup/launch", status_code=201)
+    def launch_gcp_setup(
+        request: Request,
+        response: Response,
+        connection_id: UUID,
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "gcp":
+            raise HTTPException(status_code=404, detail="Google Cloud connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot be launched")
+        launcher = request.app.state.gcp_setup_launcher
+        if launcher is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Google Cloud Shell onboarding is not configured",
+            )
+        try:
+            launch = launcher.create_launch(
+                tenant_id=current_tenant,
+                connection_id=str(connection_id),
+                connection=target,
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=502, detail="Unable to prepare the Google Cloud setup script"
+            ) from error
+
+        recorded = repo.record_gcp_connection_setup_launch(
+            current_tenant,
+            str(connection_id),
+            launch={
+                "method": "gcp_cloud_shell",
+                "script_version": launch["script_version"],
+                "script_sha256": launch["script_sha256"],
+                "principal_email": launch["principal_email"],
+                "published_at": launch["published_at"].isoformat(),
+                "url_expires_at": launch["expires_at"].isoformat(),
+            },
+            setup_token_sha256=launch["completion_token_sha256"],
+        )
+        if recorded is None:
+            raise HTTPException(status_code=409, detail="connection changed during launch")
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "cloud_shell_url": launch["cloud_shell_url"],
+            "script_url": launch["script_url"],
+            "setup_command": launch["setup_command"],
+            "script_version": launch["script_version"],
+            "script_sha256": launch["script_sha256"],
+            "principal_email": launch["principal_email"],
+            "expires_at": launch["expires_at"],
+        }
+
+    @app.post("/v1/connections/{connection_id}/gcp/setup/complete", status_code=202)
+    def complete_gcp_setup(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        connection_id: UUID,
+        completion: GcpSetupCompletion,
+    ) -> dict[str, str]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "gcp":
+            raise HTTPException(status_code=404, detail="Google Cloud connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot be completed")
+        payload = _decode_gcp_completion_code(completion.completion_code)
+        expected_token_hash = target["credential_reference"].get("setup_token_sha256")
+        presented_token = payload.get("token")
+        token_matches = (
+            bool(expected_token_hash)
+            and isinstance(presented_token, str)
+            and hmac.compare_digest(
+                expected_token_hash, hashlib.sha256(presented_token.encode()).hexdigest()
+            )
+        )
+        if not token_matches:
+            raise HTTPException(
+                status_code=409, detail="Google Cloud setup completion code is invalid"
+            )
+        onboarding = target["configuration"].get("onboarding", {})
+        try:
+            expires_at = datetime.fromisoformat(onboarding["url_expires_at"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(
+                status_code=409, detail="Google Cloud setup launch is not current"
+            ) from error
+        if datetime.now(UTC) > expires_at:
+            raise HTTPException(
+                status_code=409, detail="Google Cloud setup completion code has expired"
+            )
+        if payload.get("principal_email") != target["credential_reference"]["principal_email"]:
+            raise HTTPException(
+                status_code=409, detail="Google Cloud principal does not match the plan"
+            )
+        projects = _gcp_projects_from_completion(payload)
+        completed_at = datetime.now(UTC)
+        updated = repo.complete_gcp_connection_setup(
+            current_tenant,
+            str(connection_id),
+            expected_setup_token_sha256=expected_token_hash,
+            projects=projects,
+            coverage_plan=gcp_coverage_plan(target["declared_scopes"], projects),
+            completed_at=completed_at,
+        )
+        if updated is None:
+            raise HTTPException(status_code=409, detail="connection changed during setup")
+        validation_target = repo.get_connection_validation_target(
+            current_tenant, str(connection_id)
+        )
+        if validation_target is None:
+            raise HTTPException(status_code=409, detail="connection changed during setup")
+        return queue_validation(
+            request,
+            background_tasks,
+            repo,
+            current_tenant,
+            validation_target,
+            wait_for_credentials=True,
+            wait_for_healthy=True,
+        )
+
     @app.post("/v1/connections/{connection_id}/validate", status_code=202)
     def validate_connection(
         request: Request,
@@ -739,12 +968,17 @@ def create_app(
             raise HTTPException(status_code=404, detail="connection not found")
         if target["lifecycle_state"] != "active":
             raise HTTPException(status_code=409, detail="disabled connections cannot be validated")
-        if target["provider"] not in {"aws", "azure"}:
+        if target["provider"] not in {"aws", "azure", "gcp"}:
             raise HTTPException(status_code=422, detail="connection provider is not supported")
         if target["provider"] == "azure" and not target["configuration"].get("subscriptions"):
             raise HTTPException(
                 status_code=409,
                 detail="complete Azure subscription selection before validation",
+            )
+        if target["provider"] == "gcp" and not target["configuration"].get("projects"):
+            raise HTTPException(
+                status_code=409,
+                detail="complete Google Cloud project selection before validation",
             )
         return queue_validation(
             request,
@@ -1072,6 +1306,10 @@ def _with_validation_state(
             result["provider"] == "azure"
             and request.app.state.azure_setup_launcher is not None
         ),
+        "gcp_cloud_shell": (
+            result["provider"] == "gcp"
+            and request.app.state.gcp_setup_launcher is not None
+        ),
     }
     return result
 
@@ -1113,6 +1351,30 @@ def _azure_setup_launcher_from_environment() -> AzureSetupScriptLauncher | None:
     )
 
 
+def _gcp_setup_launcher_from_environment() -> GcpSetupScriptLauncher | None:
+    bucket_name = os.environ.get("DENALI_GCP_ONBOARDING_BUCKET")
+    if not bucket_name:
+        return None
+    expires_in_seconds = _bounded_environment_integer(
+        "DENALI_GCP_ONBOARDING_URL_SECONDS",
+        default=3600,
+        minimum=300,
+        maximum=3600,
+    )
+    return GcpSetupScriptLauncher(
+        bucket_name=bucket_name,
+        expires_in_seconds=expires_in_seconds,
+    )
+
+
+def _gcp_principal_provisioner_from_environment(
+) -> GcpConnectionPrincipalProvisioner | None:
+    operator_project_id = os.environ.get("DENALI_GCP_OPERATOR_PROJECT_ID")
+    if not operator_project_id:
+        return None
+    return GcpConnectionPrincipalProvisioner(operator_project_id=operator_project_id)
+
+
 def _decode_azure_completion_code(value: str) -> dict[str, Any]:
     encoded = value.strip()
     if encoded.startswith("DENALI_SETUP_COMPLETE="):
@@ -1126,6 +1388,24 @@ def _decode_azure_completion_code(value: str) -> dict[str, Any]:
         ) from error
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Azure setup completion code is malformed")
+    return payload
+
+
+def _decode_gcp_completion_code(value: str) -> dict[str, Any]:
+    encoded = value.strip()
+    if encoded.startswith("DENALI_GCP_SETUP_COMPLETE="):
+        encoded = encoded.split("=", 1)[1].strip()
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded + padding))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=422, detail="Google Cloud setup completion code is malformed"
+        ) from error
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=422, detail="Google Cloud setup completion code is malformed"
+        )
     return payload
 
 
@@ -1147,6 +1427,36 @@ def _azure_subscriptions_from_completion(payload: dict[str, Any]) -> list[dict[s
             seen.add(normalized_id)
             subscriptions.append({"id": subscription_id, "name": name})
     return subscriptions
+
+
+def _gcp_projects_from_completion(payload: dict[str, Any]) -> list[dict[str, str]]:
+    raw_projects = payload.get("projects")
+    if not isinstance(raw_projects, list) or not 1 <= len(raw_projects) <= 200:
+        raise HTTPException(status_code=422, detail="select between 1 and 200 projects")
+    projects: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_projects:
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=422, detail="Google Cloud project selection is invalid"
+            )
+        project_id = str(item.get("id", ""))
+        name = str(item.get("name", "")).strip()
+        project_number = str(item.get("number", ""))
+        if (
+            not valid_gcp_project_id(project_id)
+            or not name
+            or len(name) > 256
+            or not project_number.isdigit()
+            or not 6 <= len(project_number) <= 30
+        ):
+            raise HTTPException(
+                status_code=422, detail="Google Cloud project selection is invalid"
+            )
+        if project_id not in seen:
+            seen.add(project_id)
+            projects.append({"id": project_id, "name": name, "number": project_number})
+    return projects
 
 
 def _valid_uuid_text(value: str) -> bool:

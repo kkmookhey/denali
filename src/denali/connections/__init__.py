@@ -31,6 +31,20 @@ from denali.connections.azure_onboarding import (
     AzureSetupScriptLauncher,
     render_setup_script,
 )
+from denali.connections.gcp import (
+    GCP_SCOPE_AGENT_BUILDER,
+    GCP_SCOPE_AI_ACTIVITY,
+    GCP_SCOPE_VERTEX_AI,
+    GCP_SCOPES,
+    GcpConnectionValidator,
+    gcp_coverage_plan,
+)
+from denali.connections.gcp_onboarding import (
+    GCP_ONBOARDING_SCRIPT_VERSION,
+    GcpConnectionPrincipalProvisioner,
+    GcpSetupScriptLauncher,
+    render_gcp_setup_script,
+)
 
 __all__ = [
     "AWS_COVERAGE_AUTOMATIC",
@@ -51,9 +65,19 @@ __all__ = [
     "AZURE_SCOPES",
     "AzureConnectionValidator",
     "AzureSetupScriptLauncher",
+    "GCP_ONBOARDING_SCRIPT_VERSION",
+    "GCP_SCOPE_AGENT_BUILDER",
+    "GCP_SCOPE_AI_ACTIVITY",
+    "GCP_SCOPE_VERTEX_AI",
+    "GCP_SCOPES",
+    "GcpConnectionPrincipalProvisioner",
+    "GcpConnectionValidator",
+    "GcpSetupScriptLauncher",
     "aws_connection_coverage_plan",
     "aws_coverage_plan",
     "azure_coverage_plan",
+    "gcp_coverage_plan",
     "render_cloudformation",
     "render_setup_script",
+    "render_gcp_setup_script",
 ]

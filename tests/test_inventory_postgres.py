@@ -17,8 +17,10 @@ import pytest
 from denali.connections import (
     AWS_SCOPE_BEDROCK_AGENTS,
     AZURE_SCOPES,
+    GCP_SCOPES,
     aws_coverage_plan,
     azure_coverage_plan,
+    gcp_coverage_plan,
 )
 from denali.connectors.code_to_cloud import CodeToCloudConnector, DeploymentTarget
 from denali.connectors.demo import demo_batch, demo_findings_batch
@@ -422,6 +424,78 @@ def test_azure_setup_completion_consumes_token_and_binds_selected_subscriptions(
         expected_setup_token_sha256=setup_token_sha256,
         service_principal_id=service_principal_id,
         subscriptions=subscriptions,
+        coverage_plan=plan,
+        completed_at=now,
+    )
+    assert replay is None
+
+
+def test_gcp_setup_completion_consumes_token_and_binds_selected_projects(repository) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    connection_id = str(uuid.uuid4())
+    principal_email = "denali-audit@denali-operator.iam.gserviceaccount.com"
+    setup_token_sha256 = "d" * 64
+    projects = [
+        {"id": "production-ai-12345", "name": "Production", "number": "123456789012"},
+        {"id": "ai-lab-67890", "name": "AI Lab", "number": "210987654321"},
+    ]
+    created = repo.create_connection(
+        tenant,
+        connection_id=connection_id,
+        provider="gcp",
+        display_name="Fixture GCP",
+        credential_type="gcp_service_account",
+        credential_reference={"principal_email": principal_email},
+        declared_scopes=list(GCP_SCOPES),
+        coverage_plan=[],
+        configuration={"coverage_mode": "selected-projects", "projects": []},
+    )
+    assert created["credential_reference"] == {
+        "type": "gcp_service_account",
+        "principal_email": principal_email,
+    }
+
+    launched = repo.record_gcp_connection_setup_launch(
+        tenant,
+        connection_id,
+        launch={
+            "method": "gcp_cloud_shell",
+            "script_version": "denali-gcp-project-reader-v1",
+            "script_sha256": "e" * 64,
+            "principal_email": principal_email,
+            "published_at": now.isoformat(),
+            "url_expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+        setup_token_sha256=setup_token_sha256,
+    )
+    assert launched is not None
+    assert "setup_token" not in str(launched)
+    target = repo.get_connection_validation_target(tenant, connection_id)
+    assert target is not None
+    assert target["credential_reference"]["setup_token_sha256"] == setup_token_sha256
+
+    plan = gcp_coverage_plan(list(GCP_SCOPES), projects)
+    completed = repo.complete_gcp_connection_setup(
+        tenant,
+        connection_id,
+        expected_setup_token_sha256=setup_token_sha256,
+        projects=projects,
+        coverage_plan=plan,
+        completed_at=now,
+    )
+    assert completed is not None
+    assert completed["configuration"]["projects"] == projects
+    assert len(completed["coverage_plan"]) == 10
+    completed_target = repo.get_connection_validation_target(tenant, connection_id)
+    assert completed_target is not None
+    assert "setup_token_sha256" not in completed_target["credential_reference"]
+
+    replay = repo.complete_gcp_connection_setup(
+        tenant,
+        connection_id,
+        expected_setup_token_sha256=setup_token_sha256,
+        projects=projects,
         coverage_plan=plan,
         completed_at=now,
     )

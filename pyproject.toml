@@ -47,6 +47,7 @@ azure = [
   "azure-identity>=1.17",
 ]
 gcp = [
+  "google-auth>=2.35",
   "google-cloud-logging>=3.12",
 ]
 dev = [

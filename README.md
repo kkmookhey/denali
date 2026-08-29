@@ -143,6 +143,34 @@ Entra sign-ins and applications, prompts, responses, and secrets remain outside 
 connection. See
 [`docs/architecture/0019-self-service-azure-connections.md`](docs/architecture/0019-self-service-azure-connections.md).
 
+### Self-service Google Cloud connection
+
+Google Cloud uses a unique Denali-owned service account per connection and customer-controlled project IAM; it
+does not ask customers for a service-account JSON key or user OAuth token. Open
+**Connections**, select **Google Cloud**, and create a plan. **Prepare Google Cloud setup**
+provides a Cloud Shell link, copyable command, and the exact script as a download. The script
+enumerates active projects visible to the signed-in Google identity, lets the customer choose
+one, several, or all, and grants only Cloud Asset Viewer and Logs Viewer on those projects.
+
+Configure the Denali API with an operator project for its keyless connection principals and
+the private script publisher:
+
+```bash
+export DENALI_GCP_OPERATOR_PROJECT_ID=denali-operator-project
+export DENALI_GCP_ONBOARDING_BUCKET=denali-onboarding-templates
+```
+
+The Denali operator identity needs permission to create service accounts in that operator
+project. Its runtime identity must obtain each connection principal through service-account
+impersonation and therefore needs Service Account Token Creator on those principals (a
+project-level operator grant can cover them). Do not use a long-lived customer key.
+
+Validation binds each selected project ID to its immutable project number, then tests five
+independent Cloud Asset Inventory and Cloud Logging planes across all resource locations.
+New IAM bindings receive the same bounded propagation retry as Azure. Successful connection
+validation is not collection evidence or a risk verdict. See
+[`docs/architecture/0020-self-service-gcp-connections.md`](docs/architecture/0020-self-service-gcp-connections.md).
+
 Scan a source repository into Denali with the first-party repository connector:
 
 ```bash

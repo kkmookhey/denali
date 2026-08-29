@@ -52,6 +52,8 @@ import type {
   AwsConnectionCreate,
   AzureConnectionCreate,
   AzureSetupLaunch,
+  GcpConnectionCreate,
+  GcpSetupLaunch,
   CodeToCloudDeployment,
   Connection,
   Coverage,
@@ -1777,6 +1779,12 @@ const AZURE_CONNECTION_SCOPES = [
   { id: "azure.ai_activity", label: "Azure AI management activity", detail: "Subscription Activity Log metadata; no prompts or responses" },
 ];
 
+const GCP_CONNECTION_SCOPES = [
+  { id: "gcp.vertex_ai", label: "Vertex AI", detail: "Runtime, model, dataset, pipeline, and notebook resources" },
+  { id: "gcp.agent_builder", label: "Agent Builder and Dialogflow", detail: "Discovery Engine and conversational agent resources" },
+  { id: "gcp.ai_activity", label: "Google Cloud AI management activity", detail: "Cloud Audit Log metadata; no prompts or responses" },
+];
+
 function ConnectionsPage({
   connections,
   onChanged,
@@ -1792,7 +1800,7 @@ function ConnectionsPage({
       : connections[0]?.id ?? null,
   );
   const [showCreate, setShowCreate] = useState(connections.length === 0);
-  const [provider, setProvider] = useState<"aws" | "azure">("aws");
+  const [provider, setProvider] = useState<"aws" | "azure" | "gcp">("aws");
   const [displayName, setDisplayName] = useState("");
   const [accountId, setAccountId] = useState("");
   const [partition, setPartition] = useState<AwsConnectionCreate["partition"]>("aws");
@@ -1803,6 +1811,8 @@ function ConnectionsPage({
   const [azureTenantId, setAzureTenantId] = useState("");
   const [azureLaunches, setAzureLaunches] = useState<Record<string, AzureSetupLaunch>>({});
   const [azureCompletionCode, setAzureCompletionCode] = useState<Record<string, string>>({});
+  const [gcpLaunches, setGcpLaunches] = useState<Record<string, GcpSetupLaunch>>({});
+  const [gcpCompletionCode, setGcpCompletionCode] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const selected = connections.find((connection) => connection.id === selectedId) ?? connections[0];
@@ -1812,7 +1822,7 @@ function ConnectionsPage({
     setBusy("create");
     setActionError(null);
     try {
-      const payload: AwsConnectionCreate | AzureConnectionCreate = provider === "aws" ? {
+      const payload: AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate = provider === "aws" ? {
           provider: "aws",
           display_name: displayName,
           account_id: accountId,
@@ -1821,11 +1831,15 @@ function ConnectionsPage({
           coverage_mode: coverageMode,
           regions: coverageMode === "selected" ? regions.split(",").map((region) => region.trim()).filter(Boolean) : [],
           declared_scopes: scopes,
-        } : {
+        } : provider === "azure" ? {
           provider: "azure",
           display_name: displayName,
           tenant_id: azureTenantId,
           cloud: "AzureCloud",
+          declared_scopes: scopes,
+        } : {
+          provider: "gcp",
+          display_name: displayName,
           declared_scopes: scopes,
         };
       const created = await api.createConnection(payload);
@@ -1926,6 +1940,39 @@ function ConnectionsPage({
     }
   }
 
+  async function prepareGcpSetup(connection: Connection) {
+    setBusy(`launch:${connection.id}`);
+    setActionError(null);
+    try {
+      const launch = await api.launchGcpSetup(connection.id);
+      setGcpLaunches((current) => ({ ...current, [connection.id]: launch }));
+      await onChanged();
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to prepare Google Cloud setup");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function completeGcpSetup(connection: Connection) {
+    const completionCode = gcpCompletionCode[connection.id]?.trim();
+    if (!completionCode) {
+      setActionError("Paste the completion code printed by the Google Cloud setup script.");
+      return;
+    }
+    setBusy(`complete:${connection.id}`);
+    setActionError(null);
+    try {
+      await api.completeGcpSetup(connection.id, completionCode);
+      await waitForValidation(connection, 525);
+      setGcpCompletionCode((current) => ({ ...current, [connection.id]: "" }));
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to complete Google Cloud setup");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function disableConnection(connection: Connection) {
     if (!window.confirm(`Disable ${connection.display_name}? Scheduled collection must stop using this connection.`)) return;
     setBusy(`disable:${connection.id}`);
@@ -1966,7 +2013,7 @@ function ConnectionsPage({
 
   return <div className="page-stack connections-page">
     <section className="page-intro connection-intro">
-      <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali customer credentials.</h2><p>AWS uses assume-role; Azure uses a multi-tenant application with Reader only on subscriptions the customer selects. Every declared plane is validated separately.</p></div>
+      <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali customer credentials.</h2><p>AWS uses assume-role; Azure uses a tenant-local enterprise application; Google Cloud grants bounded roles to Denali’s service account. Customers select exact subscriptions or projects, and every declared plane is validated separately.</p></div>
       <button className="primary-action" onClick={() => setShowCreate((visible) => !visible)}><Plus /> Add connection</button>
     </section>
     <section className="connection-boundary"><ShieldCheck /><div><strong>Connection health is not a risk verdict.</strong><span>A healthy connection means the configured role and declared validation calls worked. It does not mean collection is complete, findings are absent, or the connected environment is safe.</span></div></section>
@@ -1976,8 +2023,8 @@ function ConnectionsPage({
     </div>}
     {actionError && <div className="connection-error"><CircleAlert /><span>{actionError}</span></div>}
     {showCreate && <form className="panel connection-create" onSubmit={(event) => void createConnection(event)}>
-      <div className="connection-provider-picker"><button type="button" className={provider === "aws" ? "active" : ""} onClick={() => { setProvider("aws"); setScopes(AWS_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Amazon Web Services</button><button type="button" className={provider === "azure" ? "active" : ""} onClick={() => { setProvider("azure"); setScopes(AZURE_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Microsoft Azure</button></div>
-      <div className="connection-create-head"><div><span>NEW CONNECTION</span><h3>{provider === "aws" ? "Amazon Web Services" : "Microsoft Azure"}</h3><p>{provider === "aws" ? "CloudFormation creates one read-only role with an external-ID trust condition. No access keys are created or stored." : "Denali’s multi-tenant application receives Reader only on subscriptions you select in Azure Cloud Shell. No customer client secret is created or stored."}</p></div><span className="provider-mark">{provider === "aws" ? "AWS" : "AZURE"}</span></div>
+      <div className="connection-provider-picker"><button type="button" className={provider === "aws" ? "active" : ""} onClick={() => { setProvider("aws"); setScopes(AWS_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Amazon Web Services</button><button type="button" className={provider === "azure" ? "active" : ""} onClick={() => { setProvider("azure"); setScopes(AZURE_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Microsoft Azure</button><button type="button" className={provider === "gcp" ? "active" : ""} onClick={() => { setProvider("gcp"); setScopes(GCP_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Google Cloud</button></div>
+      <div className="connection-create-head"><div><span>NEW CONNECTION</span><h3>{provider === "aws" ? "Amazon Web Services" : provider === "azure" ? "Microsoft Azure" : "Google Cloud"}</h3><p>{provider === "aws" ? "CloudFormation creates one read-only role with an external-ID trust condition. No access keys are created or stored." : provider === "azure" ? "Denali’s multi-tenant application receives Reader only on subscriptions you select in Azure Cloud Shell. No customer client secret is created or stored." : "Denali creates a unique keyless service account for this connection. Google Cloud Shell grants it bounded read roles only on projects you select; no customer key or user token is stored."}</p></div><span className="provider-mark">{provider === "aws" ? "AWS" : provider === "azure" ? "AZURE" : "GCP"}</span></div>
       <div className="connection-form-grid">
         <label><span>Connection name</span><input required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder={provider === "aws" ? "Production AWS" : "Production Azure"} /></label>
         {provider === "aws" ? <>
@@ -1985,19 +2032,21 @@ function ConnectionsPage({
         <label><span>Partition</span><select value={partition} onChange={(event) => setPartition(event.target.value as AwsConnectionCreate["partition"])}><option value="aws">Commercial AWS</option><option value="aws-us-gov">AWS GovCloud</option><option value="aws-cn">AWS China</option></select></label>
         <label><span>Preferred CloudFormation stack location</span><input required value={deploymentRegion} onChange={(event) => setDeploymentRegion(event.target.value)} placeholder="us-east-1" /><small>This plans where the stack is managed; it does not limit inventory coverage.</small></label>
         <label><span>Inventory region coverage</span><select value={coverageMode} onChange={(event) => setCoverageMode(event.target.value as AwsConnectionCreate["coverage_mode"])}><option value="automatic">All enabled regions (recommended)</option><option value="selected">Selected regions only</option></select><small>Automatic mode rediscovers enabled and opted-in regions on every validation.</small></label>
-        {coverageMode === "selected" && <label><span>Selected inventory regions</span><input required value={regions} onChange={(event) => setRegions(event.target.value)} placeholder="us-east-1, us-west-2" /><small>Coverage outside this explicit allowlist will be reported as excluded.</small></label>}</> : <>
+        {coverageMode === "selected" && <label><span>Selected inventory regions</span><input required value={regions} onChange={(event) => setRegions(event.target.value)} placeholder="us-east-1, us-west-2" /><small>Coverage outside this explicit allowlist will be reported as excluded.</small></label>}</> : provider === "azure" ? <>
         <label><span>Microsoft Entra tenant ID</span><input required pattern="[0-9a-fA-F-]{36}" maxLength={36} value={azureTenantId} onChange={(event) => setAzureTenantId(event.target.value)} placeholder="00000000-0000-0000-0000-000000000000" /><small>Cloud Shell will enumerate enabled subscriptions in this tenant and let you choose.</small></label>
-        <label><span>Resource location coverage</span><input value="All locations in selected subscriptions" disabled /><small>Azure Resource Graph queries are subscription-wide; no single region limits coverage.</small></label></>}
+        <label><span>Resource location coverage</span><input value="All locations in selected subscriptions" disabled /><small>Azure Resource Graph queries are subscription-wide; no single region limits coverage.</small></label></> : <>
+        <label><span>Project selection</span><input value="Choose in Google Cloud Shell" disabled /><small>Cloud Shell enumerates active projects visible to your signed-in Google identity and lets you choose.</small></label>
+        <label><span>Resource location coverage</span><input value="All locations in selected projects" disabled /><small>Cloud Asset Inventory queries are project-wide; no preferred region limits coverage.</small></label></>}
       </div>
-      <fieldset className="connection-scope-picker"><legend>Declared collection planes</legend>{(provider === "aws" ? AWS_CONNECTION_SCOPES : AZURE_CONNECTION_SCOPES).map((scope) => <label key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={() => toggleScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.detail}</small></span></label>)}</fieldset>
+      <fieldset className="connection-scope-picker"><legend>Declared collection planes</legend>{(provider === "aws" ? AWS_CONNECTION_SCOPES : provider === "azure" ? AZURE_CONNECTION_SCOPES : GCP_CONNECTION_SCOPES).map((scope) => <label key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={() => toggleScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.detail}</small></span></label>)}</fieldset>
       <div className="connection-form-actions"><button type="button" onClick={() => setShowCreate(false)}>Cancel</button><button className="primary-action" type="submit" disabled={busy === "create" || scopes.length === 0}>{busy === "create" ? "Creating…" : "Create onboarding plan"}</button></div>
     </form>}
     <div className="connections-layout">
       <section className="panel connection-list-panel">
         <PanelHeader eyebrow="CLOUD" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
-        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No cloud connections configured</strong><span>Create an AWS or Azure onboarding plan to begin.</span></div>}</div>
+        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : connection.provider === "azure" ? `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions` : `${connection.configuration.projects?.length ?? 0} selected projects`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No cloud connections configured</strong><span>Create an AWS, Azure, or Google Cloud onboarding plan to begin.</span></div>}</div>
       </section>
-      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
+      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
     </div>
   </div>;
 }
@@ -2007,8 +2056,9 @@ function ConnectionHealth({ state }: { state: Connection["health_state"] }) {
   return <span className={`connection-health ${state}`}><Icon />{titleCase(state)}</span>;
 }
 
-function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
   if (connection.provider === "azure") return <AzureConnectionDetail connection={connection} busy={busy} launch={azureLaunch} completionCode={azureCompletionCode} onCompletionCode={onAzureCompletionCode} onPrepare={onPrepareAzure} onComplete={onCompleteAzure} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
+  if (connection.provider === "gcp") return <GcpConnectionDetail connection={connection} busy={busy} launch={gcpLaunch} completionCode={gcpCompletionCode} onCompletionCode={onGcpCompletionCode} onPrepare={onPrepareGcp} onComplete={onCompleteGcp} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   const validation = connection.last_validation;
   const awsCredential = connection.credential_reference.type === "aws_assume_role" ? connection.credential_reference : null;
   const launching = busy === `launch:${connection.id}`;
@@ -2060,6 +2110,28 @@ function AzureConnectionDetail({ connection, busy, launch, completionCode, onCom
     <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed subscriptions {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.subscription_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.subscription_name ?? result.subscription_id} · all resource locations</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Authorize the application, select subscriptions, and paste the Cloud Shell completion code first.</small></span></div>}</div>
     <details className="connection-permissions"><summary>Review {permissions.length || 2} declared Azure permissions</summary><div>{(permissions.length ? permissions : ["Microsoft.Resources/subscriptions/read", "Microsoft.Authorization/roleAssignments/read"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>The customer grants Azure Reader only at selected subscription scopes. This does not grant Microsoft Graph/Entra directory reads, data-plane access, secret access, prompt access, response access, or remediation.</p></details>
     <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes only connection configuration and validation history; Azure role assignments must be removed in Azure and collected evidence remains.</span>{credential?.service_principal_id && <code>Service principal {credential.service_principal_id}</code>}</div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
+  </section>;
+}
+
+function GcpConnectionDetail({ connection, busy, launch, completionCode, onCompletionCode, onPrepare, onComplete, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; launch?: GcpSetupLaunch; completionCode: string; onCompletionCode: (value: string) => void; onPrepare: () => void; onComplete: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+  const validation = connection.last_validation;
+  const projects = connection.configuration.projects ?? [];
+  const setupComplete = projects.length > 0;
+  const preparing = busy === `launch:${connection.id}`;
+  const completing = busy === `complete:${connection.id}`;
+  const validating = connection.validation_state === "running" || busy === `validate:${connection.id}` || completing;
+  const credential = connection.credential_reference.type === "gcp_service_account" ? connection.credential_reference : null;
+  const permissions = [...new Set(connection.coverage_plan.flatMap((item) => item.permissions))].sort();
+  return <section className="panel connection-detail">
+    <div className="connection-detail-head"><div><span>GOOGLE CLOUD</span><h3>{connection.display_name}</h3><code>{credential?.principal_email}</code></div><ConnectionHealth state={connection.health_state} /></div>
+    <div className="setup-progress">
+      <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>A unique keyless Denali service account, declared scopes, and customer-controlled project-selection boundary are recorded. No customer key or user token is requested.</small></div></div>
+      <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Select projects and grant bounded read access</strong><small>Google Cloud Shell enumerates active projects visible to your signed-in identity. Cloud Asset Viewer and Logs Viewer are granted only to projects you select; every resource location inside them remains in scope.</small>{!launch && <button className="primary-action" disabled={preparing || !connection.setup_capabilities.gcp_cloud_shell} onClick={onPrepare}><ExternalLink />{preparing ? "Preparing Google Cloud setup…" : setupComplete ? "Prepare Google Cloud setup again" : "Prepare Google Cloud setup"}</button>}{launch && <div className="azure-setup-actions"><div className="connection-launch-actions"><a className="primary-action" href={launch.cloud_shell_url} target="_blank" rel="noreferrer"><ExternalLink />1. Open Cloud Shell</a><a className="secondary-action" href={launch.script_url} download><Download />Download script</a></div><small className="azure-consent-guidance">Cloud Shell uses your existing Google session only to enumerate projects and update IAM policies. Denali never receives that session or a customer service-account key.</small><label className="azure-command"><span>2. Run in Cloud Shell</span><textarea readOnly value={launch.setup_command} /><button type="button" onClick={() => void navigator.clipboard.writeText(launch.setup_command)}>Copy command</button><small>The command downloads the same reviewable script shown by Download script. Its URL expires at {formatTime(launch.expires_at)}.</small></label><label className="azure-completion"><span>3. Paste the completion code printed by the script</span><textarea value={completionCode} onChange={(event) => onCompletionCode(event.target.value)} placeholder="DENALI_GCP_SETUP_COMPLETE=…" /><button className="primary-action" type="button" disabled={completing || !completionCode.trim()} onClick={onComplete}>{completing ? "Waiting for Google Cloud IAM propagation…" : "Complete setup and validate"}</button><small>New Google Cloud IAM bindings can take several minutes to propagate. Denali retries the declared checks before recording a partial result.</small></label></div>}{!connection.setup_capabilities.gcp_cloud_shell && <small className="launch-unavailable">Cloud Shell setup requires Denali’s Google Cloud service account and private onboarding-script publisher.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{projects.length} selected project{projects.length === 1 ? "" : "s"}</strong>{projects.map((project) => <code key={project.id}>{project.name} · {project.id} · {project.number}</code>)}</div>}</div></div>
+      <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every selected project</strong><small>Denali binds each exact project ID and immutable project number first, then validates every declared project-wide plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating Google Cloud…" : validation ? "Validate again" : "Validate connection"}</button>}</div></div>
+    </div>
+    <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed projects {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.project_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.project_name ?? result.project_id} · all resource locations</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Select projects in Cloud Shell and paste its completion code first.</small></span></div>}</div>
+    <details className="connection-permissions"><summary>Review {permissions.length || 2} declared Google Cloud permissions</summary><div>{(permissions.length ? permissions : ["cloudasset.assets.searchAllResources", "logging.logEntries.list"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>The customer grants Cloud Asset Viewer and Logs Viewer only on selected projects. This does not grant writes, service-account key access, prompt or response contents, or remediation.</p></details>
+    <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes only connection configuration and validation history; customer-project IAM bindings and the Denali-owned service account require separate cleanup, while collected evidence remains.</span>{credential?.principal_unique_id && <code>Immutable service-account ID {credential.principal_unique_id}</code>}</div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
   </section>;
 }
 
