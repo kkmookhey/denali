@@ -55,6 +55,52 @@ remains available at <http://127.0.0.1:8088>, with interactive documentation at
 <http://127.0.0.1:8088/docs>. The local stack deliberately uses ports `3080`, `8088`,
 and `55450` to avoid colliding with the earlier CISOBrief development environment.
 
+### Self-service AWS connection
+
+Open **Connections**, select **Add AWS connection**, and declare the account and collection
+planes Denali should validate. Automatic coverage discovers every enabled or opted-in AWS
+Region on each validation and is the default. Selected-region coverage is available as an
+explicit restriction and reports enabled Regions outside the declared scope. The
+CloudFormation stack location is separate from inventory coverage: it only determines
+where the onboarding stack is managed. When one-click launch is configured, **Launch in
+AWS** publishes the exact per-connection template through a private, short-lived S3 URL
+and opens AWS CloudFormation Quick Create with the stack name and Denali principal already
+filled in. The customer still reviews the template, acknowledges IAM role creation, and
+creates the stack. **Download template** remains available for restricted environments and
+local installations. The stack creates one read-only assume role with an external-ID trust
+condition; it creates no access keys and grants no remediation permissions.
+
+Configure Quick Create on the Denali API with:
+
+```bash
+export DENALI_AWS_ONBOARDING_BUCKET=denali-onboarding-templates
+export DENALI_AWS_PRINCIPAL_ARN=arn:aws:iam::123456789012:role/DenaliRuntime
+```
+
+The API principal needs `s3:PutObject` and `s3:GetObject` only for
+`denali/onboarding/aws/*` in that bucket. Keep S3 Block Public Access enabled, enable
+default bucket encryption, and add a lifecycle rule that deletes objects under that prefix
+after one day. Presigned reads expire after one hour by default and may be shortened with
+`DENALI_AWS_ONBOARDING_URL_SECONDS` (300–3600 seconds). The exact template version, SHA-256,
+intended principal, and publication times are recorded on the connection; Denali does not
+retain the S3 object key, presigned URL, or external ID in launch metadata.
+
+Launching starts a bounded background check that waits up to 15 minutes for the role to
+become assumable, then performs normal validation. Manual downloads use **Validate
+connection** after deployment. Denali first verifies role assumption and exact account
+binding, discovers the account's enabled Regions, then tests every declared plane in every
+in-scope Region.
+Successful authentication with a denied or unavailable plane is shown as partial coverage,
+not healthy. Connection health is access validation only: it is not proof that collection
+ran, that no findings exist, or that the account is safe.
+Validation continues in the background while the Connections page polls for the completed
+result, so broad multi-Region coverage is not constrained by an HTTP proxy timeout.
+
+Connections must be disabled before deletion, and deletion requires the exact display
+name. Deleting connection configuration retains evidence already collected through that
+connection. The contract and its evidence boundary are documented in
+[`docs/architecture/0018-self-service-aws-connections.md`](docs/architecture/0018-self-service-aws-connections.md).
+
 Scan a source repository into Denali with the first-party repository connector:
 
 ```bash

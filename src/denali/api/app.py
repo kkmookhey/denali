@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import os
+import re
 from contextlib import asynccontextmanager
-from typing import Annotated, Any, Protocol
-from uuid import UUID
+from threading import Lock
+from time import monotonic, sleep
+from typing import Annotated, Any, Literal, Protocol
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from denali.connections import (
+    AWS_COVERAGE_AUTOMATIC,
+    AWS_COVERAGE_SELECTED,
+    AWS_SCOPES,
+    AwsCloudFormationLauncher,
+    AwsConnectionValidator,
+    aws_connection_coverage_plan,
+)
+from denali.connections.aws import render_cloudformation
 from denali.store.db import migrate
 from denali.store.repository import PostgresInventoryRepository
 
@@ -19,6 +31,40 @@ DEFAULT_LOCAL_TENANT = "00000000-0000-4000-8000-000000000001"
 
 
 class InventoryReader(Protocol):
+    def create_connection(
+        self,
+        tenant_id: str,
+        *,
+        connection_id: str,
+        provider: str,
+        display_name: str,
+        credential_type: str,
+        credential_reference: dict[str, Any],
+        declared_scopes: list[str],
+        coverage_plan: list[dict[str, Any]],
+        configuration: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def list_connections(self, tenant_id: str) -> list[dict[str, Any]]: ...
+
+    def get_connection(self, tenant_id: str, connection_id: str) -> dict[str, Any] | None: ...
+
+    def get_connection_validation_target(
+        self, tenant_id: str, connection_id: str
+    ) -> dict[str, Any] | None: ...
+
+    def record_connection_validation(
+        self, tenant_id: str, connection_id: str, validation: dict[str, Any]
+    ) -> dict[str, Any] | None: ...
+
+    def record_connection_launch(
+        self, tenant_id: str, connection_id: str, launch: dict[str, Any]
+    ) -> dict[str, Any] | None: ...
+
+    def disable_connection(self, tenant_id: str, connection_id: str) -> dict[str, Any] | None: ...
+
+    def delete_connection(self, tenant_id: str, connection_id: str) -> str: ...
+
     def list_assets(
         self,
         tenant_id: str,
@@ -138,14 +184,57 @@ class GovernanceUpdate(BaseModel):
     notes: str | None = Field(default=None, max_length=4000)
 
 
+class AwsConnectionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["aws"] = "aws"
+    display_name: str = Field(min_length=1, max_length=120)
+    account_id: str = Field(pattern=r"^[0-9]{12}$")
+    partition: Literal["aws", "aws-us-gov", "aws-cn"] = "aws"
+    deployment_region: str = "us-east-1"
+    coverage_mode: Literal["automatic", "selected"] = AWS_COVERAGE_AUTOMATIC
+    regions: list[str] = Field(default_factory=list, max_length=40)
+    declared_scopes: list[str] = Field(
+        default_factory=lambda: list(AWS_SCOPES), min_length=1, max_length=len(AWS_SCOPES)
+    )
+    role_name: str = Field(
+        default="DenaliSecurityAuditRole",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9+=,.@_-]+$",
+    )
+
+
 def create_app(
     *,
     repository: InventoryReader | None = None,
+    connection_validator: AwsConnectionValidator | None = None,
+    cloudformation_launcher: AwsCloudFormationLauncher | None = None,
+    onboarding_validation_timeout_seconds: int | None = None,
+    onboarding_validation_retry_seconds: int | None = None,
     tenant_id: str | None = None,
     migrate_on_start: bool = True,
 ) -> FastAPI:
     configured_dsn = os.environ.get("DENALI_DSN")
     configured_tenant = tenant_id or os.environ.get("DENALI_TENANT_ID", DEFAULT_LOCAL_TENANT)
+    configured_launcher = cloudformation_launcher or _cloudformation_launcher_from_environment()
+    onboarding_validation_timeout = (
+        onboarding_validation_timeout_seconds
+        if onboarding_validation_timeout_seconds is not None
+        else _bounded_environment_integer(
+            "DENALI_AWS_ONBOARDING_VALIDATION_SECONDS",
+            default=900,
+            minimum=60,
+            maximum=1800,
+        )
+    )
+    onboarding_validation_retry = (
+        onboarding_validation_retry_seconds
+        if onboarding_validation_retry_seconds is not None
+        else _bounded_environment_integer(
+            "DENALI_AWS_ONBOARDING_RETRY_SECONDS", default=10, minimum=2, maximum=60
+        )
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -158,6 +247,12 @@ def create_app(
         else:
             app.state.repository = None
         app.state.tenant_id = configured_tenant
+        app.state.connection_validator = connection_validator or AwsConnectionValidator()
+        app.state.cloudformation_launcher = configured_launcher
+        app.state.onboarding_validation_timeout = onboarding_validation_timeout
+        app.state.onboarding_validation_retry = onboarding_validation_retry
+        app.state.active_connection_validations = set()
+        app.state.connection_validation_lock = Lock()
         yield
 
     app = FastAPI(
@@ -170,9 +265,53 @@ def create_app(
         CORSMiddleware,
         allow_origins=_cors_origins(),
         allow_credentials=False,
-        allow_methods=["GET", "PATCH", "OPTIONS"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type"],
     )
+
+    def queue_validation(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        repo: InventoryReader,
+        current_tenant: str,
+        target: dict[str, Any],
+        *,
+        wait_for_credentials: bool,
+    ) -> dict[str, str]:
+        connection_id = str(target["id"])
+        connection_key = (current_tenant, connection_id)
+        validation_lock = request.app.state.connection_validation_lock
+        active_validations = request.app.state.active_connection_validations
+        with validation_lock:
+            if connection_key in active_validations:
+                return {"status": "already_running", "connection_id": connection_id}
+            active_validations.add(connection_key)
+
+        validator = request.app.state.connection_validator
+        retry_seconds = request.app.state.onboarding_validation_retry
+        timeout_seconds = request.app.state.onboarding_validation_timeout
+
+        def run_validation() -> None:
+            deadline = monotonic() + timeout_seconds
+            try:
+                while True:
+                    validation = validator.validate(target)
+                    if (
+                        not wait_for_credentials
+                        or validation["credential_state"] == "passed"
+                        or monotonic() >= deadline
+                    ):
+                        repo.record_connection_validation(
+                            current_tenant, connection_id, validation
+                        )
+                        return
+                    sleep(min(retry_seconds, max(0, deadline - monotonic())))
+            finally:
+                with validation_lock:
+                    active_validations.discard(connection_key)
+
+        background_tasks.add_task(run_validation)
+        return {"status": "started", "connection_id": connection_id}
 
     @app.get("/", include_in_schema=False)
     def web_application() -> RedirectResponse:
@@ -182,6 +321,234 @@ def create_app(
     def health(request: Request) -> dict[str, str]:
         state = "ready" if request.app.state.repository is not None else "storage_unconfigured"
         return {"status": state, "version": app.version}
+
+    @app.get("/v1/connections")
+    def list_connections(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        rows = repo.list_connections(current_tenant)
+        return {
+            "items": [_with_validation_state(request, current_tenant, row) for row in rows]
+        }
+
+    @app.post("/v1/connections", status_code=201)
+    def create_connection(request: Request, connection: AwsConnectionCreate) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        display_name = connection.display_name.strip()
+        if not display_name:
+            raise HTTPException(status_code=422, detail="display_name must not be blank")
+        if not _valid_aws_region(connection.deployment_region, partition=connection.partition):
+            raise HTTPException(
+                status_code=422,
+                detail=f"unsupported AWS deployment region format: {connection.deployment_region}",
+            )
+        regions = list(dict.fromkeys(connection.regions))
+        invalid_regions = [
+            region
+            for region in regions
+            if not _valid_aws_region(region, partition=connection.partition)
+        ]
+        if invalid_regions:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unsupported AWS region format: {', '.join(invalid_regions)}",
+            )
+        if connection.coverage_mode == AWS_COVERAGE_SELECTED and not regions:
+            raise HTTPException(
+                status_code=422,
+                detail="selected region coverage requires at least one region",
+            )
+        scopes = list(dict.fromkeys(connection.declared_scopes))
+        unsupported_scopes = [scope for scope in scopes if scope not in AWS_SCOPES]
+        if unsupported_scopes:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unsupported AWS scope: {', '.join(unsupported_scopes)}",
+            )
+        connection_id = str(uuid4())
+        external_id = f"denali-{current_tenant}-{connection_id}"
+        role_arn = (
+            f"arn:{connection.partition}:iam::{connection.account_id}:role/{connection.role_name}"
+        )
+        try:
+            created = repo.create_connection(
+                current_tenant,
+                connection_id=connection_id,
+                provider="aws",
+                display_name=display_name,
+                credential_type="aws_assume_role",
+                credential_reference={"role_arn": role_arn, "external_id": external_id},
+                declared_scopes=scopes,
+                coverage_plan=aws_connection_coverage_plan(
+                    scopes,
+                    (
+                        regions
+                        if connection.coverage_mode == AWS_COVERAGE_SELECTED
+                        else ["all-enabled"]
+                    ),
+                    deployment_region=connection.deployment_region,
+                    coverage_mode=connection.coverage_mode,
+                ),
+                configuration={
+                    "account_id": connection.account_id,
+                    "partition": connection.partition,
+                    "deployment_region": connection.deployment_region,
+                    "coverage_mode": connection.coverage_mode,
+                    "regions": regions if connection.coverage_mode == AWS_COVERAGE_SELECTED else [],
+                    "role_name": connection.role_name,
+                    "stack_scopes": [],
+                },
+            )
+            return _with_validation_state(request, current_tenant, created)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.get("/v1/connections/{connection_id}")
+    def connection_detail(request: Request, connection_id: UUID) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        row = repo.get_connection(current_tenant, str(connection_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="connection not found")
+        return _with_validation_state(request, current_tenant, row)
+
+    @app.get("/v1/connections/{connection_id}/aws/cloudformation.yaml")
+    def aws_connection_cloudformation(
+        request: Request, connection_id: UUID
+    ) -> PlainTextResponse:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "aws":
+            raise HTTPException(status_code=404, detail="AWS connection not found")
+        template = render_cloudformation(target)
+        filename = f"denali-aws-{connection_id}.yaml"
+        return PlainTextResponse(
+            template,
+            media_type="application/yaml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.post("/v1/connections/{connection_id}/aws/cloudformation/launch", status_code=201)
+    def launch_aws_cloudformation(
+        request: Request,
+        response: Response,
+        background_tasks: BackgroundTasks,
+        connection_id: UUID,
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "aws":
+            raise HTTPException(status_code=404, detail="AWS connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot be launched")
+        launcher = request.app.state.cloudformation_launcher
+        if launcher is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "AWS console launch is not configured; use Download template or configure "
+                    "DENALI_AWS_ONBOARDING_BUCKET and DENALI_AWS_PRINCIPAL_ARN"
+                ),
+            )
+        try:
+            launch = launcher.create_launch(
+                tenant_id=current_tenant,
+                connection_id=str(connection_id),
+                connection=target,
+            )
+        except Exception as error:
+            raise HTTPException(
+                status_code=502, detail="Unable to prepare the AWS CloudFormation launch"
+            ) from error
+
+        recorded = repo.record_connection_launch(
+            current_tenant,
+            str(connection_id),
+            {
+                "method": "cloudformation_quick_create",
+                "template_version": launch["template_version"],
+                "template_sha256": launch["template_sha256"],
+                "principal_arn": launch["principal_arn"],
+                "published_at": launch["published_at"].isoformat(),
+                "url_expires_at": launch["expires_at"].isoformat(),
+            },
+        )
+        if recorded is None:
+            raise HTTPException(status_code=409, detail="connection changed during launch")
+        validation = queue_validation(
+            request,
+            background_tasks,
+            repo,
+            current_tenant,
+            target,
+            wait_for_credentials=True,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "launch_url": launch["launch_url"],
+            "stack_name": launch["stack_name"],
+            "stack_region": launch["stack_region"],
+            "template_version": launch["template_version"],
+            "template_sha256": launch["template_sha256"],
+            "expires_at": launch["expires_at"],
+            "validation_status": validation["status"],
+        }
+
+    @app.post("/v1/connections/{connection_id}/validate", status_code=202)
+    def validate_connection(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        connection_id: UUID,
+    ) -> dict[str, str]:
+        repo, current_tenant = _context(request)
+        connection_key = (current_tenant, str(connection_id))
+        target = repo.get_connection_validation_target(current_tenant, connection_key[1])
+        if target is None:
+            raise HTTPException(status_code=404, detail="connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot be validated")
+        if target["provider"] != "aws":
+            raise HTTPException(status_code=422, detail="connection provider is not supported")
+        return queue_validation(
+            request,
+            background_tasks,
+            repo,
+            current_tenant,
+            target,
+            wait_for_credentials=False,
+        )
+
+    @app.post("/v1/connections/{connection_id}/disable")
+    def disable_connection(request: Request, connection_id: UUID) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        connection_key = (current_tenant, str(connection_id))
+        with request.app.state.connection_validation_lock:
+            if connection_key in request.app.state.active_connection_validations:
+                raise HTTPException(
+                    status_code=409,
+                    detail="wait for the active validation to finish before disabling",
+                )
+        row = repo.disable_connection(current_tenant, str(connection_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="connection not found")
+        return _with_validation_state(request, current_tenant, row)
+
+    @app.delete("/v1/connections/{connection_id}", status_code=204)
+    def delete_connection(
+        request: Request,
+        connection_id: UUID,
+        confirm: str = Query(min_length=1, max_length=120),
+    ) -> Response:
+        repo, current_tenant = _context(request)
+        row = repo.get_connection(current_tenant, str(connection_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="connection not found")
+        if confirm != row["display_name"]:
+            raise HTTPException(status_code=409, detail="confirmation name does not match")
+        result = repo.delete_connection(current_tenant, str(connection_id))
+        if result == "active":
+            raise HTTPException(status_code=409, detail="disable the connection before deleting it")
+        if result == "not_found":
+            raise HTTPException(status_code=404, detail="connection not found")
+        return Response(status_code=204)
 
     @app.get("/v1/inventory/summary")
     def inventory_summary(request: Request) -> dict[str, Any]:
@@ -449,9 +816,63 @@ def _context(request: Request) -> tuple[InventoryReader, str]:
     return repository, request.app.state.tenant_id
 
 
+def _with_validation_state(
+    request: Request, tenant_id: str, row: dict[str, Any]
+) -> dict[str, Any]:
+    result = dict(row)
+    connection_key = (tenant_id, str(result["id"]))
+    with request.app.state.connection_validation_lock:
+        running = connection_key in request.app.state.active_connection_validations
+    result["validation_state"] = "running" if running else "idle"
+    result["setup_capabilities"] = {
+        "cloudformation_quick_create": request.app.state.cloudformation_launcher is not None
+    }
+    return result
+
+
+def _cloudformation_launcher_from_environment() -> AwsCloudFormationLauncher | None:
+    bucket_name = os.environ.get("DENALI_AWS_ONBOARDING_BUCKET")
+    principal_arn = os.environ.get("DENALI_AWS_PRINCIPAL_ARN")
+    if not bucket_name or not principal_arn:
+        return None
+    expires_in_seconds = _bounded_environment_integer(
+        "DENALI_AWS_ONBOARDING_URL_SECONDS", default=3600, minimum=300, maximum=3600
+    )
+    return AwsCloudFormationLauncher(
+        bucket_name=bucket_name,
+        principal_arn=principal_arn,
+        expires_in_seconds=expires_in_seconds,
+    )
+
+
+def _bounded_environment_integer(
+    name: str, *, default: int, minimum: int, maximum: int
+) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return min(maximum, max(minimum, value))
+
+
 def _cors_origins() -> list[str]:
     raw = os.environ.get("DENALI_CORS_ORIGINS", "http://localhost:5173")
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _valid_aws_region(region: str, *, partition: str) -> bool:
+    patterns = {
+        "aws": (
+            r"^(af|ap|ca|eu|il|me|mx|sa|us)-"
+            r"(central|east|northeast|north|northwest|south|southeast|southwest|west)-[0-9]+$"
+        ),
+        "aws-us-gov": r"^us-gov-(east|west)-[0-9]+$",
+        "aws-cn": r"^cn-(north|northwest)-[0-9]+$",
+    }
+    return bool(re.fullmatch(patterns[partition], region))
 
 
 app = create_app()

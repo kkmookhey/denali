@@ -14,6 +14,8 @@ import {
   CloudCog,
   Code2,
   Database,
+  Download,
+  ExternalLink,
   FileCode2,
   Filter,
   Fingerprint,
@@ -29,11 +31,14 @@ import {
   PanelLeftClose,
   Package,
   PackageCheck,
+  Plus,
+  Power,
   RefreshCw,
   Search,
   ServerCog,
   ShieldCheck,
   Sparkles,
+  Trash2,
   Waypoints,
   X,
   Zap,
@@ -44,7 +49,9 @@ import { api } from "./api";
 import type {
   Asset,
   AssetDetail,
+  AwsConnectionCreate,
   CodeToCloudDeployment,
+  Connection,
   Coverage,
   Finding,
   FindingDetail,
@@ -68,7 +75,7 @@ import type {
   VulnerabilitySummary,
 } from "./types";
 
-type Page = "dashboard" | "inventory" | "shadowAi" | "findings" | "vulnerabilities" | "issues" | "codeToCloud" | "runtime" | "detections" | "sources";
+type Page = "dashboard" | "connections" | "inventory" | "shadowAi" | "findings" | "vulnerabilities" | "issues" | "codeToCloud" | "runtime" | "detections" | "sources";
 type DetailTab = "overview" | "relationships" | "evidence";
 type FindingDetailTab = "overview" | "evidence" | "history";
 type IssueDetailTab = "overview" | "path" | "evidence";
@@ -124,6 +131,7 @@ function App() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [coverage, setCoverage] = useState<Coverage[]>([]);
+  const [connections, setConnections] = useState<Connection[]>([]);
   const [findingSummary, setFindingSummary] = useState<FindingSummary | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [vulnerabilitySummary, setVulnerabilitySummary] = useState<VulnerabilitySummary | null>(null);
@@ -154,6 +162,7 @@ function App() {
     try {
       const [
         summaryResult,
+        connectionsResult,
         assetsResult,
         coverageResult,
         findingSummaryResult,
@@ -171,6 +180,7 @@ function App() {
         detectionEvaluationsResult,
       ] = await Promise.all([
         api.summary(),
+        api.connections(),
         api.assets(),
         api.coverage(),
         api.findingSummary(),
@@ -188,6 +198,7 @@ function App() {
         api.detectionEvaluations(),
       ]);
       setSummary(summaryResult);
+      setConnections(connectionsResult.items);
       setAssets(assetsResult.items);
       setCoverage(coverageResult.items);
       setFindingSummary(findingSummaryResult);
@@ -279,6 +290,8 @@ function App() {
               onViewSources={() => navigate("sources")}
               onNavigate={navigate}
             />
+          ) : page === "connections" ? (
+            <ConnectionsPage connections={connections} onChanged={loadAll} />
           ) : page === "inventory" ? (
             <Inventory
               assets={assets}
@@ -416,6 +429,7 @@ function Sidebar({ page, onNavigate, open }: { page: Page; onNavigate: (page: Pa
 
       <nav className="nav-stack" aria-label="Primary navigation">
         <NavButton active={page === "dashboard"} icon={LayoutDashboard} label="Overview" onClick={() => onNavigate("dashboard")} />
+        <NavButton active={page === "connections"} icon={CloudCog} label="Connections" onClick={() => onNavigate("connections")} />
         <p className="nav-heading">DISCOVER</p>
         <NavButton active={page === "inventory"} icon={Boxes} label="Inventory" onClick={() => onNavigate("inventory")} />
         <NavButton active={page === "shadowAi"} icon={AppWindow} label="Shadow AI" onClick={() => onNavigate("shadowAi")} />
@@ -467,6 +481,7 @@ function NavButton({
 function Topbar({ page, onMenu, onRefresh }: { page: Page; onMenu: () => void; onRefresh: () => void }) {
   const titles: Record<Page, { eyebrow: string; title: string }> = {
     dashboard: { eyebrow: "Command center", title: "Denali Brief" },
+    connections: { eyebrow: "Setup", title: "Connections" },
     inventory: { eyebrow: "Discovery", title: "AI inventory" },
     shadowAi: { eyebrow: "Discovery", title: "Shadow AI" },
     findings: { eyebrow: "Posture", title: "AI configuration findings" },
@@ -1702,6 +1717,216 @@ function detectionRuleName(ruleUid: string) {
   if (ruleUid === "DENALI-RUNTIME-ENTRA-FAILURES-001") return "Repeated failed access to an AI application";
   if (ruleUid === "DENALI-RUNTIME-ENTRA-CONSENT-001") return "Consent changed for an unreviewed AI application";
   return titleCase(ruleUid);
+}
+
+const AWS_CONNECTION_SCOPES = [
+  { id: "aws.bedrock_agents", label: "Bedrock Agents Classic", detail: "Agents and guardrails" },
+  { id: "aws.agentcore", label: "Amazon Bedrock AgentCore", detail: "Runtimes, gateways, identities, and memory metadata" },
+  { id: "aws.bedrock_activity", label: "Bedrock management activity", detail: "Bounded CloudTrail event history" },
+  { id: "aws.bedrock_logging", label: "Invocation logging configuration", detail: "Configuration presence, never prompts or responses" },
+];
+
+function ConnectionsPage({
+  connections,
+  onChanged,
+}: {
+  connections: Connection[];
+  onChanged: () => Promise<void>;
+}) {
+  const [selectedId, setSelectedId] = useState<string | null>(connections[0]?.id ?? null);
+  const [showCreate, setShowCreate] = useState(connections.length === 0);
+  const [displayName, setDisplayName] = useState("");
+  const [accountId, setAccountId] = useState("");
+  const [partition, setPartition] = useState<AwsConnectionCreate["partition"]>("aws");
+  const [deploymentRegion, setDeploymentRegion] = useState("us-east-1");
+  const [coverageMode, setCoverageMode] = useState<AwsConnectionCreate["coverage_mode"]>("automatic");
+  const [regions, setRegions] = useState("us-east-1");
+  const [scopes, setScopes] = useState(AWS_CONNECTION_SCOPES.map((scope) => scope.id));
+  const [busy, setBusy] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const selected = connections.find((connection) => connection.id === selectedId) ?? connections[0];
+
+  async function createConnection(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("create");
+    setActionError(null);
+    try {
+      const created = await api.createConnection({
+        provider: "aws",
+        display_name: displayName,
+        account_id: accountId,
+        partition,
+        deployment_region: deploymentRegion,
+        coverage_mode: coverageMode,
+        regions: coverageMode === "selected" ? regions.split(",").map((region) => region.trim()).filter(Boolean) : [],
+        declared_scopes: scopes,
+      });
+      await onChanged();
+      setSelectedId(created.id);
+      setShowCreate(false);
+      setDisplayName("");
+      setAccountId("");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to create connection");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function validateConnection(connection: Connection) {
+    setBusy(`validate:${connection.id}`);
+    setActionError(null);
+    try {
+      await api.validateConnection(connection.id);
+      await waitForValidation(connection, 150);
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to validate connection");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function waitForValidation(connection: Connection, maxAttempts: number) {
+    const previousValidation = connection.last_validated_at ?? null;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      const current = await api.connection(connection.id);
+      if (current.validation_state === "running") continue;
+      if (current.last_validated_at !== previousValidation) {
+        await onChanged();
+        return;
+      }
+      throw new Error("Validation stopped before a result was recorded.");
+    }
+    throw new Error("Validation is still running. Refresh shortly to see its result.");
+  }
+
+  async function launchConnection(connection: Connection) {
+    const launchWindow = window.open("about:blank", "_blank");
+    if (!launchWindow) {
+      setActionError("Allow pop-ups for Denali, then select Launch in AWS again.");
+      return;
+    }
+    launchWindow.opener = null;
+    let navigated = false;
+    setBusy(`launch:${connection.id}`);
+    setActionError(null);
+    try {
+      const launch = await api.launchCloudFormation(connection.id);
+      launchWindow.location.replace(launch.launch_url);
+      navigated = true;
+      await waitForValidation(connection, 525);
+    } catch (cause) {
+      if (!navigated) launchWindow.close();
+      setActionError(cause instanceof Error ? cause.message : "Unable to launch AWS");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function disableConnection(connection: Connection) {
+    if (!window.confirm(`Disable ${connection.display_name}? Scheduled collection must stop using this connection.`)) return;
+    setBusy(`disable:${connection.id}`);
+    setActionError(null);
+    try {
+      await api.disableConnection(connection.id);
+      await onChanged();
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to disable connection");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteConnection(connection: Connection) {
+    const confirmation = window.prompt(
+      `Type “${connection.display_name}” to delete its configuration. Collected evidence is retained.`,
+    );
+    if (confirmation === null) return;
+    setBusy(`delete:${connection.id}`);
+    setActionError(null);
+    try {
+      await api.deleteConnection(connection.id, confirmation);
+      setSelectedId(null);
+      await onChanged();
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to delete connection");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function toggleScope(scopeId: string) {
+    setScopes((current) => current.includes(scopeId)
+      ? current.filter((item) => item !== scopeId)
+      : [...current, scopeId]);
+  }
+
+  return <div className="page-stack connections-page">
+    <section className="page-intro connection-intro">
+      <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali access keys.</h2><p>AWS uses a read-only assume-role path. Authentication and every declared collection plane are validated separately.</p></div>
+      <button className="primary-action" onClick={() => setShowCreate((visible) => !visible)}><Plus /> Add AWS connection</button>
+    </section>
+    <section className="connection-boundary"><ShieldCheck /><div><strong>Connection health is not a risk verdict.</strong><span>A healthy connection means the configured role and declared validation calls worked. It does not mean collection is complete, findings are absent, or the AWS account is safe.</span></div></section>
+    {actionError && <div className="connection-error"><CircleAlert /><span>{actionError}</span></div>}
+    {showCreate && <form className="panel connection-create" onSubmit={(event) => void createConnection(event)}>
+      <div className="connection-create-head"><div><span>NEW CONNECTION</span><h3>Amazon Web Services</h3><p>CloudFormation creates one read-only role with an external-ID trust condition. No access keys are created or stored.</p></div><span className="provider-mark">AWS</span></div>
+      <div className="connection-form-grid">
+        <label><span>Connection name</span><input required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Production AWS" /></label>
+        <label><span>AWS account ID</span><input required inputMode="numeric" pattern="[0-9]{12}" maxLength={12} value={accountId} onChange={(event) => setAccountId(event.target.value)} placeholder="123456789012" /></label>
+        <label><span>Partition</span><select value={partition} onChange={(event) => setPartition(event.target.value as AwsConnectionCreate["partition"])}><option value="aws">Commercial AWS</option><option value="aws-us-gov">AWS GovCloud</option><option value="aws-cn">AWS China</option></select></label>
+        <label><span>Preferred CloudFormation stack location</span><input required value={deploymentRegion} onChange={(event) => setDeploymentRegion(event.target.value)} placeholder="us-east-1" /><small>This plans where the stack is managed; it does not limit inventory coverage.</small></label>
+        <label><span>Inventory region coverage</span><select value={coverageMode} onChange={(event) => setCoverageMode(event.target.value as AwsConnectionCreate["coverage_mode"])}><option value="automatic">All enabled regions (recommended)</option><option value="selected">Selected regions only</option></select><small>Automatic mode rediscovers enabled and opted-in regions on every validation.</small></label>
+        {coverageMode === "selected" && <label><span>Selected inventory regions</span><input required value={regions} onChange={(event) => setRegions(event.target.value)} placeholder="us-east-1, us-west-2" /><small>Coverage outside this explicit allowlist will be reported as excluded.</small></label>}
+      </div>
+      <fieldset className="connection-scope-picker"><legend>Declared collection planes</legend>{AWS_CONNECTION_SCOPES.map((scope) => <label key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={() => toggleScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.detail}</small></span></label>)}</fieldset>
+      <div className="connection-form-actions"><button type="button" onClick={() => setShowCreate(false)}>Cancel</button><button className="primary-action" type="submit" disabled={busy === "create" || scopes.length === 0}>{busy === "create" ? "Creating…" : "Create onboarding plan"}</button></div>
+    </form>}
+    <div className="connections-layout">
+      <section className="panel connection-list-panel">
+        <PanelHeader eyebrow="AWS" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
+        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.configuration.account_id} · {(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : connection.configuration.regions.join(", ")}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No AWS connections configured</strong><span>Create an onboarding plan to begin. Other providers are intentionally not available in this slice.</span></div>}</div>
+      </section>
+      {selected && <ConnectionDetail connection={selected} busy={busy} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
+    </div>
+  </div>;
+}
+
+function ConnectionHealth({ state }: { state: Connection["health_state"] }) {
+  const Icon = state === "healthy" ? CircleCheck : state === "partial" || state === "unknown" ? CircleHelp : CircleAlert;
+  return <span className={`connection-health ${state}`}><Icon />{titleCase(state)}</span>;
+}
+
+function ConnectionDetail({ connection, busy, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+  const validation = connection.last_validation;
+  const launching = busy === `launch:${connection.id}`;
+  const validating = connection.validation_state === "running" || busy === `validate:${connection.id}` || launching;
+  const validatedRole = validation?.credential_state === "passed";
+  const permissions = [...new Set(["ec2:DescribeRegions", ...connection.coverage_plan.flatMap((item) => item.permissions)])].sort();
+  const regionDiscovery = validation?.results.find((result) => result.plane === "aws_region_discovery");
+  const planeResults = validation?.results.filter((result) => result.plane !== "aws_region_discovery") ?? [];
+  const planeSummaries = [...planeResults.reduce((summaries, result) => {
+    const current = summaries.get(result.plane) ?? { label: result.label, total: 0, passed: 0, failed: 0, unknown: 0, notApplicable: 0 };
+    current.total += 1;
+    if (result.state === "passed") current.passed += 1;
+    else if (result.state === "failed") current.failed += 1;
+    else if (result.state === "not_applicable") current.notApplicable += 1;
+    else current.unknown += 1;
+    summaries.set(result.plane, current);
+    return summaries;
+  }, new Map<string, { label: string; total: number; passed: number; failed: number; unknown: number; notApplicable: number }>()).values()];
+  const coverageMode = connection.configuration.coverage_mode ?? "automatic";
+  return <section className="panel connection-detail">
+    <div className="connection-detail-head"><div><span>AMAZON WEB SERVICES</span><h3>{connection.display_name}</h3><code>{connection.credential_reference.role_arn}</code></div><ConnectionHealth state={connection.health_state} /></div>
+    <div className="setup-progress">
+      <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Account, scopes, role ARN, and {coverageMode === "automatic" ? "automatic enabled-region coverage" : "the selected-region boundary"} are recorded.</small></div></div>
+      <div className={validatedRole ? "complete" : "current"}><span>{validatedRole ? <Check /> : "2"}</span><div><strong>2. Deploy the CloudFormation stack</strong><small>The stack is managed in {connection.configuration.deployment_region ?? "us-east-1"}; its account-wide IAM role does not restrict inventory to that Region. AWS lets you inspect the exact template and permissions before creating it.</small><div className="connection-launch-actions"><button className="primary-action" disabled={launching || !connection.setup_capabilities.cloudformation_quick_create} onClick={onLaunch}><ExternalLink />{launching ? "Waiting for AWS deployment…" : "Launch in AWS"}</button><a className="secondary-action" href={api.cloudFormationUrl(connection.id)} download><Download /> Download template</a></div>{!connection.setup_capabilities.cloudformation_quick_create && <small className="launch-unavailable">One-click launch requires the Denali onboarding bucket and runtime principal configuration. Manual template download remains available.</small>}{connection.configuration.onboarding && <small className="launch-record">Last launch prepared {formatTime(connection.configuration.onboarding.published_at)} · template {connection.configuration.onboarding.template_sha256.slice(0, 12)}</small>}</div></div>
+      <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Discover Regions and validate every plane</strong><small>Role assumption and account binding run first. Enabled Regions are observed next; each applicable regional plane then succeeds or fails independently.</small>{connection.lifecycle_state === "active" && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating across AWS…" : validation ? "Validate again" : "Validate connection"}</button>}{validating && <small className="validation-progress-note">This continues in the background. Large accounts can take a few minutes.</small>}</div></div>
+    </div>
+    <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed account {validation.account_id_observed ?? "not established"}</small></div>{regionDiscovery && <div className={`region-discovery ${regionDiscovery.state}`}><span>{regionDiscovery.state === "passed" ? <CircleCheck /> : regionDiscovery.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{coverageMode === "automatic" ? "Automatic enabled-region coverage" : "Selected-region coverage"}</strong><p>{regionDiscovery.detail}</p>{regionDiscovery.discovered_regions && regionDiscovery.discovered_regions.length > 0 && <small>{regionDiscovery.discovered_regions.join(", ")}</small>}{regionDiscovery.excluded_enabled_regions && regionDiscovery.excluded_enabled_regions.length > 0 && <small className="excluded-regions">Outside declared scope: {regionDiscovery.excluded_enabled_regions.join(", ")}</small>}</div></div>}<div className="validation-plane-rollup">{planeSummaries.map((summary) => <div className={summary.failed || summary.unknown ? "attention" : "complete"} key={summary.label}><span>{summary.failed || summary.unknown ? <CircleAlert /> : <CircleCheck />}</span><div><strong>{summary.label}</strong><small>{summary.total} Region checks</small></div><div className="rollup-counts"><b className="passed">{summary.passed} passed</b>{summary.notApplicable > 0 && <b>{summary.notApplicable} not applicable</b>}{summary.failed > 0 && <b className="failed">{summary.failed} failed</b>}{summary.unknown > 0 && <b className="failed">{summary.unknown} unknown</b>}</div></div>)}</div><details className="plane-validation-results"><summary>View all {planeResults.length} raw plane/Region results</summary><div className="validation-grid">{planeResults.map((result) => <div key={`${result.scope}:${result.plane}:${result.region}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.region} · {result.state === "not_applicable" ? "Not applicable" : titleCase(result.plane)}</small><p>{result.detail}</p></div></div>)}</div></details></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>No coverage conclusion is available until the stack is deployed and validation runs.</small></span></div>}</div>
+    <details className="connection-permissions"><summary>Review {permissions.length} declared permissions</summary><div>{permissions.map((permission) => <code key={permission}>{permission}</code>)}</div><p>The downloaded role also includes bounded read-only permissions for future explicit stack scopes. Those custom stack planes are not configured or claimed here.</p></details>
+    <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes only connection configuration and validation history; collected evidence remains.</span></div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
+  </section>;
 }
 
 function Sources({ coverage }: { coverage: Coverage[] }) {

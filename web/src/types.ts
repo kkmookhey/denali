@@ -80,6 +80,100 @@ export type Coverage = {
   collected_at: string;
 };
 
+export type ConnectionValidationResult = {
+  scope: string;
+  plane: string;
+  label: string;
+  region: string;
+  state: "passed" | "failed" | "unknown" | "not_applicable";
+  detail: string;
+  coverage_mode?: "automatic" | "selected";
+  observed_at?: string;
+  discovered_regions?: string[];
+  not_enabled_regions?: string[];
+  excluded_enabled_regions?: string[];
+};
+
+export type ConnectionValidation = {
+  id?: string;
+  started_at: string;
+  completed_at: string;
+  health_state: "healthy" | "partial" | "unhealthy";
+  credential_state: "passed" | "failed";
+  account_id_observed: string | null;
+  results: ConnectionValidationResult[];
+  summary: string;
+};
+
+export type ConnectionCoveragePlan = {
+  scope: string;
+  plane: string;
+  label: string;
+  region: string;
+  permissions: string[];
+  validation_state: "not_validated";
+};
+
+export type Connection = {
+  id: string;
+  provider: "aws";
+  display_name: string;
+  lifecycle_state: "active" | "disabled";
+  health_state: "unknown" | "healthy" | "partial" | "unhealthy" | "disabled";
+  validation_state?: "idle" | "running";
+  setup_capabilities: {
+    cloudformation_quick_create: boolean;
+  };
+  credential_reference: {
+    type: "aws_assume_role";
+    role_arn: string;
+  };
+  declared_scopes: string[];
+  coverage_plan: ConnectionCoveragePlan[];
+  configuration: {
+    account_id: string;
+    partition: "aws" | "aws-us-gov" | "aws-cn";
+    deployment_region?: string;
+    coverage_mode?: "automatic" | "selected";
+    regions: string[];
+    role_name: string;
+    stack_scopes: string[];
+    onboarding?: {
+      method: "cloudformation_quick_create";
+      template_version: string;
+      template_sha256: string;
+      principal_arn: string;
+      published_at: string;
+      url_expires_at: string;
+    };
+  };
+  created_at?: string;
+  updated_at?: string;
+  last_validated_at?: string | null;
+  last_validation: ConnectionValidation | null;
+};
+
+export type AwsCloudFormationLaunch = {
+  launch_url: string;
+  stack_name: string;
+  stack_region: string;
+  template_version: string;
+  template_sha256: string;
+  expires_at: string;
+  validation_status: "started" | "already_running";
+};
+
+export type AwsConnectionCreate = {
+  provider: "aws";
+  display_name: string;
+  account_id: string;
+  partition: "aws" | "aws-us-gov" | "aws-cn";
+  deployment_region: string;
+  coverage_mode: "automatic" | "selected";
+  regions: string[];
+  declared_scopes: string[];
+};
+
 export type FindingSeverity =
   | "unknown"
   | "informational"

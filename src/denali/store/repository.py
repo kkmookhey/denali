@@ -56,6 +56,16 @@ END
 """
 
 
+def _connection_response(row: dict[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    role_arn = result.pop("role_arn")
+    result["credential_reference"] = {
+        "type": result.pop("credential_type"),
+        "role_arn": role_arn,
+    }
+    return result
+
+
 class PostgresInventoryRepository:
     def __init__(self, dsn: str):
         self._dsn = dsn
@@ -1727,6 +1737,249 @@ class PostgresInventoryRepository:
                 (tenant_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def create_connection(
+        self,
+        tenant_id: str,
+        *,
+        connection_id: str,
+        provider: str,
+        display_name: str,
+        credential_type: str,
+        credential_reference: dict[str, Any],
+        declared_scopes: list[str],
+        coverage_plan: list[dict[str, Any]],
+        configuration: dict[str, Any],
+    ) -> dict[str, Any]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO provider_connection
+                      (id, tenant_id, provider, display_name, credential_type,
+                       credential_reference, declared_scopes, coverage_plan, configuration)
+                    VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s::jsonb, %s::jsonb,
+                            %s::jsonb, %s::jsonb)
+                    """,
+                    (
+                        connection_id,
+                        tenant_id,
+                        provider,
+                        display_name,
+                        credential_type,
+                        json.dumps(credential_reference),
+                        json.dumps(declared_scopes),
+                        json.dumps(coverage_plan),
+                        json.dumps(configuration),
+                    ),
+                )
+            except psycopg.errors.UniqueViolation as error:
+                raise ValueError("connection display name already exists") from error
+        created = self.get_connection(tenant_id, connection_id)
+        if created is None:
+            raise RuntimeError("created connection was not found")
+        return created
+
+    def list_connections(self, tenant_id: str) -> list[dict[str, Any]]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT c.id, c.provider, c.display_name, c.lifecycle_state, c.health_state,
+                       c.credential_type,
+                       c.credential_reference->>'role_arn' AS role_arn,
+                       c.declared_scopes, c.coverage_plan, c.configuration,
+                       c.created_at, c.updated_at, c.last_validated_at,
+                       latest.validation AS last_validation
+                FROM provider_connection c
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_build_object(
+                        'id', v.id,
+                        'started_at', v.started_at,
+                        'completed_at', v.completed_at,
+                        'health_state', v.health_state,
+                        'credential_state', v.credential_state,
+                        'account_id_observed', v.account_id_observed,
+                        'results', v.results,
+                        'summary', v.summary
+                    ) AS validation
+                    FROM connection_validation v
+                    WHERE v.tenant_id = c.tenant_id AND v.connection_id = c.id
+                    ORDER BY v.completed_at DESC
+                    LIMIT 1
+                ) latest ON true
+                WHERE c.tenant_id = %s::uuid
+                ORDER BY c.lifecycle_state, c.display_name, c.id
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [_connection_response(row) for row in rows]
+
+    def get_connection(self, tenant_id: str, connection_id: str) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT c.id, c.provider, c.display_name, c.lifecycle_state, c.health_state,
+                       c.credential_type,
+                       c.credential_reference->>'role_arn' AS role_arn,
+                       c.declared_scopes, c.coverage_plan, c.configuration,
+                       c.created_at, c.updated_at, c.last_validated_at,
+                       latest.validation AS last_validation
+                FROM provider_connection c
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_build_object(
+                        'id', v.id,
+                        'started_at', v.started_at,
+                        'completed_at', v.completed_at,
+                        'health_state', v.health_state,
+                        'credential_state', v.credential_state,
+                        'account_id_observed', v.account_id_observed,
+                        'results', v.results,
+                        'summary', v.summary
+                    ) AS validation
+                    FROM connection_validation v
+                    WHERE v.tenant_id = c.tenant_id AND v.connection_id = c.id
+                    ORDER BY v.completed_at DESC
+                    LIMIT 1
+                ) latest ON true
+                WHERE c.tenant_id = %s::uuid AND c.id = %s::uuid
+                """,
+                (tenant_id, connection_id),
+            ).fetchone()
+        return None if row is None else _connection_response(row)
+
+    def get_connection_validation_target(
+        self, tenant_id: str, connection_id: str
+    ) -> dict[str, Any] | None:
+        """Return internal validation material; callers must never serialize this row."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT id, provider, display_name, lifecycle_state, credential_type,
+                       credential_reference, declared_scopes, coverage_plan, configuration
+                FROM provider_connection
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                """,
+                (tenant_id, connection_id),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def record_connection_validation(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        validation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            with connection.transaction():
+                exists = connection.execute(
+                    """
+                    SELECT 1 FROM provider_connection
+                    WHERE tenant_id = %s::uuid AND id = %s::uuid
+                    FOR UPDATE
+                    """,
+                    (tenant_id, connection_id),
+                ).fetchone()
+                if exists is None:
+                    return None
+                connection.execute(
+                    """
+                    INSERT INTO connection_validation
+                      (tenant_id, connection_id, started_at, completed_at, health_state,
+                       credential_state, account_id_observed, results, summary)
+                    VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    """,
+                    (
+                        tenant_id,
+                        connection_id,
+                        validation["started_at"],
+                        validation["completed_at"],
+                        validation["health_state"],
+                        validation["credential_state"],
+                        validation.get("account_id_observed"),
+                        json.dumps(validation["results"]),
+                        validation["summary"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE provider_connection
+                    SET health_state = %s, last_validated_at = %s, updated_at = %s
+                    WHERE tenant_id = %s::uuid AND id = %s::uuid
+                    """,
+                    (
+                        validation["health_state"],
+                        validation["completed_at"],
+                        validation["completed_at"],
+                        tenant_id,
+                        connection_id,
+                    ),
+                )
+        return self.get_connection(tenant_id, connection_id)
+
+    def record_connection_launch(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        launch: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Record launch intent without retaining the S3 URL, object key, or external ID."""
+
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET configuration = jsonb_set(
+                        configuration,
+                        '{onboarding}',
+                        %s::jsonb,
+                        true
+                    ),
+                    updated_at = now()
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                RETURNING id
+                """,
+                (json.dumps(launch), tenant_id, connection_id),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def disable_connection(self, tenant_id: str, connection_id: str) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET lifecycle_state = 'disabled', health_state = 'disabled', updated_at = now()
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                RETURNING id
+                """,
+                (tenant_id, connection_id),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def delete_connection(self, tenant_id: str, connection_id: str) -> str:
+        """Delete only disabled configuration; collected evidence remains untouched."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT lifecycle_state FROM provider_connection
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                FOR UPDATE
+                """,
+                (tenant_id, connection_id),
+            ).fetchone()
+            if row is None:
+                return "not_found"
+            if row["lifecycle_state"] != "disabled":
+                return "active"
+            connection.execute(
+                """
+                DELETE FROM provider_connection
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                """,
+                (tenant_id, connection_id),
+            )
+        return "deleted"
 
     def list_assets(
         self,

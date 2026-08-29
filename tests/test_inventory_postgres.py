@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from denali.connections import AWS_SCOPE_BEDROCK_AGENTS, aws_coverage_plan
 from denali.connectors.code_to_cloud import CodeToCloudConnector, DeploymentTarget
 from denali.connectors.demo import demo_batch, demo_findings_batch
 from denali.connectors.repository_posture import RepositoryPostureConnector
@@ -237,6 +238,106 @@ def repository():
     migrate(DSN)
     tenant = str(uuid.uuid4())
     return tenant, PostgresInventoryRepository(DSN)
+
+
+def test_connection_lifecycle_retains_collected_evidence(repository) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    connection_id = str(uuid.uuid4())
+    role_arn = "arn:aws:iam::123456789012:role/DenaliSecurityAuditRole"
+    plan = aws_coverage_plan([AWS_SCOPE_BEDROCK_AGENTS], ["us-east-1"])
+
+    created = repo.create_connection(
+        tenant,
+        connection_id=connection_id,
+        provider="aws",
+        display_name="Fixture AWS",
+        credential_type="aws_assume_role",
+        credential_reference={"role_arn": role_arn, "external_id": "denali-private-fixture"},
+        declared_scopes=[AWS_SCOPE_BEDROCK_AGENTS],
+        coverage_plan=plan,
+        configuration={
+            "account_id": "123456789012",
+            "partition": "aws",
+            "regions": ["us-east-1"],
+            "role_name": "DenaliSecurityAuditRole",
+            "stack_scopes": [],
+        },
+    )
+
+    assert created["health_state"] == "unknown"
+    assert created["credential_reference"] == {
+        "type": "aws_assume_role",
+        "role_arn": role_arn,
+    }
+    assert "external_id" not in str(created)
+    target = repo.get_connection_validation_target(tenant, connection_id)
+    assert target is not None
+    assert target["credential_reference"]["external_id"] == "denali-private-fixture"
+
+    launched = repo.record_connection_launch(
+        tenant,
+        connection_id,
+        {
+            "method": "cloudformation_quick_create",
+            "template_version": "denali-aws-readonly-role-v1",
+            "template_sha256": "a" * 64,
+            "principal_arn": "arn:aws:iam::999999999999:role/DenaliRuntime",
+            "published_at": now.isoformat(),
+            "url_expires_at": now.isoformat(),
+        },
+    )
+    assert launched is not None
+    assert launched["configuration"]["onboarding"]["template_sha256"] == "a" * 64
+    assert "external_id" not in str(launched)
+
+    validated = repo.record_connection_validation(
+        tenant,
+        connection_id,
+        {
+            "started_at": now,
+            "completed_at": now,
+            "health_state": "partial",
+            "credential_state": "passed",
+            "account_id_observed": "123456789012",
+            "results": [
+                {
+                    "scope": AWS_SCOPE_BEDROCK_AGENTS,
+                    "plane": "bedrock_agents",
+                    "label": "Bedrock Agents Classic inventory",
+                    "region": "us-east-1",
+                    "state": "failed",
+                    "detail": "Validation call failed (AccessDeniedException).",
+                }
+            ],
+            "summary": "Credentials validated; 1 declared collection plane(s) failed.",
+        },
+    )
+    assert validated is not None
+    assert validated["health_state"] == "partial"
+    assert validated["last_validation"]["results"][0]["state"] == "failed"
+
+    observed = assertion("connection-evidence-agent", now)
+    repo.ingest(
+        tenant,
+        InventoryBatch(
+            connector_id="fixture",
+            connection_id=connection_id,
+            run_id="connection-evidence-run",
+            scope_key="fixture-scope",
+            collected_at=now,
+            coverage=(Coverage("agents", CoverageState.COMPLETE, "fixture-scope"),),
+            assets=(observed,),
+        ),
+    )
+
+    assert repo.delete_connection(tenant, connection_id) == "active"
+    disabled = repo.disable_connection(tenant, connection_id)
+    assert disabled is not None
+    assert disabled["health_state"] == "disabled"
+    assert repo.delete_connection(tenant, connection_id) == "deleted"
+    assert repo.get_connection(tenant, connection_id) is None
+    assert repo.summary(tenant)["total"] == 1
 
 
 def test_activity_can_be_filtered_by_correlated_asset(repository) -> None:

@@ -1,6 +1,9 @@
 import type {
   Asset,
   AssetDetail,
+  AwsConnectionCreate,
+  AwsCloudFormationLaunch,
+  Connection,
   Coverage,
   CodeToCloudDeployment,
   Finding,
@@ -31,13 +34,44 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
   if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `Request failed (${response.status})`);
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const payload = await response.json() as { detail?: unknown };
+      if (typeof payload.detail === "string") throw new Error(payload.detail);
+    }
+    throw new Error(`Request failed (${response.status})`);
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
 export const api = {
+  connections: () => request<{ items: Connection[] }>("/v1/connections"),
+  connection: (id: string) => request<Connection>(`/v1/connections/${id}`),
+  createConnection: (connection: AwsConnectionCreate) =>
+    request<Connection>("/v1/connections", {
+      method: "POST",
+      body: JSON.stringify(connection),
+    }),
+  validateConnection: (id: string) =>
+    request<{ status: "started" | "already_running"; connection_id: string }>(
+      `/v1/connections/${id}/validate`,
+      { method: "POST" },
+    ),
+  disableConnection: (id: string) =>
+    request<Connection>(`/v1/connections/${id}/disable`, { method: "POST" }),
+  deleteConnection: (id: string, confirmation: string) =>
+    request<void>(
+      `/v1/connections/${id}?confirm=${encodeURIComponent(confirmation)}`,
+      { method: "DELETE" },
+    ),
+  cloudFormationUrl: (id: string) =>
+    `${API_BASE}/v1/connections/${id}/aws/cloudformation.yaml`,
+  launchCloudFormation: (id: string) =>
+    request<AwsCloudFormationLaunch>(
+      `/v1/connections/${id}/aws/cloudformation/launch`,
+      { method: "POST" },
+    ),
   summary: () => request<Summary>("/v1/inventory/summary"),
   assets: () => request<{ items: Asset[] }>("/v1/inventory/assets?limit=500"),
   asset: (id: string) => request<AssetDetail>(`/v1/inventory/assets/${id}`),
