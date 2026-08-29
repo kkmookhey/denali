@@ -9,14 +9,24 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+from denali.detections import (
+    evaluate_repeated_failed_ai_signins,
+    evaluate_unreviewed_ai_consent,
+)
 from denali.domain import (
+    ActivityBatch,
     AssetAssertion,
     AssetRef,
     CorrelationAsset,
     CorrelationFinding,
     CorrelationRelationship,
+    CorrelationRuntimeDetection,
     CorrelationSnapshot,
     CoverageState,
+    DetectionActivity,
+    DetectionActivityEntity,
+    DetectionAsset,
+    DetectionSnapshot,
     FindingAssertion,
     FindingBatch,
     FindingSeverity,
@@ -24,8 +34,16 @@ from denali.domain import (
     IssueCandidate,
     IssueEvaluation,
     RelationshipAssertion,
+    RuntimeDetectionCandidate,
+    RuntimeDetectionEvaluation,
+    VulnerabilityAssertion,
+    VulnerabilityBatch,
 )
-from denali.issues import evaluate_agent_sensitive_write
+from denali.issues import (
+    aggregate_issue_evaluation_state,
+    evaluate_agent_sensitive_write,
+    evaluate_unreviewed_ai_consent_then_use,
+)
 
 _ASSERTION_RANK_SQL = """
 CASE aa.assertion_type
@@ -102,6 +120,7 @@ class PostgresInventoryRepository:
                     )
 
                 self._refresh_asset_lifecycle(connection, tenant_id)
+                self._refresh_vulnerability_asset_links(connection, tenant_id)
 
         return {
             "assets": len(batch.assets),
@@ -177,6 +196,744 @@ class PostgresInventoryRepository:
                     resolved_missing = result.rowcount
 
         return {"findings": persisted_findings, "resolved_missing": resolved_missing}
+
+    def ingest_vulnerabilities(self, tenant_id: str, batch: VulnerabilityBatch) -> dict[str, int]:
+        """Persist scanner observations without manufacturing referenced inventory."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            with connection.transaction():
+                self._insert_run(connection, tenant_id, batch)
+                if batch.scan_subject is not None:
+                    self._upsert_vulnerability_scan(connection, tenant_id, batch)
+                canonical_ids: set[str] = set()
+                for observation in batch.vulnerabilities:
+                    vulnerability_id = self._upsert_vulnerability(
+                        connection, tenant_id, batch, observation
+                    )
+                    canonical_ids.add(vulnerability_id)
+                    self._upsert_vulnerability_observation(
+                        connection,
+                        tenant_id,
+                        vulnerability_id,
+                        batch,
+                        observation,
+                    )
+
+                resolved_missing = 0
+                if batch.may_resolve_missing:
+                    result = connection.execute(
+                        """
+                        UPDATE vulnerability_observation
+                        SET withdrawn_at = %s
+                        WHERE tenant_id = %s::uuid
+                          AND connector_id = %s
+                          AND connection_id = %s
+                          AND scope_key = %s
+                          AND last_observed_run_id <> %s
+                          AND withdrawn_at IS NULL
+                        """,
+                        (
+                            batch.collected_at,
+                            tenant_id,
+                            batch.connector_id,
+                            batch.connection_id,
+                            batch.scope_key,
+                            batch.run_id,
+                        ),
+                    )
+                    resolved_missing = result.rowcount
+
+                self._refresh_vulnerability_asset_links(connection, tenant_id)
+                self._refresh_vulnerability_states(connection, tenant_id, batch.collected_at)
+
+        return {
+            "observations": len(batch.vulnerabilities),
+            "vulnerabilities": len(canonical_ids),
+            "resolved_missing": resolved_missing,
+        }
+
+    def ingest_activity(self, tenant_id: str, batch: ActivityBatch) -> dict[str, int]:
+        """Append immutable activity observations and link only existing inventory."""
+
+        inserted = 0
+        linked_entities = 0
+        unresolved_entities = 0
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            with connection.transaction():
+                self._insert_run(connection, tenant_id, batch)
+                for activity in batch.activities:
+                    row = connection.execute(
+                        """
+                        INSERT INTO activity_event
+                          (tenant_id, connector_id, connection_id, run_id, scope_key,
+                           source_uid, category, activity_name, title, outcome, provider,
+                           account_uid, region, occurred_at, source_observed_at,
+                           session_uid, trace_uid, evidence, attributes)
+                        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                        ON CONFLICT (tenant_id, connector_id, connection_id, source_uid)
+                        DO NOTHING
+                        RETURNING id
+                        """,
+                        (
+                            tenant_id,
+                            batch.connector_id,
+                            batch.connection_id,
+                            batch.run_id,
+                            batch.scope_key,
+                            activity.source_uid,
+                            activity.category.value,
+                            activity.activity_name,
+                            activity.title,
+                            activity.outcome.value,
+                            activity.provider,
+                            activity.account_uid,
+                            activity.region,
+                            activity.occurred_at,
+                            activity.observed_at,
+                            activity.session_uid,
+                            activity.trace_uid,
+                            json.dumps(_evidence_json(activity.evidence)),
+                            json.dumps(dict(activity.attributes)),
+                        ),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    inserted += 1
+                    activity_id = str(row["id"])
+                    for position, entity in enumerate(activity.entities):
+                        entity_row = connection.execute(
+                            """
+                            INSERT INTO activity_entity
+                              (tenant_id, activity_id, position, role, external_uid,
+                               display_name, asset_kind, asset_natural_key, asset_id,
+                               correlation, confidence, attributes)
+                            VALUES (
+                              %s::uuid, %s::uuid, %s, %s, %s, %s, %s, %s,
+                              (SELECT id FROM asset
+                               WHERE tenant_id = %s::uuid AND kind = %s
+                                 AND natural_key = %s),
+                              %s, %s, %s::jsonb
+                            )
+                            RETURNING asset_id
+                            """,
+                            (
+                                tenant_id,
+                                activity_id,
+                                position,
+                                entity.role.value,
+                                entity.external_uid,
+                                entity.display_name,
+                                entity.asset.kind.value if entity.asset else None,
+                                entity.asset.natural_key if entity.asset else None,
+                                tenant_id,
+                                entity.asset.kind.value if entity.asset else None,
+                                entity.asset.natural_key if entity.asset else None,
+                                entity.correlation.value,
+                                entity.confidence,
+                                json.dumps(dict(entity.attributes)),
+                            ),
+                        ).fetchone()
+                        if entity_row["asset_id"] is None:
+                            unresolved_entities += 1
+                        else:
+                            linked_entities += 1
+        return {
+            "activities": inserted,
+            "duplicates": len(batch.activities) - inserted,
+            "linked_entities": linked_entities,
+            "unresolved_entities": unresolved_entities,
+        }
+
+    def list_activity(
+        self,
+        tenant_id: str,
+        *,
+        category: str | None = None,
+        outcome: str | None = None,
+        asset_id: str | None = None,
+        include_fixtures: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT event.*,
+                       actor.external_uid AS actor_uid,
+                       actor.display_name AS actor_name,
+                       actor.asset_id AS actor_asset_id,
+                       (SELECT count(*) FROM activity_entity entity
+                        WHERE entity.tenant_id = event.tenant_id
+                          AND entity.activity_id = event.id) AS entity_count,
+                       (SELECT count(*) FROM activity_entity entity
+                        WHERE entity.tenant_id = event.tenant_id
+                          AND entity.activity_id = event.id
+                          AND entity.asset_id IS NOT NULL) AS correlated_entity_count
+                FROM activity_event event
+                LEFT JOIN LATERAL (
+                    SELECT entity.external_uid, entity.display_name, entity.asset_id
+                    FROM activity_entity entity
+                    WHERE entity.tenant_id = event.tenant_id
+                      AND entity.activity_id = event.id AND entity.role = 'actor'
+                    ORDER BY entity.position LIMIT 1
+                ) actor ON true
+                WHERE event.tenant_id = %s::uuid
+                  AND (%s::boolean OR event.attributes->>'fixture' IS DISTINCT FROM 'true')
+                  AND (%s::text IS NULL OR event.category = %s::text)
+                  AND (%s::text IS NULL OR event.outcome = %s::text)
+                  AND (
+                    %s::uuid IS NULL OR EXISTS (
+                      SELECT 1
+                      FROM activity_entity related
+                      WHERE related.tenant_id = event.tenant_id
+                        AND related.activity_id = event.id
+                        AND related.asset_id = %s::uuid
+                    )
+                  )
+                ORDER BY event.occurred_at DESC, event.id
+                LIMIT %s OFFSET %s
+                """,
+                (
+                    tenant_id,
+                    include_fixtures,
+                    category,
+                    category,
+                    outcome,
+                    outcome,
+                    asset_id,
+                    asset_id,
+                    limit,
+                    offset,
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_activity(self, tenant_id: str, activity_id: str) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            event = connection.execute(
+                "SELECT * FROM activity_event WHERE tenant_id = %s::uuid AND id = %s::uuid",
+                (tenant_id, activity_id),
+            ).fetchone()
+            if event is None:
+                return None
+            entities = connection.execute(
+                """
+                SELECT entity.*, asset.lifecycle_state, asset.governance_status,
+                       view.display_name AS asset_display_name
+                FROM activity_entity entity
+                LEFT JOIN asset ON asset.tenant_id = entity.tenant_id
+                               AND asset.id = entity.asset_id
+                LEFT JOIN LATERAL (
+                    SELECT assertion.display_name
+                    FROM asset_assertion assertion
+                    WHERE assertion.tenant_id = entity.tenant_id
+                      AND assertion.asset_id = entity.asset_id
+                      AND assertion.withdrawn_at IS NULL
+                    ORDER BY assertion.confidence DESC, assertion.last_seen_at DESC
+                    LIMIT 1
+                ) view ON true
+                WHERE entity.tenant_id = %s::uuid AND entity.activity_id = %s::uuid
+                ORDER BY entity.position
+                """,
+                (tenant_id, activity_id),
+            ).fetchall()
+        result = dict(event)
+        result["entities"] = [dict(row) for row in entities]
+        return result
+
+    def activity_summary(self, tenant_id: str, *, include_fixtures: bool = False) -> dict[str, Any]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            totals = connection.execute(
+                """
+                SELECT count(*) AS total,
+                       count(*) FILTER (
+                         WHERE occurred_at >= now() - interval '24 hours'
+                       ) AS last_24h,
+                       count(DISTINCT provider) AS providers,
+                       count(*) FILTER (WHERE outcome = 'failure') AS failures,
+                       (
+                         SELECT count(*)
+                         FROM activity_event fixture
+                         WHERE fixture.tenant_id = %s::uuid
+                           AND fixture.attributes->>'fixture' = 'true'
+                       ) AS fixture_total
+                FROM activity_event
+                WHERE tenant_id = %s::uuid
+                  AND (%s::boolean OR attributes->>'fixture' IS DISTINCT FROM 'true')
+                """,
+                (tenant_id, tenant_id, include_fixtures),
+            ).fetchone()
+            by_category = connection.execute(
+                """
+                SELECT category, count(*) AS count
+                FROM activity_event
+                WHERE tenant_id = %s::uuid
+                  AND (%s::boolean OR attributes->>'fixture' IS DISTINCT FROM 'true')
+                GROUP BY category ORDER BY category
+                """,
+                (tenant_id, include_fixtures),
+            ).fetchall()
+        return {
+            **dict(totals),
+            "by_category": {row["category"]: row["count"] for row in by_category},
+        }
+
+    def evaluate_runtime_detections(self, tenant_id: str) -> dict[str, Any]:
+        """Evaluate explainable detections without mutating their source observations."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            with connection.transaction():
+                snapshot = self._load_detection_snapshot(connection, tenant_id)
+                sign_in_coverage = self._detection_coverage_state(
+                    connection,
+                    tenant_id,
+                    ("entra_ai_signins", "entra_ai_application_inventory"),
+                )
+                consent_coverage = self._detection_coverage_state(
+                    connection,
+                    tenant_id,
+                    ("entra_ai_directory_audits", "entra_ai_application_inventory"),
+                )
+                evaluations = (
+                    evaluate_repeated_failed_ai_signins(
+                        snapshot, coverage_state=sign_in_coverage
+                    ),
+                    evaluate_unreviewed_ai_consent(
+                        snapshot, coverage_state=consent_coverage
+                    ),
+                )
+                for evaluation in evaluations:
+                    active_keys: set[str] = set()
+                    for candidate in evaluation.candidates:
+                        detection_id = self._upsert_runtime_detection(
+                            connection, tenant_id, candidate, evaluation
+                        )
+                        active_keys.add(candidate.correlation_key)
+                        self._replace_runtime_detection_evidence(
+                            connection, tenant_id, detection_id, candidate
+                        )
+
+                    # Event-backed detections remain open until an explicit analyst or
+                    # remediation disposition exists. A rolling window expiring is not
+                    # evidence that the observed behavior was remediated.
+                    connection.execute(
+                        """
+                        UPDATE runtime_detection
+                        SET last_evaluated_at = %s
+                        WHERE tenant_id = %s::uuid AND rule_uid = %s
+                          AND NOT (correlation_key = ANY(%s::text[]))
+                        """,
+                        (
+                            evaluation.evaluated_at,
+                            tenant_id,
+                            evaluation.rule_uid,
+                            list(active_keys),
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO runtime_detection_rule_evaluation
+                          (tenant_id, rule_uid, state, confirmed_detections,
+                           incomplete_candidates, detail, evaluated_at)
+                        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (tenant_id, rule_uid)
+                        DO UPDATE SET state = EXCLUDED.state,
+                                      confirmed_detections = EXCLUDED.confirmed_detections,
+                                      incomplete_candidates = EXCLUDED.incomplete_candidates,
+                                      detail = EXCLUDED.detail,
+                                      evaluated_at = EXCLUDED.evaluated_at
+                        """,
+                        (
+                            tenant_id,
+                            evaluation.rule_uid,
+                            evaluation.state.value,
+                            len(evaluation.candidates),
+                            evaluation.incomplete_candidates,
+                            evaluation.detail,
+                            evaluation.evaluated_at,
+                        ),
+                    )
+        return {
+            "confirmed_detections": sum(len(item.candidates) for item in evaluations),
+            "evaluations": [
+                {
+                    "rule_uid": item.rule_uid,
+                    "state": item.state.value,
+                    "confirmed_detections": len(item.candidates),
+                    "incomplete_candidates": item.incomplete_candidates,
+                    "detail": item.detail,
+                }
+                for item in evaluations
+            ],
+        }
+
+    def list_runtime_detections(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT detection.*,
+                       (SELECT count(*) FROM runtime_detection_activity link
+                        WHERE link.tenant_id = detection.tenant_id
+                          AND link.detection_id = detection.id) AS activity_count,
+                       (SELECT count(*) FROM runtime_detection_asset link
+                        WHERE link.tenant_id = detection.tenant_id
+                          AND link.detection_id = detection.id) AS asset_count
+                FROM runtime_detection detection
+                WHERE detection.tenant_id = %s::uuid
+                  AND (%s::text IS NULL OR detection.state = %s::text)
+                  AND (%s::text IS NULL OR detection.severity = %s::text)
+                ORDER BY
+                  CASE detection.state WHEN 'open' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,
+                  CASE detection.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                    WHEN 'medium' THEN 2 WHEN 'low' THEN 3
+                    WHEN 'informational' THEN 4 ELSE 5 END,
+                  detection.last_seen_at DESC, detection.correlation_key
+                LIMIT %s OFFSET %s
+                """,
+                (tenant_id, state, state, severity, severity, limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_runtime_detection(
+        self, tenant_id: str, detection_id: str
+    ) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            detection = connection.execute(
+                """
+                SELECT * FROM runtime_detection
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                """,
+                (tenant_id, detection_id),
+            ).fetchone()
+            if detection is None:
+                return None
+            activities = connection.execute(
+                """
+                SELECT event.*, link.role
+                FROM runtime_detection_activity link
+                JOIN activity_event event
+                  ON event.tenant_id = link.tenant_id AND event.id = link.activity_id
+                WHERE link.tenant_id = %s::uuid AND link.detection_id = %s::uuid
+                ORDER BY event.occurred_at, event.id
+                """,
+                (tenant_id, detection_id),
+            ).fetchall()
+            assets = connection.execute(
+                f"""
+                SELECT asset.id, asset.kind, asset.natural_key, asset.governance_status,
+                       asset.lifecycle_state, link.role, winner.display_name,
+                       winner.assertion_type, winner.confidence, winner.attributes,
+                       winner.evidence
+                FROM runtime_detection_asset link
+                JOIN asset ON asset.tenant_id = link.tenant_id AND asset.id = link.asset_id
+                LEFT JOIN LATERAL (
+                    SELECT aa.display_name, aa.assertion_type,
+                           aa.confidence, aa.attributes, aa.evidence
+                    FROM asset_assertion aa
+                    WHERE aa.tenant_id = asset.tenant_id
+                      AND aa.asset_id = asset.id
+                    ORDER BY (aa.withdrawn_at IS NULL) DESC,
+                             {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC
+                    LIMIT 1
+                ) winner ON true
+                WHERE link.tenant_id = %s::uuid AND link.detection_id = %s::uuid
+                ORDER BY link.role, asset.natural_key
+                """,
+                (tenant_id, detection_id),
+            ).fetchall()
+        result = dict(detection)
+        result["activities"] = [dict(row) for row in activities]
+        result["assets"] = [dict(row) for row in assets]
+        return result
+
+    def runtime_detection_summary(self, tenant_id: str) -> dict[str, Any]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            by_state = connection.execute(
+                """
+                SELECT state, count(*) AS count FROM runtime_detection
+                WHERE tenant_id = %s::uuid GROUP BY state ORDER BY state
+                """,
+                (tenant_id,),
+            ).fetchall()
+            open_by_severity = connection.execute(
+                """
+                SELECT severity, count(*) AS count FROM runtime_detection
+                WHERE tenant_id = %s::uuid AND state = 'open'
+                GROUP BY severity ORDER BY severity
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return {
+            "total": sum(row["count"] for row in by_state),
+            "by_state": {row["state"]: row["count"] for row in by_state},
+            "open_by_severity": {row["severity"]: row["count"] for row in open_by_severity},
+        }
+
+    def latest_runtime_detection_evaluations(self, tenant_id: str) -> list[dict[str, Any]]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT rule_uid, state, confirmed_detections, incomplete_candidates,
+                       detail, evaluated_at
+                FROM runtime_detection_rule_evaluation
+                WHERE tenant_id = %s::uuid ORDER BY rule_uid
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _upsert_vulnerability_scan(connection, tenant_id: str, batch: VulnerabilityBatch) -> None:
+        subject = batch.scan_subject
+        if subject is None:
+            return
+        connection.execute(
+            """
+            INSERT INTO vulnerability_scan
+              (tenant_id, connector_id, connection_id, run_id,
+               target_kind, target_natural_key, target_asset_id,
+               artifact_kind, artifact_locator, artifact_digest,
+               source_observed_at, evidence)
+            VALUES (
+              %s::uuid, %s, %s, %s, %s, %s,
+              (SELECT id FROM asset
+               WHERE tenant_id = %s::uuid AND kind = %s AND natural_key = %s),
+              %s, %s, %s, %s, %s::jsonb
+            )
+            ON CONFLICT (tenant_id, connector_id, connection_id, run_id)
+            DO UPDATE SET target_kind = EXCLUDED.target_kind,
+                          target_natural_key = EXCLUDED.target_natural_key,
+                          target_asset_id = EXCLUDED.target_asset_id,
+                          artifact_kind = EXCLUDED.artifact_kind,
+                          artifact_locator = EXCLUDED.artifact_locator,
+                          artifact_digest = EXCLUDED.artifact_digest,
+                          source_observed_at = EXCLUDED.source_observed_at,
+                          evidence = EXCLUDED.evidence
+            """,
+            (
+                tenant_id,
+                batch.connector_id,
+                batch.connection_id,
+                batch.run_id,
+                subject.target.kind.value,
+                subject.target.natural_key,
+                tenant_id,
+                subject.target.kind.value,
+                subject.target.natural_key,
+                subject.artifact_kind,
+                subject.artifact_locator,
+                subject.artifact_digest,
+                subject.evidence.observed_at,
+                json.dumps(_evidence_json(subject.evidence)),
+            ),
+        )
+
+    def list_vulnerabilities(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT v.*, winner.aliases, winner.title, winner.description,
+                       winner.severity, winner.cvss_score, winner.cvss_vector,
+                       winner.fix_state, winner.fixed_versions, winner.exploit_state,
+                       winner.match_method, winner.match_confidence,
+                       winner.database_version, winner.database_built_at,
+                       winner.connector_id AS scanner,
+                       winner.connection_id AS scanner_connection,
+                       component_view.display_name AS component_name,
+                       component_view.attributes AS component_attributes,
+                       target_view.display_name AS target_name,
+                       (v.component_asset_id IS NOT NULL) AS component_correlated,
+                       (v.target_asset_id IS NOT NULL) AS target_correlated,
+                       (SELECT count(*) FROM vulnerability_observation source_count
+                        WHERE source_count.tenant_id = v.tenant_id
+                          AND source_count.vulnerability_id = v.id
+                          AND source_count.withdrawn_at IS NULL) AS source_count
+                FROM vulnerability v
+                JOIN LATERAL (
+                    SELECT observation.*
+                    FROM vulnerability_observation observation
+                    WHERE observation.tenant_id = v.tenant_id
+                      AND observation.vulnerability_id = v.id
+                    ORDER BY observation.withdrawn_at NULLS FIRST,
+                             observation.match_confidence DESC,
+                             observation.last_seen_at DESC,
+                             observation.connector_id,
+                             observation.connection_id
+                    LIMIT 1
+                ) winner ON true
+                LEFT JOIN LATERAL (
+                    SELECT assertion.display_name, assertion.attributes
+                    FROM asset_assertion assertion
+                    WHERE assertion.tenant_id = v.tenant_id
+                      AND assertion.asset_id = v.component_asset_id
+                      AND assertion.withdrawn_at IS NULL
+                    ORDER BY assertion.confidence DESC, assertion.last_seen_at DESC
+                    LIMIT 1
+                ) component_view ON true
+                LEFT JOIN LATERAL (
+                    SELECT assertion.display_name
+                    FROM asset_assertion assertion
+                    WHERE assertion.tenant_id = v.tenant_id
+                      AND assertion.asset_id = v.target_asset_id
+                      AND assertion.withdrawn_at IS NULL
+                    ORDER BY assertion.confidence DESC, assertion.last_seen_at DESC
+                    LIMIT 1
+                ) target_view ON true
+                WHERE v.tenant_id = %s::uuid
+                  AND (%s::text IS NULL OR v.state = %s::text)
+                  AND (%s::text IS NULL OR winner.severity = %s::text)
+                ORDER BY
+                  CASE v.state WHEN 'open' THEN 0 WHEN 'unknown' THEN 1
+                               WHEN 'suppressed' THEN 2 ELSE 3 END,
+                  CASE winner.exploit_state WHEN 'known_exploited' THEN 0
+                       WHEN 'public_exploit' THEN 1 ELSE 2 END,
+                  CASE winner.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                       WHEN 'medium' THEN 2 WHEN 'low' THEN 3
+                       WHEN 'informational' THEN 4 ELSE 5 END,
+                  v.last_seen_at DESC, v.vulnerability_id
+                LIMIT %s OFFSET %s
+                """,
+                (tenant_id, state, state, severity, severity, limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_vulnerability(self, tenant_id: str, vulnerability_id: str) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            vulnerability = connection.execute(
+                """
+                SELECT v.*,
+                       component_view.display_name AS component_name,
+                       component_view.attributes AS component_attributes,
+                       target_view.display_name AS target_name
+                FROM vulnerability v
+                LEFT JOIN LATERAL (
+                    SELECT assertion.display_name, assertion.attributes
+                    FROM asset_assertion assertion
+                    WHERE assertion.tenant_id = v.tenant_id
+                      AND assertion.asset_id = v.component_asset_id
+                      AND assertion.withdrawn_at IS NULL
+                    ORDER BY assertion.confidence DESC, assertion.last_seen_at DESC
+                    LIMIT 1
+                ) component_view ON true
+                LEFT JOIN LATERAL (
+                    SELECT assertion.display_name
+                    FROM asset_assertion assertion
+                    WHERE assertion.tenant_id = v.tenant_id
+                      AND assertion.asset_id = v.target_asset_id
+                      AND assertion.withdrawn_at IS NULL
+                    ORDER BY assertion.confidence DESC, assertion.last_seen_at DESC
+                    LIMIT 1
+                ) target_view ON true
+                WHERE v.tenant_id = %s::uuid AND v.id = %s::uuid
+                """,
+                (tenant_id, vulnerability_id),
+            ).fetchone()
+            if vulnerability is None:
+                return None
+            observations = connection.execute(
+                """
+                SELECT connector_id, connection_id, source_uid, scope_key, aliases,
+                       title, description, severity, state, cvss_score, cvss_vector,
+                       fix_state, fixed_versions, exploit_state, match_method,
+                       match_confidence, database_version, database_built_at,
+                       source_observed_at, evidence, attributes, first_seen_at,
+                       last_seen_at, last_observed_run_id, withdrawn_at
+                FROM vulnerability_observation
+                WHERE tenant_id = %s::uuid AND vulnerability_id = %s::uuid
+                ORDER BY withdrawn_at NULLS FIRST, last_seen_at DESC,
+                         connector_id, connection_id
+                """,
+                (tenant_id, vulnerability_id),
+            ).fetchall()
+        result = dict(vulnerability)
+        result["component"] = {
+            "kind": result.pop("component_kind"),
+            "natural_key": result.pop("component_natural_key"),
+            "asset_id": result.pop("component_asset_id"),
+            "display_name": result.pop("component_name"),
+            "attributes": result.pop("component_attributes"),
+        }
+        result["target"] = {
+            "kind": result.pop("target_kind"),
+            "natural_key": result.pop("target_natural_key"),
+            "asset_id": result.pop("target_asset_id"),
+            "display_name": result.pop("target_name"),
+        }
+        result["observations"] = [dict(row) for row in observations]
+        return result
+
+    def vulnerability_summary(self, tenant_id: str) -> dict[str, Any]:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT v.state, winner.severity, winner.fix_state,
+                       winner.exploit_state, count(*) AS count
+                FROM vulnerability v
+                JOIN LATERAL (
+                    SELECT severity, fix_state, exploit_state
+                    FROM vulnerability_observation observation
+                    WHERE observation.tenant_id = v.tenant_id
+                      AND observation.vulnerability_id = v.id
+                    ORDER BY observation.withdrawn_at NULLS FIRST,
+                             observation.match_confidence DESC,
+                             observation.last_seen_at DESC
+                    LIMIT 1
+                ) winner ON true
+                WHERE v.tenant_id = %s::uuid
+                GROUP BY v.state, winner.severity, winner.fix_state,
+                         winner.exploit_state
+                """,
+                (tenant_id,),
+            ).fetchall()
+            open_vulnerability_ids = connection.execute(
+                """
+                SELECT count(DISTINCT vulnerability_id) AS count
+                FROM vulnerability
+                WHERE tenant_id = %s::uuid AND state = 'open'
+                """,
+                (tenant_id,),
+            ).fetchone()["count"]
+        by_state: dict[str, int] = {}
+        open_by_severity: dict[str, int] = {}
+        open_by_fix_state: dict[str, int] = {}
+        open_by_exploit_state: dict[str, int] = {}
+        for row in rows:
+            by_state[row["state"]] = by_state.get(row["state"], 0) + row["count"]
+            if row["state"] == "open":
+                open_by_severity[row["severity"]] = (
+                    open_by_severity.get(row["severity"], 0) + row["count"]
+                )
+                open_by_fix_state[row["fix_state"]] = (
+                    open_by_fix_state.get(row["fix_state"], 0) + row["count"]
+                )
+                open_by_exploit_state[row["exploit_state"]] = (
+                    open_by_exploit_state.get(row["exploit_state"], 0) + row["count"]
+                )
+        return {
+            "total": sum(by_state.values()),
+            "by_state": by_state,
+            "open_vulnerability_ids": open_vulnerability_ids,
+            "open_by_severity": open_by_severity,
+            "open_by_fix_state": open_by_fix_state,
+            "open_by_exploit_state": open_by_exploit_state,
+        }
 
     def list_findings(
         self,
@@ -289,92 +1046,137 @@ class PostgresInventoryRepository:
         with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
             with connection.transaction():
                 snapshot = self._load_correlation_snapshot(connection, tenant_id)
-                evaluation = evaluate_agent_sensitive_write(snapshot)
-                active_keys: set[str] = set()
-                for candidate in evaluation.candidates:
-                    issue_id = self._upsert_issue(connection, tenant_id, candidate, evaluation)
-                    active_keys.add(candidate.correlation_key)
-                    self._replace_issue_components(connection, tenant_id, issue_id, candidate)
-
-                existing = connection.execute(
-                    """
-                    SELECT id, correlation_key
-                    FROM issue
-                    WHERE tenant_id = %s::uuid AND rule_uid = %s AND state <> 'resolved'
-                    """,
-                    (tenant_id, evaluation.rule_uid),
-                ).fetchall()
-                missing = [row for row in existing if row["correlation_key"] not in active_keys]
-                for row in missing:
-                    contributor_open = connection.execute(
-                        """
-                        SELECT bool_and(f.state = 'open' AND f.evaluation_result = 'fail') AS open
-                        FROM issue_finding link
-                        JOIN finding f ON f.id = link.finding_id AND f.tenant_id = link.tenant_id
-                        WHERE link.tenant_id = %s::uuid AND link.issue_id = %s::uuid
-                        """,
-                        (tenant_id, row["id"]),
-                    ).fetchone()["open"]
-                    if contributor_open and evaluation.state is not CoverageState.COMPLETE:
-                        state = "unknown"
-                        reason = "correlation_incomplete"
-                    elif contributor_open:
-                        state = "resolved"
-                        reason = "correlation_no_longer_confirmed"
-                    else:
-                        state = "resolved"
-                        reason = "contributing_finding_inactive"
-                    connection.execute(
-                        """
-                        UPDATE issue
-                        SET state = %s, resolution_reason = %s,
-                            last_changed_at = CASE WHEN state <> %s
-                                THEN %s ELSE last_changed_at END,
-                            last_evaluated_at = %s
-                        WHERE tenant_id = %s::uuid AND id = %s::uuid
-                        """,
-                        (
-                            state,
-                            reason,
-                            state,
-                            evaluation.evaluated_at,
-                            evaluation.evaluated_at,
-                            tenant_id,
-                            row["id"],
+                detection_snapshot = self._load_detection_snapshot(connection, tenant_id)
+                runtime_detections = self._load_correlation_runtime_detections(
+                    connection, tenant_id
+                )
+                evaluations = (
+                    evaluate_agent_sensitive_write(snapshot),
+                    evaluate_unreviewed_ai_consent_then_use(
+                        runtime_detections,
+                        detection_snapshot.activities,
+                        snapshot.assets,
+                        coverage_state=self._cross_signal_issue_coverage_state(
+                            connection, tenant_id
                         ),
-                    )
-
-                connection.execute(
-                    """
-                    INSERT INTO issue_rule_evaluation
-                      (tenant_id, rule_uid, state, confirmed_issues, incomplete_candidates,
-                       ambiguous_resource_references, detail, evaluated_at)
-                    VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (tenant_id, rule_uid)
-                    DO UPDATE SET state = EXCLUDED.state,
-                                  confirmed_issues = EXCLUDED.confirmed_issues,
-                                  incomplete_candidates = EXCLUDED.incomplete_candidates,
-                                  ambiguous_resource_references =
-                                      EXCLUDED.ambiguous_resource_references,
-                                  detail = EXCLUDED.detail,
-                                  evaluated_at = EXCLUDED.evaluated_at
-                    """,
-                    (
-                        tenant_id,
-                        evaluation.rule_uid,
-                        evaluation.state.value,
-                        len(evaluation.candidates),
-                        evaluation.incomplete_candidates,
-                        evaluation.ambiguous_resource_references,
-                        evaluation.detail,
-                        evaluation.evaluated_at,
                     ),
                 )
+                for evaluation in evaluations:
+                    active_keys: set[str] = set()
+                    for candidate in evaluation.candidates:
+                        issue_id = self._upsert_issue(connection, tenant_id, candidate, evaluation)
+                        active_keys.add(candidate.correlation_key)
+                        self._replace_issue_components(connection, tenant_id, issue_id, candidate)
+
+                    existing = connection.execute(
+                        """
+                        SELECT id, correlation_key
+                        FROM issue
+                        WHERE tenant_id = %s::uuid AND rule_uid = %s AND state <> 'resolved'
+                        """,
+                        (tenant_id, evaluation.rule_uid),
+                    ).fetchall()
+                    missing = [
+                        row for row in existing if row["correlation_key"] not in active_keys
+                    ]
+                    for row in missing:
+                        contributors = connection.execute(
+                            """
+                            SELECT
+                              (SELECT bool_and(
+                                  f.state = 'open' AND f.evaluation_result = 'fail')
+                               FROM issue_finding link
+                               JOIN finding f
+                                 ON f.id = link.finding_id
+                                AND f.tenant_id = link.tenant_id
+                               WHERE link.tenant_id = %s::uuid
+                                 AND link.issue_id = %s::uuid) AS findings_open,
+                              (SELECT bool_and(d.state = 'open')
+                               FROM issue_detection link
+                               JOIN runtime_detection d
+                                 ON d.id = link.detection_id
+                                AND d.tenant_id = link.tenant_id
+                               WHERE link.tenant_id = %s::uuid
+                                 AND link.issue_id = %s::uuid) AS detections_open
+                            """,
+                            (tenant_id, row["id"], tenant_id, row["id"]),
+                        ).fetchone()
+                        current_contributor = bool(
+                            contributors["findings_open"]
+                            or contributors["detections_open"]
+                        )
+                        if (
+                            current_contributor
+                            and evaluation.state is not CoverageState.COMPLETE
+                        ):
+                            state = "unknown"
+                            reason = "correlation_incomplete"
+                        elif contributors["findings_open"] is False:
+                            state = "resolved"
+                            reason = "contributing_finding_inactive"
+                        elif contributors["detections_open"] is False:
+                            state = "resolved"
+                            reason = "contributing_detection_inactive"
+                        else:
+                            state = "resolved"
+                            reason = "correlation_no_longer_confirmed"
+                        connection.execute(
+                            """
+                            UPDATE issue
+                            SET state = %s, resolution_reason = %s,
+                                last_changed_at = CASE WHEN state <> %s
+                                    THEN %s ELSE last_changed_at END,
+                                last_evaluated_at = %s
+                            WHERE tenant_id = %s::uuid AND id = %s::uuid
+                            """,
+                            (
+                                state,
+                                reason,
+                                state,
+                                evaluation.evaluated_at,
+                                evaluation.evaluated_at,
+                                tenant_id,
+                                row["id"],
+                            ),
+                        )
+
+                    connection.execute(
+                        """
+                        INSERT INTO issue_rule_evaluation
+                          (tenant_id, rule_uid, state, confirmed_issues,
+                           incomplete_candidates, ambiguous_resource_references,
+                           detail, evaluated_at)
+                        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (tenant_id, rule_uid)
+                        DO UPDATE SET state = EXCLUDED.state,
+                                      confirmed_issues = EXCLUDED.confirmed_issues,
+                                      incomplete_candidates = EXCLUDED.incomplete_candidates,
+                                      ambiguous_resource_references =
+                                          EXCLUDED.ambiguous_resource_references,
+                                      detail = EXCLUDED.detail,
+                                      evaluated_at = EXCLUDED.evaluated_at
+                        """,
+                        (
+                            tenant_id,
+                            evaluation.rule_uid,
+                            evaluation.state.value,
+                            len(evaluation.candidates),
+                            evaluation.incomplete_candidates,
+                            evaluation.ambiguous_resource_references,
+                            evaluation.detail,
+                            evaluation.evaluated_at,
+                        ),
+                    )
+        aggregate_state = aggregate_issue_evaluation_state(evaluations)
         return {
-            "confirmed_issues": len(evaluation.candidates),
-            "evaluation_state": evaluation.state.value,
-            "incomplete_candidates": evaluation.incomplete_candidates,
-            "ambiguous_resource_references": evaluation.ambiguous_resource_references,
+            "confirmed_issues": sum(len(item.candidates) for item in evaluations),
+            "evaluation_state": aggregate_state.value,
+            "incomplete_candidates": sum(
+                item.incomplete_candidates for item in evaluations
+            ),
+            "ambiguous_resource_references": sum(
+                item.ambiguous_resource_references for item in evaluations
+            ),
         }
 
     def list_issues(
@@ -395,7 +1197,13 @@ class PostgresInventoryRepository:
                            AS finding_count,
                        (SELECT count(*) FROM issue_path_node n
                         WHERE n.tenant_id = i.tenant_id AND n.issue_id = i.id)
-                           AS asset_count
+                           AS asset_count,
+                       (SELECT count(*) FROM issue_detection d
+                        WHERE d.tenant_id = i.tenant_id AND d.issue_id = i.id)
+                           AS detection_count,
+                       (SELECT count(*) FROM issue_activity a
+                        WHERE a.tenant_id = i.tenant_id AND a.issue_id = i.id)
+                           AS activity_count
                 FROM issue i
                 WHERE i.tenant_id = %s::uuid
                   AND (%s::text IS NULL OR i.state = %s::text)
@@ -464,10 +1272,51 @@ class PostgresInventoryRepository:
                 """,
                 (tenant_id, issue_id),
             ).fetchall()
+            detections = connection.execute(
+                """
+                SELECT d.id, d.rule_uid, d.title, d.description, d.risk,
+                       d.investigation_guidance, d.severity, d.state, d.confidence,
+                       d.attributes, d.first_seen_at, d.last_seen_at, link.role
+                FROM issue_detection link
+                JOIN runtime_detection d
+                  ON d.id = link.detection_id AND d.tenant_id = link.tenant_id
+                WHERE link.tenant_id = %s::uuid AND link.issue_id = %s::uuid
+                ORDER BY link.role, d.last_seen_at, d.id
+                """,
+                (tenant_id, issue_id),
+            ).fetchall()
+            activities = connection.execute(
+                """
+                SELECT event.id, event.category, event.outcome, event.activity_name,
+                       event.title, event.provider, event.occurred_at, event.evidence,
+                       event.attributes, link.role, actors.actors
+                FROM issue_activity link
+                JOIN activity_event event
+                  ON event.id = link.activity_id AND event.tenant_id = link.tenant_id
+                LEFT JOIN LATERAL (
+                  SELECT array_agg(jsonb_build_object(
+                           'external_uid', entity.external_uid,
+                           'display_name', entity.display_name,
+                           'asset_id', entity.asset_id,
+                           'correlation', entity.correlation,
+                           'confidence', entity.confidence)
+                         ORDER BY entity.position) AS actors
+                  FROM activity_entity entity
+                  WHERE entity.tenant_id = event.tenant_id
+                    AND entity.activity_id = event.id
+                    AND entity.role = 'actor'
+                ) actors ON true
+                WHERE link.tenant_id = %s::uuid AND link.issue_id = %s::uuid
+                ORDER BY event.occurred_at, event.id
+                """,
+                (tenant_id, issue_id),
+            ).fetchall()
         result = dict(issue)
         result["findings"] = [dict(row) for row in findings]
         result["path_nodes"] = [dict(row) for row in nodes]
         result["path_edges"] = [dict(row) for row in edges]
+        result["detections"] = [dict(row) for row in detections]
+        result["activities"] = [dict(row) for row in activities]
         return result
 
     def issue_summary(self, tenant_id: str) -> dict[str, Any]:
@@ -501,6 +1350,379 @@ class PostgresInventoryRepository:
                        ambiguous_resource_references, detail, evaluated_at
                 FROM issue_rule_evaluation
                 WHERE tenant_id = %s::uuid ORDER BY rule_uid
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def deployment_targets(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Return active, independently asserted workloads eligible for IaC correlation."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT a.natural_key, winner.display_name,
+                       winner.attributes->>'service' AS service,
+                       winner.attributes->>'logical_id' AS logical_id,
+                       winner.evidence->>'locator' AS evidence_locator,
+                       winner.evidence->'payload' AS evidence_payload
+                FROM asset a
+                JOIN LATERAL (
+                    SELECT aa.display_name, aa.attributes, aa.evidence
+                    FROM asset_assertion aa
+                    WHERE aa.tenant_id = a.tenant_id AND aa.asset_id = a.id
+                      AND aa.withdrawn_at IS NULL
+                      AND aa.assertion_type IN ('observed', 'externally_verified')
+                    ORDER BY {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC,
+                             aa.connector_id, aa.connection_id
+                    LIMIT 1
+                ) winner ON true
+                WHERE a.tenant_id = %s::uuid AND a.kind = 'ai_workload'
+                  AND a.lifecycle_state = 'active'
+                  AND winner.attributes->>'service' IN ('lambda', 'ecs')
+                  AND COALESCE(winner.attributes->>'logical_id', '') <> ''
+                ORDER BY a.natural_key
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [
+            {
+                "natural_key": row["natural_key"],
+                "display_name": row["display_name"],
+                "service": row["service"],
+                "logical_id": row["logical_id"],
+                "evidence_locator": row["evidence_locator"],
+                "evidence_payload": dict(row["evidence_payload"] or {}),
+            }
+            for row in rows
+        ]
+
+    def code_to_cloud_deployments(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Return proven repository-to-workload links and their runtime context."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT deployment.id, deployment.assertion_type, deployment.confidence,
+                       deployment.attributes, deployment.evidence,
+                       workload.id AS workload_id, workload.natural_key AS workload_natural_key,
+                       workload_view.display_name AS workload_name,
+                       workload_view.attributes AS workload_attributes,
+                       repository.id AS repository_id,
+                       repository.natural_key AS repository_natural_key,
+                       repository_view.display_name AS repository_name,
+                       COALESCE(models.items, '[]'::jsonb) AS models,
+                       identity.item AS identity,
+                       COALESCE(code_findings.items, '[]'::jsonb) AS code_findings,
+                       vulnerability_coverage.item AS vulnerability_coverage,
+                       COALESCE(artifact_vulnerability_summary.total, 0)
+                           AS artifact_vulnerability_count,
+                       COALESCE(artifact_vulnerability_summary.vulnerability_ids, 0)
+                           AS artifact_vulnerability_id_count,
+                       COALESCE(artifact_vulnerabilities.items, '[]'::jsonb)
+                           AS artifact_vulnerabilities
+                FROM relationship_assertion deployment
+                JOIN asset workload ON workload.id = deployment.source_asset_id
+                  AND workload.tenant_id = deployment.tenant_id
+                JOIN asset repository ON repository.id = deployment.target_asset_id
+                  AND repository.tenant_id = deployment.tenant_id
+                JOIN LATERAL (
+                    SELECT aa.display_name, aa.attributes
+                    FROM asset_assertion aa
+                    WHERE aa.tenant_id = workload.tenant_id AND aa.asset_id = workload.id
+                      AND aa.withdrawn_at IS NULL
+                      AND aa.attributes ? 'service'
+                      AND aa.attributes ? 'logical_id'
+                    ORDER BY {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC LIMIT 1
+                ) workload_view ON true
+                JOIN LATERAL (
+                    SELECT aa.display_name
+                    FROM asset_assertion aa
+                    WHERE aa.tenant_id = repository.tenant_id AND aa.asset_id = repository.id
+                      AND aa.withdrawn_at IS NULL
+                    ORDER BY {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC LIMIT 1
+                ) repository_view ON true
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_agg(jsonb_build_object(
+                        'id', model.id, 'natural_key', model.natural_key,
+                        'display_name', model_view.display_name,
+                        'assertion_type', rel.assertion_type,
+                        'confidence', rel.confidence
+                    ) ORDER BY model_view.display_name) AS items
+                    FROM relationship_assertion rel
+                    JOIN asset model ON model.id = rel.target_asset_id
+                      AND model.tenant_id = rel.tenant_id
+                    JOIN LATERAL (
+                        SELECT aa.display_name FROM asset_assertion aa
+                        WHERE aa.tenant_id = model.tenant_id AND aa.asset_id = model.id
+                          AND aa.withdrawn_at IS NULL
+                        ORDER BY {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC LIMIT 1
+                    ) model_view ON true
+                    WHERE rel.tenant_id = deployment.tenant_id
+                      AND rel.source_asset_id = workload.id AND rel.kind = 'uses'
+                      AND rel.withdrawn_at IS NULL AND model.kind = 'ai_model'
+                ) models ON true
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_build_object(
+                        'id', principal.id, 'natural_key', principal.natural_key,
+                        'display_name', principal_view.display_name,
+                        'assertion_type', rel.assertion_type,
+                        'confidence', rel.confidence
+                    ) AS item
+                    FROM relationship_assertion rel
+                    JOIN asset principal ON principal.id = rel.target_asset_id
+                      AND principal.tenant_id = rel.tenant_id
+                    JOIN LATERAL (
+                        SELECT aa.display_name FROM asset_assertion aa
+                        WHERE aa.tenant_id = principal.tenant_id AND aa.asset_id = principal.id
+                          AND aa.withdrawn_at IS NULL
+                        ORDER BY {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC LIMIT 1
+                    ) principal_view ON true
+                    WHERE rel.tenant_id = deployment.tenant_id
+                      AND rel.source_asset_id = workload.id AND rel.kind = 'runs_as'
+                      AND rel.withdrawn_at IS NULL AND principal.kind = 'identity'
+                    ORDER BY rel.confidence DESC LIMIT 1
+                ) identity ON true
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_agg(jsonb_build_object(
+                        'id', finding.id, 'title', finding.title,
+                        'severity', finding.severity, 'rule_uid', finding.rule_uid,
+                        'source_path', finding.attributes->>'source_path',
+                        'source_line', finding.attributes->>'source_line',
+                        'applicability', CASE
+                            WHEN COALESCE(
+                                deployment.attributes->'reachable_source_paths', '[]'::jsonb
+                            ) ? (finding.attributes->>'source_path')
+                            THEN 'artifact_included'
+                            ELSE 'repository_only'
+                        END,
+                        'import_chain', deployment.attributes->'artifact_import_chains'
+                            ->(finding.attributes->>'source_path')
+                    ) ORDER BY
+                        CASE
+                            WHEN COALESCE(
+                                deployment.attributes->'reachable_source_paths', '[]'::jsonb
+                            ) ? (finding.attributes->>'source_path') THEN 0 ELSE 1
+                        END,
+                        finding.severity DESC, finding.title) AS items
+                    FROM finding
+                    WHERE finding.tenant_id = deployment.tenant_id
+                      AND finding.state = 'open' AND finding.evaluation_result = 'fail'
+                      AND finding.attributes->>'repository' = repository.natural_key
+                ) code_findings ON true
+                LEFT JOIN LATERAL (
+                    SELECT scan.run_id AS scan_run_id,
+                           CASE
+                             WHEN workload_view.attributes->'deployment_artifact'
+                                    IS NULL THEN 'not_evaluated'
+                             WHEN scan.artifact_kind =
+                                    workload_view.attributes->'deployment_artifact'->>'kind'
+                              AND scan.artifact_locator = CASE
+                                WHEN scan.artifact_kind = 'container_image'
+                                  THEN workload_view.attributes
+                                    ->'deployment_artifact'->>'image'
+                                WHEN scan.artifact_kind = 's3_object'
+                                  THEN concat(
+                                    's3://',
+                                    workload_view.attributes
+                                      ->'deployment_artifact'->>'bucket', '/',
+                                    workload_view.attributes
+                                      ->'deployment_artifact'->>'key'
+                                  )
+                                ELSE NULL
+                              END THEN 'matched'
+                             WHEN scan.artifact_kind =
+                                    workload_view.attributes->'deployment_artifact'->>'kind'
+                              AND scan.artifact_digest IS NOT NULL
+                              AND scan.artifact_digest =
+                                    workload_view.attributes
+                                      ->'deployment_artifact'->>'code_sha256'
+                               THEN 'matched'
+                             ELSE 'not_matched'
+                           END AS artifact_identity_status,
+                           jsonb_build_object(
+                        'state', coverage.state,
+                        'detail', coverage.detail,
+                        'connector_id', coverage.connector_id,
+                        'connection_id', coverage.connection_id,
+                        'run_id', coverage.run_id,
+                        'collected_at', coverage.collected_at,
+                        'artifact_kind', scan.artifact_kind,
+                        'artifact_locator', scan.artifact_locator,
+                        'artifact_digest', scan.artifact_digest,
+                        'artifact_identity_status', CASE
+                          WHEN workload_view.attributes->'deployment_artifact'
+                                 IS NULL THEN 'not_evaluated'
+                          WHEN scan.artifact_kind =
+                                 workload_view.attributes->'deployment_artifact'->>'kind'
+                           AND scan.artifact_locator = CASE
+                             WHEN scan.artifact_kind = 'container_image'
+                               THEN workload_view.attributes
+                                 ->'deployment_artifact'->>'image'
+                             WHEN scan.artifact_kind = 's3_object'
+                               THEN concat(
+                                 's3://',
+                                 workload_view.attributes
+                                   ->'deployment_artifact'->>'bucket', '/',
+                                 workload_view.attributes
+                                   ->'deployment_artifact'->>'key'
+                               )
+                             ELSE NULL
+                           END THEN 'matched'
+                          WHEN scan.artifact_kind =
+                                 workload_view.attributes->'deployment_artifact'->>'kind'
+                           AND scan.artifact_digest IS NOT NULL
+                           AND scan.artifact_digest =
+                                 workload_view.attributes
+                                   ->'deployment_artifact'->>'code_sha256'
+                            THEN 'matched'
+                          ELSE 'not_matched'
+                        END,
+                        'artifact_identity_method', CASE
+                          WHEN scan.artifact_kind =
+                                 workload_view.attributes->'deployment_artifact'->>'kind'
+                           AND scan.artifact_locator = CASE
+                             WHEN scan.artifact_kind = 'container_image'
+                               THEN workload_view.attributes
+                                 ->'deployment_artifact'->>'image'
+                             WHEN scan.artifact_kind = 's3_object'
+                               THEN concat(
+                                 's3://',
+                                 workload_view.attributes
+                                   ->'deployment_artifact'->>'bucket', '/',
+                                 workload_view.attributes
+                                   ->'deployment_artifact'->>'key'
+                               )
+                             ELSE NULL
+                           END THEN 'exact_locator'
+                          WHEN scan.artifact_kind =
+                                 workload_view.attributes->'deployment_artifact'->>'kind'
+                           AND scan.artifact_digest IS NOT NULL
+                           AND scan.artifact_digest =
+                                 workload_view.attributes
+                                   ->'deployment_artifact'->>'code_sha256'
+                            THEN 'exact_digest'
+                          ELSE NULL
+                        END
+                    ) AS item
+                    FROM vulnerability_scan scan
+                    JOIN collection_coverage coverage
+                      ON coverage.tenant_id = scan.tenant_id
+                     AND coverage.connector_id = scan.connector_id
+                     AND coverage.connection_id = scan.connection_id
+                     AND coverage.run_id = scan.run_id
+                     AND coverage.plane = 'vulnerabilities'
+                    WHERE scan.tenant_id = deployment.tenant_id
+                      AND scan.target_kind = workload.kind
+                      AND scan.target_natural_key = workload.natural_key
+                    ORDER BY coverage.collected_at DESC, coverage.connector_id,
+                             coverage.connection_id
+                    LIMIT 1
+                ) vulnerability_coverage ON true
+                LEFT JOIN LATERAL (
+                    SELECT count(DISTINCT vulnerability.id) AS total,
+                           count(DISTINCT vulnerability.vulnerability_id)
+                               AS vulnerability_ids
+                    FROM vulnerability
+                    JOIN vulnerability_observation observation
+                      ON observation.tenant_id = vulnerability.tenant_id
+                     AND observation.vulnerability_id = vulnerability.id
+                     AND observation.withdrawn_at IS NULL
+                     AND observation.last_observed_run_id =
+                           vulnerability_coverage.scan_run_id
+                    WHERE vulnerability.tenant_id = deployment.tenant_id
+                      AND vulnerability.target_asset_id = workload.id
+                      AND vulnerability.state = 'open'
+                      AND vulnerability_coverage.artifact_identity_status = 'matched'
+                ) artifact_vulnerability_summary ON true
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_agg(jsonb_build_object(
+                        'id', vulnerability.id,
+                        'vulnerability_id', vulnerability.vulnerability_id,
+                        'title', winner.title,
+                        'severity', winner.severity,
+                        'state', vulnerability.state,
+                        'cvss_score', winner.cvss_score,
+                        'fix_state', winner.fix_state,
+                        'fixed_versions', winner.fixed_versions,
+                        'exploit_state', winner.exploit_state,
+                        'match_method', winner.match_method,
+                        'match_confidence', winner.match_confidence,
+                        'scanner', winner.connector_id,
+                        'source_count', (
+                            SELECT count(*)
+                            FROM vulnerability_observation source_count
+                            WHERE source_count.tenant_id = vulnerability.tenant_id
+                              AND source_count.vulnerability_id = vulnerability.id
+                              AND source_count.withdrawn_at IS NULL
+                        ),
+                        'component_id', component.id,
+                        'component_name', component_view.display_name,
+                        'component_purl',
+                            component_view.attributes->'component'->>'purl'
+                    ) ORDER BY
+                        CASE winner.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                            WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+                        vulnerability.vulnerability_id,
+                        component_view.display_name) AS items
+                    FROM vulnerability
+                    JOIN LATERAL (
+                        SELECT observation.*
+                        FROM vulnerability_observation observation
+                        WHERE observation.tenant_id = vulnerability.tenant_id
+                          AND observation.vulnerability_id = vulnerability.id
+                          AND observation.withdrawn_at IS NULL
+                          AND observation.last_observed_run_id =
+                                vulnerability_coverage.scan_run_id
+                        ORDER BY observation.match_confidence DESC,
+                                 observation.last_seen_at DESC,
+                                 observation.connector_id,
+                                 observation.connection_id
+                        LIMIT 1
+                    ) winner ON true
+                    LEFT JOIN asset component
+                      ON component.id = vulnerability.component_asset_id
+                     AND component.tenant_id = vulnerability.tenant_id
+                    LEFT JOIN LATERAL (
+                        SELECT aa.display_name, aa.attributes
+                        FROM asset_assertion aa
+                        WHERE aa.tenant_id = component.tenant_id
+                          AND aa.asset_id = component.id
+                          AND aa.withdrawn_at IS NULL
+                        ORDER BY {_ASSERTION_RANK_SQL} DESC,
+                                 aa.last_seen_at DESC
+                        LIMIT 1
+                    ) component_view ON true
+                    WHERE vulnerability.tenant_id = deployment.tenant_id
+                      AND vulnerability.target_asset_id = workload.id
+                      AND vulnerability.state = 'open'
+                      AND vulnerability_coverage.artifact_identity_status = 'matched'
+                      AND vulnerability.id IN (
+                        SELECT candidate.id
+                        FROM vulnerability candidate
+                        JOIN vulnerability_observation candidate_observation
+                          ON candidate_observation.tenant_id = candidate.tenant_id
+                         AND candidate_observation.vulnerability_id = candidate.id
+                         AND candidate_observation.withdrawn_at IS NULL
+                         AND candidate_observation.last_observed_run_id =
+                               vulnerability_coverage.scan_run_id
+                        WHERE candidate.tenant_id = deployment.tenant_id
+                          AND candidate.target_asset_id = workload.id
+                          AND candidate.state = 'open'
+                        ORDER BY CASE candidate_observation.severity
+                            WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                            WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+                            candidate.vulnerability_id,
+                            candidate.component_natural_key
+                        LIMIT 25
+                      )
+                ) artifact_vulnerabilities ON true
+                WHERE deployment.tenant_id = %s::uuid
+                  AND deployment.kind = 'deployed_by' AND deployment.withdrawn_at IS NULL
+                  AND workload.kind = 'ai_workload' AND repository.kind = 'code_repository'
+                  AND workload.lifecycle_state = 'active'
+                  AND repository.lifecycle_state = 'active'
+                ORDER BY repository_view.display_name, workload_view.display_name
                 """,
                 (tenant_id,),
             ).fetchall()
@@ -651,10 +1873,320 @@ class PostgresInventoryRepository:
         return None if row is None else dict(row)
 
     @staticmethod
+    def _detection_coverage_state(
+        connection, tenant_id: str, planes: tuple[str, ...]
+    ) -> CoverageState:
+        rows = connection.execute(
+            """
+            WITH latest AS (
+              SELECT DISTINCT ON (connector_id, connection_id, plane, scope)
+                     plane, state
+              FROM collection_coverage
+              WHERE tenant_id = %s::uuid AND plane = ANY(%s::text[])
+              ORDER BY connector_id, connection_id, plane, scope, collected_at DESC
+            )
+            SELECT plane, array_agg(state ORDER BY state) AS states
+            FROM latest GROUP BY plane
+            """,
+            (tenant_id, list(planes)),
+        ).fetchall()
+        states_by_plane = {row["plane"]: set(row["states"]) for row in rows}
+        if any(plane not in states_by_plane for plane in planes):
+            return CoverageState.UNKNOWN
+        states = set().union(*(states_by_plane[plane] for plane in planes))
+        if states == {CoverageState.COMPLETE.value}:
+            return CoverageState.COMPLETE
+        if states and states <= {CoverageState.FAILED.value}:
+            return CoverageState.FAILED
+        if states and states <= {CoverageState.NOT_SUPPORTED.value}:
+            return CoverageState.NOT_SUPPORTED
+        if CoverageState.FAILED.value in states or CoverageState.PARTIAL.value in states:
+            return CoverageState.PARTIAL
+        return CoverageState.UNKNOWN
+
+    @classmethod
+    def _cross_signal_issue_coverage_state(
+        cls, connection, tenant_id: str
+    ) -> CoverageState:
+        """Combine sign-in collection coverage with consent-rule evaluation coverage."""
+
+        sign_in_state = cls._detection_coverage_state(
+            connection, tenant_id, ("entra_ai_signins",)
+        )
+        row = connection.execute(
+            """
+            SELECT state
+            FROM runtime_detection_rule_evaluation
+            WHERE tenant_id = %s::uuid
+              AND rule_uid = 'DENALI-RUNTIME-ENTRA-CONSENT-001'
+            """,
+            (tenant_id,),
+        ).fetchone()
+        consent_state = CoverageState.UNKNOWN if row is None else CoverageState(row["state"])
+        states = {sign_in_state, consent_state}
+        if states == {CoverageState.COMPLETE}:
+            return CoverageState.COMPLETE
+        if states == {CoverageState.FAILED}:
+            return CoverageState.FAILED
+        if states == {CoverageState.NOT_SUPPORTED}:
+            return CoverageState.NOT_SUPPORTED
+        if CoverageState.FAILED in states or CoverageState.PARTIAL in states:
+            return CoverageState.PARTIAL
+        return CoverageState.UNKNOWN
+
+    @staticmethod
+    def _load_correlation_runtime_detections(
+        connection, tenant_id: str
+    ) -> tuple[CorrelationRuntimeDetection, ...]:
+        rows = connection.execute(
+            """
+            SELECT id, rule_uid, title, severity, state, confidence,
+                   first_seen_at, last_seen_at, attributes
+            FROM runtime_detection
+            WHERE tenant_id = %s::uuid
+            ORDER BY last_seen_at, id
+            """,
+            (tenant_id,),
+        ).fetchall()
+        activity_rows = connection.execute(
+            """
+            SELECT detection_id, activity_id
+            FROM runtime_detection_activity
+            WHERE tenant_id = %s::uuid
+            ORDER BY detection_id, activity_id
+            """,
+            (tenant_id,),
+        ).fetchall()
+        asset_rows = connection.execute(
+            """
+            SELECT detection_id, asset_id
+            FROM runtime_detection_asset
+            WHERE tenant_id = %s::uuid
+            ORDER BY detection_id, asset_id
+            """,
+            (tenant_id,),
+        ).fetchall()
+        activity_ids: dict[str, list[str]] = {}
+        for row in activity_rows:
+            activity_ids.setdefault(str(row["detection_id"]), []).append(
+                str(row["activity_id"])
+            )
+        asset_ids: dict[str, list[str]] = {}
+        for row in asset_rows:
+            asset_ids.setdefault(str(row["detection_id"]), []).append(str(row["asset_id"]))
+        return tuple(
+            CorrelationRuntimeDetection(
+                id=str(row["id"]),
+                rule_uid=row["rule_uid"],
+                title=row["title"],
+                severity=FindingSeverity(row["severity"]),
+                state=row["state"],
+                confidence=row["confidence"],
+                first_seen_at=row["first_seen_at"],
+                last_seen_at=row["last_seen_at"],
+                activity_ids=tuple(activity_ids.get(str(row["id"]), ())),
+                asset_ids=tuple(asset_ids.get(str(row["id"]), ())),
+                attributes=dict(row["attributes"]),
+            )
+            for row in rows
+        )
+
+    @staticmethod
+    def _load_detection_snapshot(connection, tenant_id: str) -> DetectionSnapshot:
+        asset_rows = connection.execute(
+            f"""
+            SELECT asset.id, asset.kind, asset.natural_key, asset.governance_status,
+                   asset.lifecycle_state, winner.display_name, winner.attributes
+            FROM asset
+            JOIN LATERAL (
+                SELECT aa.display_name, aa.attributes
+                FROM asset_assertion aa
+                WHERE aa.tenant_id = asset.tenant_id
+                  AND aa.asset_id = asset.id
+                  AND aa.withdrawn_at IS NULL
+                ORDER BY {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC,
+                         aa.connector_id, aa.connection_id
+                LIMIT 1
+            ) winner ON true
+            WHERE asset.tenant_id = %s::uuid AND asset.lifecycle_state = 'active'
+            """,
+            (tenant_id,),
+        ).fetchall()
+        activity_rows = connection.execute(
+            """
+            SELECT id, category, outcome, title, occurred_at, trace_uid,
+                   attributes, evidence
+            FROM activity_event
+            WHERE tenant_id = %s::uuid
+              AND category IN ('ai_app_sign_in', 'admin_change')
+              AND attributes->>'fixture' IS DISTINCT FROM 'true'
+            ORDER BY occurred_at, id
+            """,
+            (tenant_id,),
+        ).fetchall()
+        entity_rows = connection.execute(
+            """
+            SELECT entity.activity_id, entity.role, entity.external_uid,
+                   entity.display_name, entity.asset_id
+            FROM activity_entity entity
+            JOIN activity_event event
+              ON event.tenant_id = entity.tenant_id AND event.id = entity.activity_id
+            WHERE entity.tenant_id = %s::uuid
+              AND event.category IN ('ai_app_sign_in', 'admin_change')
+              AND event.attributes->>'fixture' IS DISTINCT FROM 'true'
+            ORDER BY entity.activity_id, entity.position
+            """,
+            (tenant_id,),
+        ).fetchall()
+        entities: dict[str, list[DetectionActivityEntity]] = {}
+        for row in entity_rows:
+            entities.setdefault(str(row["activity_id"]), []).append(
+                DetectionActivityEntity(
+                    role=row["role"],
+                    external_uid=row["external_uid"],
+                    display_name=row["display_name"],
+                    asset_id=str(row["asset_id"]) if row["asset_id"] else None,
+                )
+            )
+        return DetectionSnapshot(
+            activities=tuple(
+                DetectionActivity(
+                    id=str(row["id"]),
+                    category=row["category"],
+                    outcome=row["outcome"],
+                    title=row["title"],
+                    occurred_at=row["occurred_at"],
+                    trace_uid=row["trace_uid"],
+                    attributes=dict(row["attributes"]),
+                    evidence=dict(row["evidence"]),
+                    entities=tuple(entities.get(str(row["id"]), ())),
+                )
+                for row in activity_rows
+            ),
+            assets=tuple(
+                DetectionAsset(
+                    id=str(row["id"]),
+                    kind=row["kind"],
+                    natural_key=row["natural_key"],
+                    display_name=row["display_name"],
+                    governance_status=row["governance_status"],
+                    lifecycle_state=row["lifecycle_state"],
+                    attributes=dict(row["attributes"]),
+                )
+                for row in asset_rows
+            ),
+        )
+
+    @staticmethod
+    def _upsert_runtime_detection(
+        connection,
+        tenant_id: str,
+        candidate: RuntimeDetectionCandidate,
+        evaluation: RuntimeDetectionEvaluation,
+    ) -> str:
+        row = connection.execute(
+            """
+            INSERT INTO runtime_detection
+              (tenant_id, correlation_key, rule_uid, title, description, risk,
+               investigation_guidance, severity, state, confidence, attributes,
+               resolution_reason, first_seen_at, last_seen_at, last_changed_at,
+               last_evaluated_at)
+            VALUES
+              (%s::uuid, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s::jsonb,
+               NULL, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, correlation_key)
+            DO UPDATE SET
+              last_changed_at = CASE WHEN
+                (runtime_detection.rule_uid, runtime_detection.title,
+                 runtime_detection.description, runtime_detection.risk,
+                 runtime_detection.investigation_guidance, runtime_detection.severity,
+                 runtime_detection.state, runtime_detection.confidence,
+                 runtime_detection.attributes)
+                IS DISTINCT FROM
+                (EXCLUDED.rule_uid, EXCLUDED.title, EXCLUDED.description, EXCLUDED.risk,
+                 EXCLUDED.investigation_guidance, EXCLUDED.severity, EXCLUDED.state,
+                 EXCLUDED.confidence, EXCLUDED.attributes)
+                THEN EXCLUDED.last_seen_at ELSE runtime_detection.last_changed_at END,
+              rule_uid = EXCLUDED.rule_uid,
+              title = EXCLUDED.title,
+              description = EXCLUDED.description,
+              risk = EXCLUDED.risk,
+              investigation_guidance = EXCLUDED.investigation_guidance,
+              severity = EXCLUDED.severity,
+              state = 'open',
+              confidence = EXCLUDED.confidence,
+              attributes = EXCLUDED.attributes,
+              resolution_reason = NULL,
+              first_seen_at = LEAST(runtime_detection.first_seen_at, EXCLUDED.first_seen_at),
+              last_seen_at = GREATEST(runtime_detection.last_seen_at, EXCLUDED.last_seen_at),
+              last_evaluated_at = EXCLUDED.last_evaluated_at
+            RETURNING id
+            """,
+            (
+                tenant_id,
+                candidate.correlation_key,
+                candidate.rule_uid,
+                candidate.title,
+                candidate.description,
+                candidate.risk,
+                candidate.investigation_guidance,
+                candidate.severity.value,
+                candidate.confidence,
+                json.dumps(dict(candidate.attributes)),
+                candidate.first_seen_at,
+                candidate.last_seen_at,
+                evaluation.evaluated_at,
+                evaluation.evaluated_at,
+            ),
+        ).fetchone()
+        return str(row["id"])
+
+    @staticmethod
+    def _replace_runtime_detection_evidence(
+        connection,
+        tenant_id: str,
+        detection_id: str,
+        candidate: RuntimeDetectionCandidate,
+    ) -> None:
+        connection.execute(
+            """
+            DELETE FROM runtime_detection_activity
+            WHERE tenant_id = %s::uuid AND detection_id = %s::uuid
+            """,
+            (tenant_id, detection_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM runtime_detection_asset
+            WHERE tenant_id = %s::uuid AND detection_id = %s::uuid
+            """,
+            (tenant_id, detection_id),
+        )
+        for activity in candidate.activities:
+            connection.execute(
+                """
+                INSERT INTO runtime_detection_activity
+                  (tenant_id, detection_id, activity_id, role)
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s)
+                """,
+                (tenant_id, detection_id, activity.activity_id, activity.role),
+            )
+        for asset in candidate.assets:
+            connection.execute(
+                """
+                INSERT INTO runtime_detection_asset
+                  (tenant_id, detection_id, asset_id, role)
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s)
+                """,
+                (tenant_id, detection_id, asset.asset_id, asset.role),
+            )
+
+    @staticmethod
     def _load_correlation_snapshot(connection, tenant_id: str) -> CorrelationSnapshot:
         asset_rows = connection.execute(
             f"""
-            SELECT a.id, a.kind, a.natural_key, winner.display_name,
+            SELECT a.id, a.kind, a.natural_key, a.governance_status,
+                   a.lifecycle_state, winner.display_name,
                    winner.assertion_type, winner.confidence, winner.attributes
             FROM asset a
             JOIN LATERAL (
@@ -711,7 +2243,11 @@ class PostgresInventoryRepository:
                     display_name=row["display_name"],
                     assertion_type=row["assertion_type"],
                     confidence=row["confidence"],
-                    attributes=dict(row["attributes"]),
+                    attributes={
+                        **dict(row["attributes"]),
+                        "governance_status": row["governance_status"],
+                        "lifecycle_state": row["lifecycle_state"],
+                    },
                 )
                 for row in asset_rows
             ),
@@ -822,6 +2358,14 @@ class PostgresInventoryRepository:
             "DELETE FROM issue_path_node WHERE tenant_id = %s::uuid AND issue_id = %s::uuid",
             (tenant_id, issue_id),
         )
+        connection.execute(
+            "DELETE FROM issue_detection WHERE tenant_id = %s::uuid AND issue_id = %s::uuid",
+            (tenant_id, issue_id),
+        )
+        connection.execute(
+            "DELETE FROM issue_activity WHERE tenant_id = %s::uuid AND issue_id = %s::uuid",
+            (tenant_id, issue_id),
+        )
         for finding in candidate.findings:
             connection.execute(
                 """
@@ -846,6 +2390,22 @@ class PostgresInventoryRepository:
                 VALUES (%s::uuid, %s::uuid, %s, %s::uuid)
                 """,
                 (tenant_id, issue_id, edge.position, edge.relationship_id),
+            )
+        for detection in candidate.detections:
+            connection.execute(
+                """
+                INSERT INTO issue_detection (tenant_id, issue_id, detection_id, role)
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s)
+                """,
+                (tenant_id, issue_id, detection.detection_id, detection.role),
+            )
+        for activity in candidate.activities:
+            connection.execute(
+                """
+                INSERT INTO issue_activity (tenant_id, issue_id, activity_id, role)
+                VALUES (%s::uuid, %s::uuid, %s::uuid, %s)
+                """,
+                (tenant_id, issue_id, activity.activity_id, activity.role),
             )
 
     @staticmethod
@@ -1069,7 +2629,275 @@ class PostgresInventoryRepository:
         )
 
     @staticmethod
-    def _insert_run(connection, tenant_id: str, batch: InventoryBatch | FindingBatch) -> None:
+    def _upsert_vulnerability(
+        connection,
+        tenant_id: str,
+        batch: VulnerabilityBatch,
+        observation: VulnerabilityAssertion,
+    ) -> str:
+        row = connection.execute(
+            """
+            INSERT INTO vulnerability
+              (tenant_id, canonical_key, vulnerability_id,
+               component_kind, component_natural_key, component_asset_id,
+               target_kind, target_natural_key, target_asset_id,
+               state, resolution_reason, first_seen_at, last_seen_at, last_changed_at)
+            VALUES
+              (%s::uuid, %s, %s, %s, %s,
+               (SELECT id FROM asset WHERE tenant_id = %s::uuid AND kind = %s
+                AND natural_key = %s),
+               %s, %s,
+               (SELECT id FROM asset WHERE tenant_id = %s::uuid AND kind = %s
+                AND natural_key = %s),
+               %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, canonical_key)
+            DO UPDATE SET
+              component_asset_id = COALESCE(
+                  vulnerability.component_asset_id, EXCLUDED.component_asset_id),
+              target_asset_id = COALESCE(
+                  vulnerability.target_asset_id, EXCLUDED.target_asset_id),
+              last_seen_at = GREATEST(vulnerability.last_seen_at, EXCLUDED.last_seen_at)
+            RETURNING id
+            """,
+            (
+                tenant_id,
+                observation.canonical_key,
+                observation.vulnerability_id,
+                observation.component.kind.value,
+                observation.component.natural_key,
+                tenant_id,
+                observation.component.kind.value,
+                observation.component.natural_key,
+                observation.target.kind.value,
+                observation.target.natural_key,
+                tenant_id,
+                observation.target.kind.value,
+                observation.target.natural_key,
+                observation.state.value,
+                "source_status" if observation.state.value == "resolved" else None,
+                batch.collected_at,
+                batch.collected_at,
+                batch.collected_at,
+            ),
+        ).fetchone()
+        return str(row["id"])
+
+    @staticmethod
+    def _upsert_vulnerability_observation(
+        connection,
+        tenant_id: str,
+        vulnerability_id: str,
+        batch: VulnerabilityBatch,
+        observation: VulnerabilityAssertion,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO vulnerability_observation
+              (tenant_id, vulnerability_id, connector_id, connection_id, source_uid,
+               scope_key, aliases, title, description, severity, state, cvss_score,
+               cvss_vector, fix_state, fixed_versions, exploit_state, match_method,
+               match_confidence, database_version, database_built_at, source_observed_at,
+               evidence, attributes, first_seen_at, last_seen_at, last_observed_run_id,
+               withdrawn_at)
+            VALUES
+              (%s::uuid, %s::uuid, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s,
+               %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s::jsonb,
+               %s::jsonb, %s, %s, %s, NULL)
+            ON CONFLICT (tenant_id, connector_id, connection_id, source_uid)
+            DO UPDATE SET
+              vulnerability_id = EXCLUDED.vulnerability_id,
+              scope_key = EXCLUDED.scope_key,
+              aliases = EXCLUDED.aliases,
+              title = EXCLUDED.title,
+              description = EXCLUDED.description,
+              severity = EXCLUDED.severity,
+              state = EXCLUDED.state,
+              cvss_score = EXCLUDED.cvss_score,
+              cvss_vector = EXCLUDED.cvss_vector,
+              fix_state = EXCLUDED.fix_state,
+              fixed_versions = EXCLUDED.fixed_versions,
+              exploit_state = EXCLUDED.exploit_state,
+              match_method = EXCLUDED.match_method,
+              match_confidence = EXCLUDED.match_confidence,
+              database_version = EXCLUDED.database_version,
+              database_built_at = EXCLUDED.database_built_at,
+              source_observed_at = EXCLUDED.source_observed_at,
+              evidence = EXCLUDED.evidence,
+              attributes = EXCLUDED.attributes,
+              last_seen_at = EXCLUDED.last_seen_at,
+              last_observed_run_id = EXCLUDED.last_observed_run_id,
+              withdrawn_at = NULL
+            """,
+            (
+                tenant_id,
+                vulnerability_id,
+                batch.connector_id,
+                batch.connection_id,
+                observation.source_uid,
+                batch.scope_key,
+                json.dumps(list(observation.aliases)),
+                observation.title,
+                observation.description,
+                observation.severity.value,
+                observation.state.value,
+                observation.cvss_score,
+                observation.cvss_vector,
+                observation.fix_state.value,
+                json.dumps(list(observation.fixed_versions)),
+                observation.exploit_state.value,
+                observation.match_method.value,
+                observation.match_confidence,
+                observation.database_version,
+                observation.database_built_at,
+                observation.observed_at,
+                json.dumps(_evidence_json(observation.evidence)),
+                json.dumps(dict(observation.attributes)),
+                batch.collected_at,
+                batch.collected_at,
+                batch.run_id,
+            ),
+        )
+
+    @staticmethod
+    def _refresh_vulnerability_asset_links(connection, tenant_id: str) -> None:
+        connection.execute(
+            """
+            UPDATE vulnerability v
+            SET component_asset_id = component.id
+            FROM asset component
+            WHERE v.tenant_id = %s::uuid
+              AND component.tenant_id = v.tenant_id
+              AND component.kind = v.component_kind
+              AND component.natural_key = v.component_natural_key
+              AND v.component_asset_id IS DISTINCT FROM component.id
+            """,
+            (tenant_id,),
+        )
+        connection.execute(
+            """
+            WITH candidates AS (
+                SELECT v.id AS vulnerability_id,
+                       min(component.id::text)::uuid AS component_id
+                FROM vulnerability v
+                JOIN vulnerability_observation observation
+                  ON observation.tenant_id = v.tenant_id
+                 AND observation.vulnerability_id = v.id
+                 AND observation.withdrawn_at IS NULL
+                JOIN asset_assertion assertion
+                  ON assertion.tenant_id = v.tenant_id
+                 AND assertion.withdrawn_at IS NULL
+                 AND assertion.attributes->'syft'->'artifact_ids'
+                       ? (observation.evidence->'payload'->>'artifact_id')
+                 AND assertion.attributes->'component'->'target'->>'kind'
+                       = v.target_kind
+                 AND assertion.attributes->'component'->'target'->>'natural_key'
+                       = v.target_natural_key
+                 AND (
+                       NOT (observation.attributes ? 'component')
+                       OR (
+                           assertion.attributes->'component'->>'name'
+                               = observation.attributes->'component'->>'name'
+                           AND assertion.attributes->'component'->>'version'
+                               IS NOT DISTINCT FROM
+                               observation.attributes->'component'->>'version'
+                           AND assertion.attributes->'component'->>'package_type'
+                               = observation.attributes->'component'->>'package_type'
+                       )
+                 )
+                JOIN asset component
+                  ON component.tenant_id = assertion.tenant_id
+                 AND component.id = assertion.asset_id
+                 AND component.kind = 'software_component'
+                WHERE v.tenant_id = %s::uuid
+                  AND v.component_asset_id IS NULL
+                  AND observation.evidence->'payload'->>'artifact_id' IS NOT NULL
+                GROUP BY v.id
+                HAVING count(DISTINCT component.id) = 1
+            )
+            UPDATE vulnerability v
+            SET component_asset_id = candidates.component_id
+            FROM candidates
+            WHERE v.tenant_id = %s::uuid
+              AND v.id = candidates.vulnerability_id
+              AND v.component_asset_id IS NULL
+            """,
+            (tenant_id, tenant_id),
+        )
+        connection.execute(
+            """
+            UPDATE vulnerability_scan scan
+            SET target_asset_id = target.id
+            FROM asset target
+            WHERE scan.tenant_id = %s::uuid
+              AND target.tenant_id = scan.tenant_id
+              AND target.kind = scan.target_kind
+              AND target.natural_key = scan.target_natural_key
+              AND scan.target_asset_id IS DISTINCT FROM target.id
+            """,
+            (tenant_id,),
+        )
+        connection.execute(
+            """
+            UPDATE vulnerability v
+            SET target_asset_id = target.id
+            FROM asset target
+            WHERE v.tenant_id = %s::uuid
+              AND target.tenant_id = v.tenant_id
+              AND target.kind = v.target_kind
+              AND target.natural_key = v.target_natural_key
+              AND v.target_asset_id IS DISTINCT FROM target.id
+            """,
+            (tenant_id,),
+        )
+
+    @staticmethod
+    def _refresh_vulnerability_states(connection, tenant_id: str, changed_at: datetime) -> None:
+        connection.execute(
+            """
+            WITH current_state AS (
+                SELECT v.id,
+                       CASE
+                         WHEN count(o.source_uid) = 0 THEN 'resolved'
+                         WHEN bool_or(o.state = 'open') THEN 'open'
+                         WHEN bool_or(o.state = 'unknown') THEN 'unknown'
+                         WHEN bool_or(o.state = 'suppressed') THEN 'suppressed'
+                         ELSE 'resolved'
+                       END AS state,
+                       CASE
+                         WHEN count(o.source_uid) = 0
+                           THEN 'absent_from_authoritative_snapshot'
+                         WHEN bool_and(o.state = 'resolved') THEN 'source_status'
+                         ELSE NULL
+                       END AS resolution_reason,
+                       COALESCE(max(o.last_seen_at), v.last_seen_at) AS last_seen_at
+                FROM vulnerability v
+                LEFT JOIN vulnerability_observation o
+                  ON o.tenant_id = v.tenant_id
+                 AND o.vulnerability_id = v.id
+                 AND o.withdrawn_at IS NULL
+                WHERE v.tenant_id = %s::uuid
+                GROUP BY v.id
+            )
+            UPDATE vulnerability v
+            SET state = current_state.state,
+                resolution_reason = current_state.resolution_reason,
+                last_seen_at = current_state.last_seen_at,
+                last_changed_at = CASE
+                    WHEN v.state IS DISTINCT FROM current_state.state
+                      OR v.resolution_reason IS DISTINCT FROM current_state.resolution_reason
+                    THEN %s ELSE v.last_changed_at END
+            FROM current_state
+            WHERE v.id = current_state.id
+            """,
+            (tenant_id, changed_at),
+        )
+
+    @staticmethod
+    def _insert_run(
+        connection,
+        tenant_id: str,
+        batch: InventoryBatch | FindingBatch | VulnerabilityBatch | ActivityBatch,
+    ) -> None:
         connection.execute(
             """
             INSERT INTO collection_run

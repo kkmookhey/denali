@@ -30,3 +30,21 @@ def evaluate_issues_main() -> None:
         f"incomplete={result['incomplete_candidates']}; "
         f"ambiguous={result['ambiguous_resource_references']}"
     )
+
+
+def evaluate_detections_main() -> None:
+    dsn = os.environ.get("DENALI_DSN")
+    if not dsn:
+        raise SystemExit("DENALI_DSN is required")
+    tenant_id = os.environ.get(
+        "DENALI_TENANT_ID", "00000000-0000-4000-8000-000000000001"
+    )
+    migrate(dsn)
+    result = PostgresInventoryRepository(dsn).evaluate_runtime_detections(tenant_id)
+    print(f"Evaluated runtime detections: {result['confirmed_detections']} confirmed")
+    for evaluation in result["evaluations"]:
+        print(
+            f"- {evaluation['rule_uid']}: {evaluation['confirmed_detections']} confirmed; "
+            f"coverage={evaluation['state']}; "
+            f"incomplete={evaluation['incomplete_candidates']}"
+        )

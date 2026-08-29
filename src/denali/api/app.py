@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -49,6 +49,20 @@ class InventoryReader(Protocol):
 
     def finding_summary(self, tenant_id: str) -> dict[str, Any]: ...
 
+    def list_vulnerabilities(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]: ...
+
+    def get_vulnerability(self, tenant_id: str, vulnerability_id: str) -> dict[str, Any] | None: ...
+
+    def vulnerability_summary(self, tenant_id: str) -> dict[str, Any]: ...
+
     def list_issues(
         self,
         tenant_id: str,
@@ -64,6 +78,46 @@ class InventoryReader(Protocol):
     def issue_summary(self, tenant_id: str) -> dict[str, Any]: ...
 
     def latest_issue_evaluations(self, tenant_id: str) -> list[dict[str, Any]]: ...
+
+    def code_to_cloud_deployments(self, tenant_id: str) -> list[dict[str, Any]]: ...
+
+    def list_activity(
+        self,
+        tenant_id: str,
+        *,
+        category: str | None = None,
+        outcome: str | None = None,
+        asset_id: str | None = None,
+        include_fixtures: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]: ...
+
+    def get_activity(self, tenant_id: str, activity_id: str) -> dict[str, Any] | None: ...
+
+    def activity_summary(
+        self, tenant_id: str, *, include_fixtures: bool = False
+    ) -> dict[str, Any]: ...
+
+    def list_runtime_detections(
+        self,
+        tenant_id: str,
+        *,
+        state: str | None = None,
+        severity: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]: ...
+
+    def get_runtime_detection(
+        self, tenant_id: str, detection_id: str
+    ) -> dict[str, Any] | None: ...
+
+    def runtime_detection_summary(self, tenant_id: str) -> dict[str, Any]: ...
+
+    def latest_runtime_detection_evaluations(
+        self, tenant_id: str
+    ) -> list[dict[str, Any]]: ...
 
     def set_governance(
         self,
@@ -218,6 +272,43 @@ def create_app(
             raise HTTPException(status_code=404, detail="finding not found")
         return row
 
+    @app.get("/v1/vulnerabilities/summary")
+    def vulnerability_summary(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return repo.vulnerability_summary(current_tenant)
+
+    @app.get("/v1/vulnerabilities")
+    def list_vulnerabilities(
+        request: Request,
+        state: str | None = Query(
+            default=None,
+            pattern="^(open|resolved|suppressed|unknown)$",
+        ),
+        severity: str | None = Query(
+            default=None,
+            pattern="^(unknown|informational|low|medium|high|critical)$",
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        rows = repo.list_vulnerabilities(
+            current_tenant,
+            state=state,
+            severity=severity,
+            limit=limit,
+            offset=offset,
+        )
+        return {"items": rows, "limit": limit, "offset": offset}
+
+    @app.get("/v1/vulnerabilities/{vulnerability_id}")
+    def vulnerability_detail(request: Request, vulnerability_id: UUID) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        row = repo.get_vulnerability(current_tenant, str(vulnerability_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="vulnerability not found")
+        return row
+
     @app.get("/v1/issues/summary")
     def issue_summary(request: Request) -> dict[str, Any]:
         repo, current_tenant = _context(request)
@@ -255,6 +346,97 @@ def create_app(
         row = repo.get_issue(current_tenant, str(issue_id))
         if row is None:
             raise HTTPException(status_code=404, detail="issue not found")
+        return row
+
+    @app.get("/v1/code-to-cloud/deployments")
+    def code_to_cloud_deployments(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return {"items": repo.code_to_cloud_deployments(current_tenant)}
+
+    @app.get("/v1/activity/summary")
+    def activity_summary(
+        request: Request,
+        include_fixtures: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return repo.activity_summary(current_tenant, include_fixtures=include_fixtures)
+
+    @app.get("/v1/activity")
+    def list_activity(
+        request: Request,
+        category: str | None = Query(
+            default=None,
+            pattern="^(model_invocation|agent_invocation|retrieval|tool_invocation|ai_app_sign_in|admin_change|data_access|other)$",
+        ),
+        outcome: str | None = Query(default=None, pattern="^(success|failure|unknown)$"),
+        asset_id: Annotated[UUID | None, Query()] = None,
+        include_fixtures: bool = Query(default=False),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return {
+            "items": repo.list_activity(
+                current_tenant,
+                category=category,
+                outcome=outcome,
+                asset_id=str(asset_id) if asset_id is not None else None,
+                include_fixtures=include_fixtures,
+                limit=limit,
+                offset=offset,
+            ),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/v1/activity/{activity_id}")
+    def activity_detail(request: Request, activity_id: UUID) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        row = repo.get_activity(current_tenant, str(activity_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="activity not found")
+        return row
+
+    @app.get("/v1/detections/summary")
+    def runtime_detection_summary(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return repo.runtime_detection_summary(current_tenant)
+
+    @app.get("/v1/detections")
+    def list_runtime_detections(
+        request: Request,
+        state: str | None = Query(default=None, pattern="^(open|resolved|unknown)$"),
+        severity: str | None = Query(
+            default=None,
+            pattern="^(unknown|informational|low|medium|high|critical)$",
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return {
+            "items": repo.list_runtime_detections(
+                current_tenant,
+                state=state,
+                severity=severity,
+                limit=limit,
+                offset=offset,
+            ),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/v1/detections/evaluations")
+    def runtime_detection_evaluations(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return {"items": repo.latest_runtime_detection_evaluations(current_tenant)}
+
+    @app.get("/v1/detections/{detection_id}")
+    def runtime_detection_detail(request: Request, detection_id: UUID) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        row = repo.get_runtime_detection(current_tenant, str(detection_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="runtime detection not found")
         return row
 
     return app

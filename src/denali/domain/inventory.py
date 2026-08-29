@@ -20,6 +20,7 @@ from typing import Any
 
 
 class AssetKind(StrEnum):
+    AI_APPLICATION = "ai_application"
     AI_AGENT = "ai_agent"
     AI_MODEL = "ai_model"
     MODEL_ARTIFACT = "model_artifact"
@@ -34,6 +35,7 @@ class AssetKind(StrEnum):
     CLOUD_RESOURCE = "cloud_resource"
     IDENTITY = "identity"
     APPLICATION_ENDPOINT = "application_endpoint"
+    SOFTWARE_COMPONENT = "software_component"
 
 
 class AssertionType(StrEnum):
@@ -89,6 +91,8 @@ class RelationshipKind(StrEnum):
     TRAINS_ON = "trains_on"
     CONNECTS_TO = "connects_to"
     EXPOSES = "exposes"
+    CONTAINS_COMPONENT = "contains_component"
+    DEPENDS_ON = "depends_on"
 
     @property
     def category(self) -> RelationshipCategory:

@@ -1,0 +1,754 @@
+"""Deterministic repository-to-runtime correlation.
+
+The connector joins literal deployment identifiers in source-controlled IaC to
+independently observed cloud workloads. A shared model name is useful corroboration,
+but is deliberately not sufficient to claim that a repository deployed a workload.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import posixpath
+import re
+from collections import deque
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from denali.connectors.repository import MAX_SOURCE_BYTES, RepositoryConnector, _source_files
+from denali.connectors.repository_posture import _balanced_object_end, _line
+from denali.domain import (
+    AssertionType,
+    AssetAssertion,
+    AssetKind,
+    AssetRef,
+    ConnectorCapabilities,
+    Coverage,
+    CoverageState,
+    Evidence,
+    InventoryBatch,
+    RelationshipAssertion,
+    RelationshipKind,
+)
+from denali.store.db import migrate
+from denali.store.repository import PostgresInventoryRepository
+
+CONNECTOR_ID = "denali.code_to_cloud"
+CAPABILITIES = ConnectorCapabilities(inventory=True, relationships=True)
+INVENTORY_PLANE = "code_to_cloud_inventory"
+RELATIONSHIP_PLANE = "code_to_cloud_deployments"
+
+_LAMBDA_RE = re.compile(
+    r"new\s+(?:[A-Za-z_$][\w$]*\.)?(?:Nodejs)?Function\s*\(\s*this\s*,\s*"
+    r"(?P<quote>['\"])(?P<construct>[^'\"]+)\1\s*,\s*\{"
+)
+_TASK_RE = re.compile(
+    r"(?:const|let)\s+(?P<variable>[A-Za-z_$][\w$]*)\s*=\s*new\s+"
+    r"(?:[A-Za-z_$][\w$]*\.)?(?:Fargate)?TaskDefinition\s*\(\s*this\s*,\s*"
+    r"(?P<quote>['\"])(?P<construct>[^'\"]+)\2"
+)
+_LITERAL_PROPERTY_TEMPLATE = r"\b{key}\s*:\s*(['\"])(?P<value>[^'\"\r\n]+)\1"
+_STRING_BINDING_RE = re.compile(
+    r"(?:const|let)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(['\"])(?P<value>[^'\"\r\n]+)\2"
+)
+_ASSET_CONTEXT_RE = re.compile(
+    r"\bfromAsset\s*\(\s*(['\"])(?P<value>[^'\"\r\n]+)\1"
+)
+_STATIC_IMPORT_RE = re.compile(
+    r"(?:^|[;\n])\s*import\s+(?!type\b)(?:[^'\"\n;]*?\s+from\s+)?"
+    r"(?P<quote>['\"])(?P<value>\.[^'\"\r\n]+)(?P=quote)",
+    re.MULTILINE,
+)
+_EXPORT_FROM_RE = re.compile(
+    r"(?:^|[;\n])\s*export\s+(?!type\b)[^'\"\n;]*?\s+from\s+"
+    r"(?P<quote>['\"])(?P<value>\.[^'\"\r\n]+)(?P=quote)",
+    re.MULTILINE,
+)
+_DYNAMIC_IMPORT_RE = re.compile(
+    r"\bimport\s*\(\s*(?P<quote>['\"])(?P<value>\.[^'\"\r\n]+)(?P=quote)\s*\)"
+)
+_ESBUILD_RE = re.compile(
+    r"\besbuild\s+(?P<entry>[^\s\\]+)(?P<arguments>.*?)(?=\n\s*(?:FROM|RUN|CMD|ENTRYPOINT)\b|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+_MODULE_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs")
+_MAX_CDK_MANIFESTS = 20
+_MAX_CDK_MANIFEST_BYTES = 2_000_000
+_MANIFEST_EXCLUDED_DIRS = frozenset(
+    {".git", ".venv", "node_modules", "vendor", "dist", "build"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentTarget:
+    natural_key: str
+    display_name: str
+    service: str
+    logical_id: str
+    evidence_locator: str
+    evidence_payload: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentDeclaration:
+    service: str
+    construct_id: str
+    deployment_name: str
+    path: str
+    line: int
+    entry: str | None = None
+    build_context: str | None = None
+    build_file: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactReachability:
+    entry: str | None
+    build_file: str | None
+    reachable_source_paths: tuple[str, ...]
+    import_chains: dict[str, list[str]]
+    warnings: tuple[str, ...]
+
+
+class CodeToCloudConnector:
+    connector_id = CONNECTOR_ID
+    capabilities = CAPABILITIES
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        targets: tuple[DeploymentTarget, ...],
+        repository_name: str | None = None,
+    ) -> None:
+        metadata = RepositoryConnector(root, repository_name=repository_name)
+        self.root = metadata.root
+        self.repository_name = metadata.repository_name
+        self.commit = metadata.commit
+        self.dirty = metadata.dirty
+        self.revision = metadata.revision
+        self.targets = targets
+
+    def collect(self, *, connection_id: str | None = None) -> InventoryBatch:
+        observed_at = datetime.now(UTC)
+        connection = connection_id or self.repository_name
+        scope = f"repository:{self.repository_name}"
+        repo_ref = AssetRef(AssetKind.CODE_REPOSITORY, self.repository_name)
+        warnings: list[str] = []
+        declarations: list[DeploymentDeclaration] = []
+        source_texts: dict[str, str] = {}
+        asset_manifests, manifest_warnings = _load_cdk_asset_manifests(self.root)
+        warnings.extend(manifest_warnings)
+
+        for source_file in _source_files(self.root):
+            relative = source_file.relative_to(self.root).as_posix()
+            try:
+                if source_file.stat().st_size > MAX_SOURCE_BYTES:
+                    warnings.append(f"{relative}: larger than {MAX_SOURCE_BYTES} bytes")
+                    continue
+                text = source_file.read_text(encoding="utf-8", errors="replace")
+            except OSError as error:
+                warnings.append(f"{relative}: {error.__class__.__name__}")
+                continue
+            source_texts[relative] = text
+            found, file_warnings = _deployment_declarations(text, relative)
+            declarations.extend(found)
+            warnings.extend(file_warnings)
+
+        relationships: list[RelationshipAssertion] = []
+        matched_targets: set[str] = set()
+        for declaration in declarations:
+            matches = _matching_targets(declaration, self.targets)
+            if len(matches) > 1:
+                warnings.append(
+                    f"{declaration.path}:{declaration.line}: deployment identifier "
+                    f"{declaration.deployment_name!r} matched multiple active workloads"
+                )
+                continue
+            if not matches:
+                continue
+            target = matches[0]
+            if target.natural_key in matched_targets:
+                continue
+            matched_targets.add(target.natural_key)
+            artifact = _artifact_reachability(self.root, declaration, source_texts)
+            warnings.extend(artifact.warnings)
+            provenance = _artifact_provenance(
+                target,
+                asset_manifests,
+                repository_revision=self.revision,
+            )
+            evidence = Evidence(
+                source_type="code_to_cloud_correlation",
+                locator=(
+                    f"repo://{self.repository_name}@{self.revision}/"
+                    f"{declaration.path}#L{declaration.line}"
+                ),
+                observed_at=observed_at,
+                payload={
+                    "repository_revision": self.revision,
+                    "source_path": declaration.path,
+                    "source_line": declaration.line,
+                    "service": declaration.service,
+                    "construct_id": declaration.construct_id,
+                    "deployment_identifier": declaration.deployment_name,
+                    "entry": artifact.entry,
+                    "build_file": artifact.build_file,
+                    "artifact_inclusion_method": "static_local_module_graph",
+                    "reachable_source_paths": list(artifact.reachable_source_paths),
+                    "artifact_import_chains": artifact.import_chains,
+                    "observed_workload": target.natural_key,
+                    "observed_logical_id": target.logical_id,
+                    "control_plane_evidence": target.evidence_locator,
+                    "match_basis": _match_basis(declaration),
+                    **provenance,
+                },
+            )
+            relationships.append(
+                RelationshipAssertion(
+                    source=AssetRef(AssetKind.AI_WORKLOAD, target.natural_key),
+                    target=repo_ref,
+                    coverage_plane=RELATIONSHIP_PLANE,
+                    kind=RelationshipKind.DEPLOYED_BY,
+                    assertion_type=AssertionType.INFERRED,
+                    confidence=1.0,
+                    evidence=evidence,
+                    attributes={
+                        "correlation": "deterministic",
+                        "service": declaration.service,
+                        "source_path": declaration.path,
+                        "source_line": declaration.line,
+                        "entry": artifact.entry,
+                        "build_file": artifact.build_file,
+                        "artifact_inclusion_method": "static_local_module_graph",
+                        "reachable_source_paths": list(artifact.reachable_source_paths),
+                        "artifact_import_chains": artifact.import_chains,
+                        **provenance,
+                    },
+                )
+            )
+
+        repo_assertion = AssetAssertion(
+            asset=repo_ref,
+            coverage_plane=INVENTORY_PLANE,
+            display_name=self.repository_name.rsplit("/", 1)[-1],
+            assertion_type=AssertionType.OBSERVED,
+            confidence=1.0,
+            evidence=Evidence(
+                source_type="local_git_repository",
+                locator=f"file://{self.root}",
+                observed_at=observed_at,
+                payload={"commit": self.commit, "dirty": self.dirty},
+            ),
+            attributes={"commit": self.commit, "dirty": self.dirty},
+        )
+        state = CoverageState.PARTIAL if warnings else CoverageState.COMPLETE
+        detail = "; ".join(dict.fromkeys(warnings))[:4_000] if warnings else None
+        return InventoryBatch(
+            connector_id=self.connector_id,
+            connection_id=connection,
+            run_id=f"code-to-cloud-{self.revision[:18]}-{observed_at.isoformat()}",
+            scope_key=scope,
+            collected_at=observed_at,
+            coverage=(
+                Coverage(INVENTORY_PLANE, state, scope, detail),
+                Coverage(RELATIONSHIP_PLANE, state, scope, detail),
+            ),
+            assets=(repo_assertion,),
+            relationships=tuple(relationships),
+        )
+
+
+def _deployment_declarations(
+    text: str, relative: str
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    output: list[DeploymentDeclaration] = []
+    warnings: list[str] = []
+    scan_text = _strip_js_comments(text)
+    bindings = {
+        match.group("name"): match.group("value")
+        for match in _STRING_BINDING_RE.finditer(scan_text)
+    }
+
+    for match in _LAMBDA_RE.finditer(scan_text):
+        object_start = match.end() - 1
+        object_end = _balanced_object_end(text, object_start)
+        if object_end is None:
+            warnings.append(
+                f"{relative}:{_line(text, match.start())}: unbalanced Lambda declaration"
+            )
+            continue
+        body = text[object_start : object_end + 1]
+        function_name = _literal_property(body, "functionName")
+        if function_name is None:
+            warnings.append(
+                f"{relative}:{_line(text, match.start())}: Lambda functionName is not literal"
+            )
+            continue
+        output.append(
+            DeploymentDeclaration(
+                service="lambda",
+                construct_id=match.group("construct"),
+                deployment_name=function_name,
+                path=relative,
+                line=_line(text, match.start()),
+                entry=_literal_property(body, "entry"),
+            )
+        )
+
+    for match in _TASK_RE.finditer(scan_text):
+        variable = re.escape(match.group("variable"))
+        add_container = re.compile(rf"\b{variable}\.addContainer\s*\(")
+        container_match = add_container.search(scan_text, match.end())
+        next_task = _TASK_RE.search(scan_text, match.end())
+        if container_match is None or (
+            next_task is not None and container_match.start() >= next_task.start()
+        ):
+            warnings.append(
+                f"{relative}:{_line(text, match.start())}: task container declaration not found"
+            )
+            continue
+        object_start = scan_text.find("{", container_match.end())
+        if object_start < 0:
+            warnings.append(
+                f"{relative}:{_line(text, container_match.start())}: task container is not literal"
+            )
+            continue
+        object_end = _balanced_object_end(text, object_start)
+        if object_end is None:
+            warnings.append(
+                f"{relative}:{_line(text, container_match.start())}: unbalanced task container"
+            )
+            continue
+        body = text[object_start : object_end + 1]
+        container_name = _literal_property(body, "containerName")
+        if container_name is None:
+            variable_match = re.search(
+                r"\bcontainerName(?:\s*:\s*([A-Za-z_$][\w$]*))?\s*(?=,|})", body
+            )
+            binding_name = (
+                variable_match.group(1)
+                if variable_match and variable_match.group(1)
+                else "containerName"
+            )
+            container_name = bindings.get(binding_name)
+        if container_name is None:
+            warnings.append(
+                f"{relative}:{_line(text, container_match.start())}: containerName is not literal"
+            )
+            continue
+        output.append(
+            DeploymentDeclaration(
+                service="ecs",
+                construct_id=match.group("construct"),
+                deployment_name=container_name,
+                path=relative,
+                line=_line(text, match.start()),
+                build_context=_asset_context(body),
+                build_file=_literal_property(body, "file"),
+            )
+        )
+    return output, warnings
+
+
+def _literal_property(text: str, key: str) -> str | None:
+    match = re.search(
+        _LITERAL_PROPERTY_TEMPLATE.format(key=re.escape(key)),
+        _strip_js_comments(text),
+    )
+    return match.group("value") if match else None
+
+
+def _asset_context(text: str) -> str | None:
+    match = _ASSET_CONTEXT_RE.search(_strip_js_comments(text))
+    return match.group("value") if match else None
+
+
+def _artifact_reachability(
+    root: Path,
+    declaration: DeploymentDeclaration,
+    source_texts: dict[str, str],
+) -> ArtifactReachability:
+    warnings: list[str] = []
+    project_root = _project_root(root, declaration.path)
+    entry = declaration.entry
+    build_file: str | None = None
+
+    if declaration.service == "ecs":
+        if declaration.build_context is None or declaration.build_file is None:
+            warnings.append(
+                f"{declaration.path}:{declaration.line}: ECS artifact build context or "
+                "Dockerfile is not literal"
+            )
+            return ArtifactReachability(None, None, (), {}, tuple(warnings))
+        build_root = _safe_join(project_root, declaration.build_context)
+        build_path = _safe_join(build_root, declaration.build_file) if build_root else None
+        if build_path is None or not build_path.is_file() or not build_path.is_relative_to(root):
+            warnings.append(
+                f"{declaration.path}:{declaration.line}: declared Dockerfile could not be read"
+            )
+            return ArtifactReachability(None, None, (), {}, tuple(warnings))
+        build_file = build_path.relative_to(root).as_posix()
+        try:
+            if build_path.stat().st_size > MAX_SOURCE_BYTES:
+                raise OSError("Dockerfile exceeds source size limit")
+            dockerfile = build_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            warnings.append(f"{build_file}: {error}")
+            return ArtifactReachability(None, build_file, (), {}, tuple(warnings))
+        entry = _esbuild_bundle_entry(dockerfile)
+        if entry is None:
+            warnings.append(f"{build_file}: no literal esbuild --bundle entry was found")
+            return ArtifactReachability(None, build_file, (), {}, tuple(warnings))
+        entry_path = _safe_join(build_root, entry)
+    else:
+        if entry is None:
+            warnings.append(
+                f"{declaration.path}:{declaration.line}: Lambda entry is not literal"
+            )
+            return ArtifactReachability(None, None, (), {}, tuple(warnings))
+        entry_path = _safe_join(project_root, entry)
+
+    if entry_path is None or not entry_path.is_relative_to(root):
+        warnings.append(f"{declaration.path}:{declaration.line}: artifact entry escapes repository")
+        return ArtifactReachability(None, build_file, (), {}, tuple(warnings))
+    entry_relative = entry_path.relative_to(root).as_posix()
+    if entry_relative not in source_texts:
+        warnings.append(
+            f"{declaration.path}:{declaration.line}: artifact entry {entry_relative!r} "
+            "was not found in scanned source"
+        )
+        return ArtifactReachability(entry_relative, build_file, (), {}, tuple(warnings))
+
+    reachable, chains, graph_warnings = _local_module_graph(entry_relative, source_texts)
+    warnings.extend(graph_warnings)
+    return ArtifactReachability(
+        entry_relative,
+        build_file,
+        tuple(sorted(reachable)),
+        chains,
+        tuple(warnings),
+    )
+
+
+def _project_root(root: Path, declaration_path: str) -> Path:
+    current = (root / declaration_path).resolve().parent
+    while current.is_relative_to(root):
+        if (current / "package.json").is_file():
+            return current
+        if current == root:
+            break
+        current = current.parent
+    return root
+
+
+def _safe_join(base: Path | None, relative: str) -> Path | None:
+    if base is None or Path(relative).is_absolute():
+        return None
+    resolved = (base / relative).resolve()
+    return resolved if resolved.is_relative_to(base) else None
+
+
+def _esbuild_bundle_entry(dockerfile: str) -> str | None:
+    normalized = re.sub(r"\\\s*\r?\n\s*", " ", dockerfile)
+    for match in _ESBUILD_RE.finditer(normalized):
+        if re.search(r"(?:^|\s)--bundle(?:\s|$)", match.group("arguments")):
+            return match.group("entry")
+    return None
+
+
+def _local_module_graph(
+    entry: str, source_texts: dict[str, str]
+) -> tuple[set[str], dict[str, list[str]], list[str]]:
+    reachable = {entry}
+    parents: dict[str, str | None] = {entry: None}
+    queue = deque([entry])
+    warnings: list[str] = []
+    while queue:
+        current = queue.popleft()
+        for specifier in _local_imports(source_texts[current]):
+            matches = _resolve_local_module(current, specifier, source_texts)
+            if len(matches) != 1:
+                outcome = "not found" if not matches else f"ambiguous ({', '.join(matches)})"
+                warnings.append(f"{current}: local import {specifier!r} was {outcome}")
+                continue
+            target = matches[0]
+            if target in reachable:
+                continue
+            reachable.add(target)
+            parents[target] = current
+            queue.append(target)
+    chains = {path: _import_chain(path, parents) for path in sorted(reachable)}
+    return reachable, chains, warnings
+
+
+def _local_imports(text: str) -> tuple[str, ...]:
+    uncommented = _strip_js_comments(text)
+    matches = [
+        *(match.group("value") for match in _STATIC_IMPORT_RE.finditer(uncommented)),
+        *(match.group("value") for match in _EXPORT_FROM_RE.finditer(uncommented)),
+        *(match.group("value") for match in _DYNAMIC_IMPORT_RE.finditer(uncommented)),
+    ]
+    return tuple(dict.fromkeys(matches))
+
+
+def _strip_js_comments(text: str) -> str:
+    output = list(text)
+    state = "code"
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        nxt = text[index + 1] if index + 1 < len(text) else ""
+        if state in {"single", "double", "template"}:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif (state == "single" and char == "'") or (
+                state == "double" and char == '"'
+            ) or (state == "template" and char == "`"):
+                state = "code"
+        elif state == "line_comment":
+            if char == "\n":
+                state = "code"
+            else:
+                output[index] = " "
+        elif state == "block_comment":
+            output[index] = "\n" if char == "\n" else " "
+            if char == "*" and nxt == "/":
+                output[index + 1] = " "
+                state = "code"
+                index += 1
+        elif char == "/" and nxt == "/":
+            output[index] = output[index + 1] = " "
+            state = "line_comment"
+            index += 1
+        elif char == "/" and nxt == "*":
+            output[index] = output[index + 1] = " "
+            state = "block_comment"
+            index += 1
+        elif char == "'":
+            state = "single"
+        elif char == '"':
+            state = "double"
+        elif char == "`":
+            state = "template"
+        index += 1
+    return "".join(output)
+
+
+def _resolve_local_module(
+    importer: str, specifier: str, source_texts: dict[str, str]
+) -> tuple[str, ...]:
+    base = posixpath.normpath(posixpath.join(posixpath.dirname(importer), specifier))
+    suffix = posixpath.splitext(base)[1]
+    candidates: list[str] = []
+    if suffix in {".js", ".jsx"}:
+        stem = base[: -len(suffix)]
+        candidates.extend(f"{stem}{item}" for item in (".ts", ".tsx", ".js", ".jsx"))
+    elif suffix == ".mjs":
+        stem = base[:-4]
+        candidates.extend((f"{stem}.mts", f"{stem}.mjs"))
+    elif suffix == ".cjs":
+        stem = base[:-4]
+        candidates.extend((f"{stem}.cts", f"{stem}.cjs"))
+    elif suffix:
+        candidates.append(base)
+    else:
+        candidates.extend(f"{base}{item}" for item in _MODULE_SUFFIXES)
+        candidates.extend(f"{base}/index{item}" for item in _MODULE_SUFFIXES)
+    return tuple(candidate for candidate in candidates if candidate in source_texts)
+
+
+def _import_chain(path: str, parents: dict[str, str | None]) -> list[str]:
+    chain: list[str] = []
+    current: str | None = path
+    while current is not None:
+        chain.append(current)
+        current = parents[current]
+    chain.reverse()
+    return chain
+
+
+def _matching_targets(
+    declaration: DeploymentDeclaration, targets: tuple[DeploymentTarget, ...]
+) -> tuple[DeploymentTarget, ...]:
+    matches: list[DeploymentTarget] = []
+    for target in targets:
+        if target.service != declaration.service:
+            continue
+        logical_match = target.logical_id.startswith(declaration.construct_id)
+        if declaration.service == "lambda":
+            identifier_match = target.display_name == declaration.deployment_name
+        else:
+            names = target.evidence_payload.get("container_names", [])
+            identifier_match = (
+                declaration.deployment_name in names if isinstance(names, list) else False
+            )
+        if logical_match and identifier_match:
+            matches.append(target)
+    return tuple(matches)
+
+
+def _match_basis(declaration: DeploymentDeclaration) -> list[str]:
+    if declaration.service == "lambda":
+        return ["cloudformation_logical_id_prefix", "literal_lambda_function_name"]
+    return ["cloudformation_logical_id_prefix", "literal_ecs_container_name"]
+
+
+def _load_cdk_asset_manifests(
+    root: Path,
+) -> tuple[tuple[tuple[str, dict[str, Any]], ...], tuple[str, ...]]:
+    manifests: list[tuple[str, dict[str, Any]]] = []
+    warnings: list[str] = []
+    candidates = sorted(
+        path
+        for path in root.rglob("*.assets.json")
+        if not any(part in _MANIFEST_EXCLUDED_DIRS for part in path.relative_to(root).parts)
+    )
+    if len(candidates) > _MAX_CDK_MANIFESTS:
+        warnings.append(
+            f"CDK asset manifests exceed safety limit of {_MAX_CDK_MANIFESTS}"
+        )
+        candidates = candidates[:_MAX_CDK_MANIFESTS]
+    for path in candidates:
+        relative = path.relative_to(root).as_posix()
+        try:
+            if path.stat().st_size > _MAX_CDK_MANIFEST_BYTES:
+                warnings.append(
+                    f"{relative}: larger than {_MAX_CDK_MANIFEST_BYTES} bytes"
+                )
+                continue
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            warnings.append(f"{relative}: {error.__class__.__name__}")
+            continue
+        if not isinstance(parsed, dict):
+            warnings.append(f"{relative}: invalid CDK asset manifest shape")
+            continue
+        manifests.append((relative, parsed))
+    return tuple(manifests), tuple(warnings)
+
+
+def _artifact_provenance(
+    target: DeploymentTarget,
+    manifests: tuple[tuple[str, dict[str, Any]], ...],
+    *,
+    repository_revision: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "artifact_identity_status": "not_evaluated",
+        "source_revision_status": "unattested",
+        "repository_revision": repository_revision,
+        "source_revision_reason": (
+            "The deployed artifact exposes no independently verifiable VCS revision."
+        ),
+    }
+    artifact = target.evidence_payload.get("deployment_artifact")
+    if not isinstance(artifact, dict) or not manifests:
+        return result
+    result["artifact_identity_status"] = "not_matched"
+    result["artifact_identity_method"] = "cdk_asset_manifest"
+    for manifest_path, manifest in manifests:
+        match = _matching_manifest_asset(artifact, manifest)
+        if match is None:
+            continue
+        asset_id, kind = match
+        result.update(
+            {
+                "artifact_identity_status": "matched",
+                "deployment_asset_id": asset_id,
+                "deployment_artifact_kind": kind,
+                "cdk_manifest_path": manifest_path,
+            }
+        )
+        return result
+    return result
+
+
+def _matching_manifest_asset(
+    artifact: dict[str, Any], manifest: dict[str, Any]
+) -> tuple[str, str] | None:
+    kind = artifact.get("kind")
+    if kind == "s3_object":
+        bucket = artifact.get("bucket")
+        key = artifact.get("key")
+        files = manifest.get("files")
+        if not isinstance(bucket, str) or not isinstance(key, str) or not isinstance(files, dict):
+            return None
+        for asset_id, item in files.items():
+            if not isinstance(asset_id, str) or not isinstance(item, dict):
+                continue
+            destinations = item.get("destinations")
+            if not isinstance(destinations, dict):
+                continue
+            if any(
+                isinstance(destination, dict)
+                and destination.get("bucketName") == bucket
+                and destination.get("objectKey") == key
+                for destination in destinations.values()
+            ):
+                return asset_id, "s3_object"
+        return None
+    if kind == "container_image":
+        image = artifact.get("image")
+        parsed = _container_repository_and_tag(image) if isinstance(image, str) else None
+        images = manifest.get("dockerImages")
+        if parsed is None or not isinstance(images, dict):
+            return None
+        repository, tag = parsed
+        for asset_id, item in images.items():
+            if not isinstance(asset_id, str) or not isinstance(item, dict):
+                continue
+            destinations = item.get("destinations")
+            if not isinstance(destinations, dict):
+                continue
+            if any(
+                isinstance(destination, dict)
+                and destination.get("repositoryName") == repository
+                and destination.get("imageTag") == tag
+                for destination in destinations.values()
+            ):
+                return asset_id, "container_image"
+    return None
+
+
+def _container_repository_and_tag(image: str) -> tuple[str, str] | None:
+    path = image.split("/", 1)[-1]
+    repository, separator, tag = path.rpartition(":")
+    if not separator or not repository or not tag or "@" in tag:
+        return None
+    return repository, tag
+
+
+def scan_main() -> None:
+    parser = argparse.ArgumentParser(description="Correlate repository IaC to observed workloads")
+    parser.add_argument("repository", type=Path)
+    parser.add_argument("--name", help="canonical repository name; defaults to git remote")
+    parser.add_argument("--connection-id", help="source connection id")
+    parser.add_argument(
+        "--tenant-id",
+        default=os.environ.get("DENALI_TENANT_ID", "00000000-0000-4000-8000-000000000001"),
+    )
+    parser.add_argument("--dsn", default=os.environ.get("DENALI_DSN"))
+    args = parser.parse_args()
+    if not args.dsn:
+        raise SystemExit("--dsn or DENALI_DSN is required")
+    migrate(args.dsn)
+    repository = PostgresInventoryRepository(args.dsn)
+    targets = tuple(
+        DeploymentTarget(**item) for item in repository.deployment_targets(args.tenant_id)
+    )
+    connector = CodeToCloudConnector(args.repository, targets=targets, repository_name=args.name)
+    batch = connector.collect(connection_id=args.connection_id)
+    result = repository.ingest(args.tenant_id, batch)
+    states = ",".join(f"{item.plane}={item.state.value}" for item in batch.coverage)
+    print(
+        f"Correlated {connector.repository_name}: {result['relationships']} deployments; {states}"
+    )
+    if batch.coverage[0].detail:
+        print(f"Coverage detail: {batch.coverage[0].detail}")

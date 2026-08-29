@@ -173,6 +173,8 @@ export type Issue = {
   last_changed_at: string;
   last_evaluated_at: string;
   finding_count: number;
+  detection_count: number;
+  activity_count: number;
   asset_count: number;
 };
 
@@ -211,8 +213,48 @@ export type IssuePathEdge = {
   target_id: string;
 };
 
+export type IssueDetection = {
+  id: string;
+  rule_uid: string;
+  title: string;
+  description: string;
+  risk: string;
+  investigation_guidance: string;
+  severity: FindingSeverity;
+  state: string;
+  confidence: number;
+  attributes: Record<string, unknown>;
+  first_seen_at: string;
+  last_seen_at: string;
+  role: string;
+};
+
+export type IssueActivityActor = {
+  external_uid: string;
+  display_name: string | null;
+  asset_id: string | null;
+  correlation: string;
+  confidence: number;
+};
+
+export type IssueActivity = {
+  id: string;
+  category: string;
+  outcome: string;
+  activity_name: string;
+  title: string;
+  provider: string;
+  occurred_at: string;
+  evidence: Evidence;
+  attributes: Record<string, unknown>;
+  role: string;
+  actors: IssueActivityActor[];
+};
+
 export type IssueDetail = Issue & {
   findings: IssueFinding[];
+  detections: IssueDetection[];
+  activities: IssueActivity[];
   path_nodes: IssuePathNode[];
   path_edges: IssuePathEdge[];
 };
@@ -229,6 +271,309 @@ export type IssueEvaluation = {
   confirmed_issues: number;
   incomplete_candidates: number;
   ambiguous_resource_references: number;
+  detail: string | null;
+  evaluated_at: string;
+};
+
+export type CodeToCloudContext = {
+  id: string;
+  natural_key: string;
+  display_name: string;
+  assertion_type: string;
+  confidence: number;
+};
+
+export type CodeToCloudFinding = {
+  id: string;
+  title: string;
+  severity: FindingSeverity;
+  rule_uid: string;
+  source_path: string | null;
+  source_line: string | null;
+  applicability: "artifact_included" | "repository_only";
+  import_chain: string[] | null;
+};
+
+export type CodeToCloudVulnerabilityCoverage = {
+  state: "complete" | "partial" | "failed" | "unknown";
+  detail: string | null;
+  connector_id: string;
+  connection_id: string;
+  run_id: string;
+  collected_at: string;
+  artifact_kind: string;
+  artifact_locator: string;
+  artifact_digest: string | null;
+  artifact_identity_status: "matched" | "not_matched" | "not_evaluated";
+  artifact_identity_method: "exact_locator" | "exact_digest" | null;
+};
+
+export type CodeToCloudVulnerability = {
+  id: string;
+  vulnerability_id: string;
+  title: string | null;
+  severity: FindingSeverity;
+  state: FindingState;
+  cvss_score: number | null;
+  fix_state: "fixed" | "not_fixed" | "wont_fix" | "unknown";
+  fixed_versions: string[];
+  exploit_state: "known_exploited" | "public_exploit" | "no_known_exploit" | "unknown";
+  match_method: string;
+  match_confidence: number;
+  scanner: string;
+  source_count: number;
+  component_id: string | null;
+  component_name: string | null;
+  component_purl: string | null;
+};
+
+export type CodeToCloudDeployment = {
+  id: string;
+  assertion_type: string;
+  confidence: number;
+  attributes: Record<string, unknown>;
+  evidence: Evidence;
+  workload_id: string;
+  workload_natural_key: string;
+  workload_name: string;
+  workload_attributes: Record<string, unknown>;
+  repository_id: string;
+  repository_natural_key: string;
+  repository_name: string;
+  models: CodeToCloudContext[];
+  identity: CodeToCloudContext | null;
+  code_findings: CodeToCloudFinding[];
+  vulnerability_coverage: CodeToCloudVulnerabilityCoverage | null;
+  artifact_vulnerability_count: number;
+  artifact_vulnerability_id_count: number;
+  artifact_vulnerabilities: CodeToCloudVulnerability[];
+};
+
+export type Vulnerability = {
+  id: string;
+  canonical_key: string;
+  vulnerability_id: string;
+  component_kind: string;
+  component_natural_key: string;
+  component_asset_id: string | null;
+  target_kind: string;
+  target_natural_key: string;
+  target_asset_id: string | null;
+  state: FindingState;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_changed_at: string;
+  aliases: string[];
+  title: string | null;
+  description: string | null;
+  severity: FindingSeverity;
+  cvss_score: number | null;
+  cvss_vector: string | null;
+  fix_state: "fixed" | "not_fixed" | "wont_fix" | "unknown";
+  fixed_versions: string[];
+  exploit_state: "known_exploited" | "public_exploit" | "no_known_exploit" | "unknown";
+  match_method: string;
+  match_confidence: number;
+  database_version: string | null;
+  database_built_at: string | null;
+  scanner: string;
+  scanner_connection: string;
+  component_correlated: boolean;
+  target_correlated: boolean;
+  source_count: number;
+  component_name: string | null;
+  component_attributes: Record<string, unknown> | null;
+  target_name: string | null;
+};
+
+export type VulnerabilityObservation = {
+  connector_id: string;
+  connection_id: string;
+  source_uid: string;
+  scope_key: string;
+  aliases: string[];
+  title: string | null;
+  description: string | null;
+  severity: FindingSeverity;
+  state: FindingState;
+  cvss_score: number | null;
+  cvss_vector: string | null;
+  fix_state: Vulnerability["fix_state"];
+  fixed_versions: string[];
+  exploit_state: Vulnerability["exploit_state"];
+  match_method: string;
+  match_confidence: number;
+  database_version: string | null;
+  database_built_at: string | null;
+  source_observed_at: string;
+  evidence: Evidence;
+  attributes: Record<string, unknown>;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_observed_run_id: string;
+  withdrawn_at: string | null;
+};
+
+export type VulnerabilityDetail = {
+  id: string;
+  canonical_key: string;
+  vulnerability_id: string;
+  state: FindingState;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_changed_at: string;
+  resolution_reason: string | null;
+  component: {
+    kind: string;
+    natural_key: string;
+    asset_id: string | null;
+    display_name: string | null;
+    attributes: Record<string, unknown> | null;
+  };
+  target: {
+    kind: string;
+    natural_key: string;
+    asset_id: string | null;
+    display_name: string | null;
+  };
+  observations: VulnerabilityObservation[];
+};
+
+export type VulnerabilitySummary = {
+  total: number;
+  by_state: Record<string, number>;
+  open_vulnerability_ids: number;
+  open_by_severity: Record<string, number>;
+  open_by_fix_state: Record<string, number>;
+  open_by_exploit_state: Record<string, number>;
+};
+
+export type ActivityCategory =
+  | "model_invocation"
+  | "agent_invocation"
+  | "retrieval"
+  | "tool_invocation"
+  | "ai_app_sign_in"
+  | "admin_change"
+  | "data_access"
+  | "other";
+
+export type RuntimeActivity = {
+  id: string;
+  connector_id: string;
+  connection_id: string;
+  run_id: string;
+  scope_key: string;
+  source_uid: string;
+  category: ActivityCategory;
+  activity_name: string;
+  title: string;
+  outcome: "success" | "failure" | "unknown";
+  provider: string;
+  account_uid: string | null;
+  region: string | null;
+  occurred_at: string;
+  source_observed_at: string;
+  session_uid: string | null;
+  trace_uid: string | null;
+  evidence: Evidence;
+  attributes: Record<string, unknown>;
+  ingested_at: string;
+  actor_uid: string | null;
+  actor_name: string | null;
+  actor_asset_id: string | null;
+  entity_count: number;
+  correlated_entity_count: number;
+};
+
+export type ActivityEntity = {
+  position: number;
+  role: "actor" | "agent" | "model" | "tool" | "workload" | "resource" | "application";
+  external_uid: string;
+  display_name: string | null;
+  asset_kind: string | null;
+  asset_natural_key: string | null;
+  asset_id: string | null;
+  correlation: "exact_identifier" | "explicit_context" | "unresolved";
+  confidence: number;
+  attributes: Record<string, unknown>;
+  lifecycle_state: string | null;
+  governance_status: Asset["governance_status"] | null;
+  asset_display_name: string | null;
+};
+
+export type RuntimeActivityDetail = Omit<
+  RuntimeActivity,
+  "actor_uid" | "actor_name" | "actor_asset_id" | "entity_count" | "correlated_entity_count"
+> & {
+  entities: ActivityEntity[];
+};
+
+export type RuntimeActivitySummary = {
+  total: number;
+  last_24h: number;
+  providers: number;
+  failures: number;
+  fixture_total: number;
+  by_category: Partial<Record<ActivityCategory, number>>;
+};
+
+export type RuntimeDetection = {
+  id: string;
+  correlation_key: string;
+  rule_uid: string;
+  title: string;
+  description: string;
+  risk: string;
+  investigation_guidance: string;
+  severity: FindingSeverity;
+  state: "open" | "resolved" | "unknown";
+  confidence: number;
+  attributes: Record<string, unknown>;
+  resolution_reason: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_changed_at: string;
+  last_evaluated_at: string;
+  activity_count: number;
+  asset_count: number;
+};
+
+export type RuntimeDetectionActivity = Omit<
+  RuntimeActivity,
+  "actor_uid" | "actor_name" | "actor_asset_id" | "entity_count" | "correlated_entity_count"
+> & { role: string };
+
+export type RuntimeDetectionAsset = {
+  id: string;
+  kind: string;
+  natural_key: string;
+  display_name: string;
+  governance_status: Asset["governance_status"];
+  lifecycle_state: string;
+  role: string;
+  assertion_type: string;
+  confidence: number;
+  attributes: Record<string, unknown>;
+  evidence: Evidence;
+};
+
+export type RuntimeDetectionDetail = Omit<RuntimeDetection, "activity_count" | "asset_count"> & {
+  activities: RuntimeDetectionActivity[];
+  assets: RuntimeDetectionAsset[];
+};
+
+export type RuntimeDetectionSummary = {
+  total: number;
+  by_state: Record<string, number>;
+  open_by_severity: Record<string, number>;
+};
+
+export type RuntimeDetectionEvaluation = {
+  rule_uid: string;
+  state: "complete" | "partial" | "failed" | "not_supported" | "unknown";
+  confirmed_detections: number;
+  incomplete_candidates: number;
   detail: string | null;
   evaluated_at: string;
 };

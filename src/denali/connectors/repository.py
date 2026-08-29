@@ -50,6 +50,7 @@ _EXCLUDED_DIRS = frozenset(
         ".venv",
         "__pycache__",
         "build",
+        "cdk.out",
         "dist",
         "fixtures",
         "node_modules",
@@ -58,7 +59,11 @@ _EXCLUDED_DIRS = frozenset(
         "vendor",
     }
 )
-_TEST_FILE_RE = re.compile(r"^(test_.*|.*_test|conftest)\.py$", re.IGNORECASE)
+_SOURCE_SUFFIXES = frozenset({".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"})
+_TEST_FILE_RE = re.compile(
+    r"^(test_.*|.*(?:_test|\.test|\.spec)|conftest)\.(?:py|[cm]?[jt]sx?)$", re.IGNORECASE
+)
+_GENERATED_FILE_RE = re.compile(r"(?:^|\.)generated\.(?:py|[cm]?[jt]sx?)$", re.IGNORECASE)
 _NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
 _FRAMEWORKS = {
@@ -91,6 +96,9 @@ _PROVIDER_SIGNALS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 _AZURE_ENV_DEPLOYMENT_RE = re.compile(
     r"""os\.(?:getenv|environ(?:\.get)?)\s*[(\[]\s*["']"""
     r"""(AZURE_OPENAI_[A-Z0-9_]*(?:DEPLOYMENT|MODEL)[A-Z0-9_]*)["']"""
+)
+_BEDROCK_MODEL_ENV_LITERAL_RE = re.compile(
+    r"\b([A-Z][A-Z0-9_]*MODEL_ID)\s*(?::|=)\s*([\"'])([^\"'\r\n]{1,300})\2"
 )
 _TOOL_REFERENCE_RE = re.compile(r"\b([a-z][a-z0-9_-]{2,})__([a-z][a-z0-9_]{2,})\b")
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
@@ -178,11 +186,12 @@ class RepositoryConnector:
                 warnings.append(f"{relative}: {error.__class__.__name__}")
                 continue
 
-            try:
-                tree = ast.parse(text, filename=relative)
-            except SyntaxError as error:
-                warnings.append(f"{relative}:{error.lineno or 0}: invalid Python syntax")
-                tree = None
+            tree = None
+            if source_file.suffix == ".py":
+                try:
+                    tree = ast.parse(text, filename=relative)
+                except SyntaxError as error:
+                    warnings.append(f"{relative}:{error.lineno or 0}: invalid Python syntax")
 
             if tree is not None:
                 self._discover_frameworks(
@@ -284,6 +293,40 @@ class RepositoryConnector:
             tuple[AssetRef, AssetRef, RelationshipKind, AssertionType], RelationshipAssertion
         ],
     ) -> None:
+        if "bedrock" in text.lower():
+            for match in _BEDROCK_MODEL_ENV_LITERAL_RE.finditer(text):
+                env_var = match.group(1)
+                model_id = match.group(3)
+                line = text[: match.start()].count("\n") + 1
+                site = _site(text, relative, line)
+                model_ref = AssetRef(AssetKind.AI_MODEL, _model_natural_key("bedrock", model_id))
+                self._add_asset(
+                    assets,
+                    model_ref,
+                    model_id,
+                    AssertionType.DECLARED,
+                    1.0,
+                    site,
+                    observed_at,
+                    {
+                        "provider": "bedrock",
+                        "model_id": model_id,
+                        "configuration_key": env_var,
+                    },
+                    "bedrock_model_environment",
+                )
+                self._add_relationship(
+                    relationships,
+                    repo_ref,
+                    model_ref,
+                    RelationshipKind.USES,
+                    AssertionType.DECLARED,
+                    1.0,
+                    site,
+                    observed_at,
+                    "bedrock_model_environment",
+                )
+
         providers: dict[str, tuple[str, ...]] = {}
         for marker, provider, model_fields in _PROVIDER_SIGNALS:
             if marker in text:
@@ -338,7 +381,9 @@ class RepositoryConnector:
                         resolved = _resolve_provider(provider, model_id)
                         line = text[: match.start()].count("\n") + 1
                         site = _site(text, relative, line)
-                        model_ref = AssetRef(AssetKind.AI_MODEL, f"{resolved}:{model_id}")
+                        model_ref = AssetRef(
+                            AssetKind.AI_MODEL, _model_natural_key(resolved, model_id)
+                        )
                         self._add_asset(
                             assets,
                             model_ref,
@@ -643,7 +688,11 @@ def _source_files(root: Path) -> list[Path]:
         )
         current = Path(current_root)
         for file_name in sorted(file_names):
-            if not file_name.endswith(".py") or _TEST_FILE_RE.match(file_name):
+            if (
+                Path(file_name).suffix.lower() not in _SOURCE_SUFFIXES
+                or _TEST_FILE_RE.match(file_name)
+                or _GENERATED_FILE_RE.search(file_name)
+            ):
                 continue
             candidate = current / file_name
             if not candidate.is_symlink():
@@ -802,6 +851,12 @@ def _resolve_provider(provider: str, model_id: str) -> str:
     if model_id.startswith("gemini-"):
         return "google_ai"
     return provider
+
+
+def _model_natural_key(provider: str, model_id: str) -> str:
+    if provider == "bedrock":
+        return f"aws:bedrock:model:{model_id}"
+    return f"{provider}:{model_id}"
 
 
 def _normalize_server(value: str) -> str:

@@ -1,6 +1,14 @@
 from datetime import UTC, datetime
 
-from denali.connectors.demo import CAPABILITIES, CONNECTOR_ID, demo_batch, demo_findings_batch
+from denali.connectors.demo import (
+    CAPABILITIES,
+    CONNECTOR_ID,
+    demo_activity_batch,
+    demo_batch,
+    demo_findings_batch,
+    demo_software_batch,
+    demo_vulnerability_batch,
+)
 from denali.domain import AssetKind, RelationshipCategory
 
 
@@ -10,6 +18,7 @@ def test_demo_connector_is_transparently_identified_and_complete() -> None:
     assert CAPABILITIES.inventory is True
     assert CAPABILITIES.relationships is True
     assert CAPABILITIES.findings is True
+    assert CAPABILITIES.activity is True
     assert all(item.evidence.source_type == "denali_demo_fixture" for item in batch.assets)
     assert batch.may_withdraw("demo_inventory") is True
 
@@ -51,3 +60,35 @@ def test_demo_findings_are_explicit_and_authoritative_fixture_evidence() -> None
         "tool.write_without_confirmation",
         "guardrail.output_unverified",
     }
+
+
+def test_demo_vulnerability_preview_is_transparent_and_correlated() -> None:
+    observed_at = datetime(2026, 8, 26, tzinfo=UTC)
+    software = demo_software_batch(observed_at)
+    vulnerabilities = demo_vulnerability_batch(observed_at)
+
+    component_refs = {
+        item.asset for item in software.assets if item.asset.kind is AssetKind.SOFTWARE_COMPONENT
+    }
+    assert len(component_refs) == 3
+    assert {item.component for item in vulnerabilities.vulnerabilities} == component_refs
+    assert vulnerabilities.authoritative is True
+    assert vulnerabilities.may_resolve_missing is True
+    assert all(item.evidence.payload["fixture"] is True for item in vulnerabilities.vulnerabilities)
+    assert all(item.attributes["fixture"] is True for item in vulnerabilities.vulnerabilities)
+
+
+def test_demo_runtime_preview_separates_observation_from_risk() -> None:
+    batch = demo_activity_batch(datetime(2026, 8, 26, tzinfo=UTC))
+
+    assert len(batch.activities) == 6
+    assert batch.coverage[0].state.value == "complete"
+    assert {item.provider for item in batch.activities} == {
+        "aws_bedrock",
+        "mcp",
+        "gcp_vertex_ai",
+        "google_workspace_gemini",
+        "microsoft_entra",
+    }
+    assert any(item.outcome.value == "failure" for item in batch.activities)
+    assert all(item.evidence.payload["fixture"] is True for item in batch.activities)

@@ -46,6 +46,43 @@ def test_test_fixtures_do_not_become_inventory(tmp_path: Path) -> None:
     assert {assertion.asset.kind for assertion in batch.assets} == {AssetKind.CODE_REPOSITORY}
 
 
+def test_typescript_bedrock_model_configuration_is_declared_without_executing_code(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "stack.ts").write_text(
+        "import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';\n"
+        "const client = new BedrockRuntimeClient({});\n"
+        "const REVIEWER_MODEL_ID = 'global.anthropic.claude-opus-4-6-v1';\n"
+        "const environment = {\n"
+        "  BEDROCK_MODEL_ID: 'global.anthropic.claude-sonnet-4-5-v1:0',\n"
+        "  REVIEWER_MODEL_ID,\n"
+        "  API_SECRET: 'never-store-this',\n"
+        "};\n"
+    )
+    (tmp_path / "ignored.test.ts").write_text(
+        "const environment = { BEDROCK_MODEL_ID: 'test-model' };\n"
+    )
+    (tmp_path / "cdk.out").mkdir()
+    (tmp_path / "cdk.out" / "generated.mjs").write_text("x" * 1_000_001)
+    (tmp_path / "screenshots.generated.ts").write_text("x" * 1_000_001)
+
+    batch = RepositoryConnector(
+        tmp_path,
+        repository_name="github.com/acme/typescript-agent",
+        app_id="typescript-agent",
+    ).collect()
+    models = [item for item in batch.assets if item.asset.kind is AssetKind.AI_MODEL]
+
+    assert {item.asset.natural_key for item in models} == {
+        "aws:bedrock:model:global.anthropic.claude-sonnet-4-5-v1:0",
+        "aws:bedrock:model:global.anthropic.claude-opus-4-6-v1",
+    }
+    assert all(item.assertion_type is AssertionType.DECLARED for item in models)
+    assert all(item.evidence.locator.startswith("repo://") for item in models)
+    assert "never-store-this" not in str(batch)
+    assert {item.state for item in batch.coverage} == {CoverageState.COMPLETE}
+
+
 def test_low_level_mcp_server_and_tools_use_one_canonical_namespace(tmp_path: Path) -> None:
     (tmp_path / "server.py").write_text(
         "import mcp.types as types\n"

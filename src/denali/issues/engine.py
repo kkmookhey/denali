@@ -10,10 +10,14 @@ from denali.domain import (
     CorrelationAsset,
     CorrelationFinding,
     CorrelationRelationship,
+    CorrelationRuntimeDetection,
     CorrelationSnapshot,
     CoverageState,
+    DetectionActivity,
     FindingSeverity,
+    IssueActivityLink,
     IssueCandidate,
+    IssueDetectionLink,
     IssueEvaluation,
     IssueFindingLink,
     IssuePathEdge,
@@ -21,10 +25,180 @@ from denali.domain import (
 )
 
 RULE_UID = "DENALI-ISSUE-AGENT-WRITE-001"
+CONSENT_THEN_USE_RULE_UID = "DENALI-ISSUE-SHADOW-AI-CONSENT-USE-001"
+CONSENT_DETECTION_RULE_UID = "DENALI-RUNTIME-ENTRA-CONSENT-001"
 IDENTITY_SIGNAL = "identity.overprivileged"
 TOOL_SIGNAL = "tool.write_without_confirmation"
 ELIGIBLE_ASSERTIONS = {"observed", "externally_verified"}
 MIN_CONFIDENCE = 0.8
+
+
+def aggregate_issue_evaluation_state(
+    evaluations: tuple[IssueEvaluation, ...],
+) -> CoverageState:
+    """Summarize issue-rule coverage without hiding an incomplete correlation.
+
+    A rule with no candidates and unknown upstream coverage is non-participating: its
+    own rule evaluation remains unknown, but it must not downgrade a different rule
+    that completed. Once an unknown rule has a candidate or incomplete/ambiguous
+    evidence, however, that uncertainty is material and must remain visible in the
+    aggregate result.
+    """
+
+    if not evaluations:
+        return CoverageState.UNKNOWN
+
+    states = {evaluation.state for evaluation in evaluations}
+    if states == {CoverageState.FAILED}:
+        return CoverageState.FAILED
+    if CoverageState.FAILED in states or CoverageState.PARTIAL in states:
+        return CoverageState.PARTIAL
+
+    material_unknown = any(
+        evaluation.state is CoverageState.UNKNOWN
+        and (
+            evaluation.candidates
+            or evaluation.incomplete_candidates
+            or evaluation.ambiguous_resource_references
+        )
+        for evaluation in evaluations
+    )
+    if material_unknown:
+        return CoverageState.UNKNOWN
+
+    if CoverageState.COMPLETE in states:
+        return CoverageState.COMPLETE
+    if states == {CoverageState.NOT_SUPPORTED}:
+        return CoverageState.NOT_SUPPORTED
+    return CoverageState.UNKNOWN
+
+
+def evaluate_unreviewed_ai_consent_then_use(
+    detections: tuple[CorrelationRuntimeDetection, ...],
+    activities: tuple[DetectionActivity, ...],
+    assets: tuple[CorrelationAsset, ...],
+    *,
+    coverage_state: CoverageState = CoverageState.COMPLETE,
+    evaluated_at: datetime | None = None,
+) -> IssueEvaluation:
+    """Correlate high-impact consent with later exact use of the same AI app.
+
+    The rule proves sequence and identity only. It does not claim the application
+    exercised the granted permission or that either observed actor had malicious intent.
+    """
+
+    now = evaluated_at or datetime.now(UTC)
+    assets_by_id = {asset.id: asset for asset in assets}
+    successful_sign_ins: dict[str, list[DetectionActivity]] = defaultdict(list)
+    for activity in activities:
+        if activity.category != "ai_app_sign_in" or activity.outcome != "success":
+            continue
+        for entity in activity.entities:
+            if entity.role == "application" and entity.asset_id:
+                successful_sign_ins[entity.asset_id].append(activity)
+
+    candidates: list[IssueCandidate] = []
+    incomplete = 0
+    for detection in detections:
+        if detection.rule_uid != CONSENT_DETECTION_RULE_UID or detection.state != "open":
+            continue
+        high_impact_scopes = tuple(
+            sorted(str(scope) for scope in detection.attributes.get("high_impact_scopes", ()))
+        )
+        if not high_impact_scopes:
+            continue
+        exact_assets = [
+            assets_by_id[asset_id]
+            for asset_id in detection.asset_ids
+            if asset_id in assets_by_id
+            and assets_by_id[asset_id].kind == "ai_application"
+            and assets_by_id[asset_id].assertion_type in ELIGIBLE_ASSERTIONS
+            and assets_by_id[asset_id].confidence >= MIN_CONFIDENCE
+            and assets_by_id[asset_id].attributes.get("governance_status") == "unreviewed"
+        ]
+        if len(exact_assets) != 1:
+            incomplete += 1
+            continue
+        application = exact_assets[0]
+        later_use = tuple(
+            activity
+            for activity in successful_sign_ins.get(application.id, ())
+            if activity.occurred_at > detection.last_seen_at
+        )
+        if not later_use:
+            continue
+        first_use = min(item.occurred_at for item in later_use)
+        actors = sorted(
+            {
+                entity.display_name or entity.external_uid
+                for activity in later_use
+                for entity in activity.entities
+                if entity.role == "actor"
+            }
+        )
+        correlation_key = hashlib.sha256(
+            f"{CONSENT_THEN_USE_RULE_UID}|{application.natural_key}".encode()
+        ).hexdigest()
+        scope_text = ", ".join(high_impact_scopes)
+        candidates.append(
+            IssueCandidate(
+                correlation_key=correlation_key,
+                rule_uid=CONSENT_THEN_USE_RULE_UID,
+                title=(
+                    f"Unreviewed AI app {application.display_name} received high-impact "
+                    "consent and was subsequently used"
+                ),
+                description=(
+                    f"Microsoft Entra recorded high-impact delegated consent ({scope_text}) "
+                    f"for unreviewed AI application {application.display_name}, followed by "
+                    f"{len(later_use)} successful sign-in event(s) to that exact application."
+                ),
+                risk=(
+                    "The application can be used while holding access to sensitive tenant data "
+                    "before the organization has approved its use. This chronology does not "
+                    "prove that the granted scope was exercised or that either actor intended "
+                    "misuse."
+                ),
+                remediation=(
+                    "Confirm the business owner and need for the application, review the exact "
+                    "delegated scopes and sign-in actors, then approve the app or revoke consent "
+                    "through the organization's established remediation workflow."
+                ),
+                severity=FindingSeverity.HIGH,
+                confidence=min(detection.confidence, application.confidence),
+                findings=(),
+                path_nodes=(IssuePathNode(application.id, 0, "unreviewed_ai_application"),),
+                path_edges=(),
+                detections=(IssueDetectionLink(detection.id, "high_impact_consent"),),
+                activities=tuple(
+                    IssueActivityLink(item.id, "subsequent_successful_sign_in")
+                    for item in sorted(later_use, key=lambda item: (item.occurred_at, item.id))
+                ),
+                attributes={
+                    "correlation": "deterministic_temporal",
+                    "path_status": "exact_application_identity",
+                    "high_impact_scopes": list(high_impact_scopes),
+                    "consent_last_seen_at": detection.last_seen_at.isoformat(),
+                    "first_subsequent_use_at": first_use.isoformat(),
+                    "subsequent_use_count": len(later_use),
+                    "actors": actors,
+                },
+            )
+        )
+
+    state = coverage_state
+    detail = None
+    if incomplete:
+        state = CoverageState.UNKNOWN
+        detail = f"{incomplete} consent detections lacked one exact active application asset"
+    return IssueEvaluation(
+        rule_uid=CONSENT_THEN_USE_RULE_UID,
+        state=state,
+        evaluated_at=now,
+        candidates=tuple(sorted(candidates, key=lambda item: item.correlation_key)),
+        incomplete_candidates=incomplete,
+        detail=detail,
+    )
 
 
 def evaluate_agent_sensitive_write(

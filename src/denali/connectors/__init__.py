@@ -3,4 +3,4 @@
 from denali.connectors.base import Connector, ConnectorContext
 
 __all__ = ["Connector", "ConnectorContext"]
-
+"""First-party discovery and interchange connectors."""

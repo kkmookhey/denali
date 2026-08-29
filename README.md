@@ -31,11 +31,12 @@ This repository is intentionally new. Proven first-party components will be impo
 from the CISOBrief history only after they conform to Denali's standalone contracts.
 Shasta infrastructure and Prowler UI patches will not be carried forward.
 
-The foundation currently contains canonical inventory and finding contracts, a Postgres
-assertion store, read/write inventory APIs, read-only finding APIs, and independent web
-experiences for inventory, AI configuration findings, and evidence-bearing issues. A
-transparent demo connector provides fixture data for local product development; every
-fixture assertion and finding is visibly identified as such in its evidence.
+The foundation currently contains canonical inventory, finding, software-component, and
+vulnerability contracts; a Postgres assertion store; read/write inventory APIs;
+read-only finding and vulnerability APIs; and independent web experiences for inventory,
+AI configuration findings, and evidence-bearing issues. A transparent demo connector
+provides fixture data for local product development; every fixture assertion and finding
+is visibly identified as such in its evidence.
 
 ## Development
 
@@ -62,7 +63,8 @@ DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
 ```
 
 The connector discovers AI frameworks, model-provider references, MCP servers, and MCP
-tools without executing repository code. It excludes tests, fixtures, generated or
+tools in Python, TypeScript, and JavaScript without executing repository code. It
+excludes tests, fixtures, generated or
 vendored directories, and symlinked source files. Evidence snippets are secret-redacted;
 read or parse failures mark coverage partial so an incomplete scan cannot withdraw
 previously observed assets.
@@ -126,6 +128,95 @@ not persisted. Denali stores configuration presence, normalized policy types and
 and an instruction hash and length so posture can be evaluated without copying sensitive
 prompt content.
 
+Discover a custom Lambda/ECS AI application inside one explicit CloudFormation stack:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-aws-stack-scan \
+  --stack-name NiSalesAgentStack \
+  --app-id anna-sales-agent \
+  --display-name Anna \
+  --region ap-south-1 \
+  --profile security-audit
+```
+
+This connector covers custom applications that invoke Bedrock directly and therefore do
+not appear in the managed Bedrock Agents or AgentCore APIs. It inventories only Lambda
+functions and ECS task definitions with allow-listed `*_MODEL_ID` configuration, their
+model identifiers, and their execution roles. It reads CloudFormation resource metadata,
+Lambda configuration, and ECS task definitions; it never invokes a workload, downloads
+code, reads secret values, or retains arbitrary environment variables. Grant only
+`sts:GetCallerIdentity`, `cloudformation:ListStackResources`, `cloudformation:GetTemplate`,
+`lambda:GetFunctionConfiguration`, and `ecs:DescribeTaskDefinition` for the bounded stack
+and compute resources. A denied detail read makes coverage partial and cannot withdraw
+previous inventory.
+
+Evaluate evidence-backed configuration controls for the same custom AI stack:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-aws-stack-posture \
+  --stack-name NiSalesAgentStack \
+  --region ap-south-1 \
+  --profile security-audit
+```
+
+The first posture slice evaluates only controls that AWS APIs can prove: effective
+inline and attached role policies for Bedrock model-family wildcards, Bedrock model
+invocation logging configuration, and retention on existing CloudWatch log groups for
+model-backed Lambda and ECS workloads. It does not invoke models, read logs, retrieve
+secrets, download code, or infer a failure from a denied API call. A complete scan is
+authoritative for this stack and resolves a prior finding when its failed condition is
+absent; a partial or failed scan cannot resolve anything.
+
+In addition to the inventory permissions above, grant
+`iam:ListRolePolicies`, `iam:GetRolePolicy`, `iam:ListAttachedRolePolicies`,
+`iam:GetPolicy`, `iam:GetPolicyVersion`,
+`bedrock:GetModelInvocationLoggingConfiguration`, and `logs:DescribeLogGroups`.
+The accepted control and evidence boundaries are documented in
+[`docs/architecture/0008-custom-aws-ai-posture.md`](docs/architecture/0008-custom-aws-ai-posture.md).
+
+Evaluate supported Bedrock Runtime call sites without executing repository code:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-repository-posture /path/to/repository
+```
+
+The initial TypeScript/JavaScript repository-posture check inspects literal AWS SDK
+command inputs and reports when they do not request an AWS managed guardrail. Dynamic
+objects and spreads are marked partial rather than treated as proof of absence. Evidence
+contains property names and source locations only—not code snippets, prompts, payload
+values, or secrets. See
+[`docs/architecture/0009-repository-ai-posture.md`](docs/architecture/0009-repository-ai-posture.md).
+
+Correlate those source-controlled deployment declarations with independently observed
+Lambda and ECS AI workloads:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-code-to-cloud /path/to/repository \
+  --name github.com/your-org/your-ai-application
+```
+
+Run the AWS stack inventory connector first. The code-to-cloud connector creates a
+`DEPLOYED_BY` edge only when a literal IaC deployment identifier and an observed
+CloudFormation logical ID agree. A shared model name or display name never creates a
+link. Ambiguous matches remain partial and create no edge. For supported CDK/esbuild
+artifacts, Denali then traces literal local-module imports from the declared bundle entry
+and separates findings included in that artifact from repository-only context. Inclusion
+does not claim that runtime execution reached the call. When an exact live S3 asset key or
+container image tag also appears in a local CDK asset manifest, Denali reports the artifact
+identity match separately. It does not convert that match into a Git-revision claim: absent
+independently verifiable revision metadata in the deployed artifact, the revision remains
+`unattested` (and a dirty checkout is always analysis context only). The trust boundaries are
+documented in
+[`docs/architecture/0010-evidence-led-code-to-cloud.md`](docs/architecture/0010-evidence-led-code-to-cloud.md)
+and
+[`docs/architecture/0011-static-artifact-inclusion.md`](docs/architecture/0011-static-artifact-inclusion.md),
+and
+[`docs/architecture/0012-deployment-artifact-provenance.md`](docs/architecture/0012-deployment-artifact-provenance.md).
+
 Import findings from a Prowler JSON-OCSF report—or another producer that emits an OCSF
 Findings class—with:
 
@@ -149,6 +240,58 @@ and state filtering plus evidence, affected-resource, compliance, remediation, a
 observation-history views. Run `denali-demo-seed` for three clearly labelled fixture
 findings, or import a real OCSF report to replace the demonstration data.
 
+Denali's vulnerability model is SBOM-first and scanner-neutral. Software components are
+durable inventory assets; vulnerabilities are deduplicated conditions with independent
+source observations. The API exposes `/v1/vulnerabilities`,
+`/v1/vulnerabilities/summary`, and `/v1/vulnerabilities/{id}`. Syft plus Grype is the
+native pipeline, while Trivy and Prowler remain first-class sources. The accepted design
+and trust boundaries are documented in
+[`docs/architecture/0006-sbom-first-vulnerability-model.md`](docs/architecture/0006-sbom-first-vulnerability-model.md).
+
+Generate the SBOM and vulnerability report with pinned scanner versions, then import
+both reports against the same explicit Denali target:
+
+```bash
+syft registry.example/agent@sha256:... -o json=agent.syft.json
+grype registry.example/agent@sha256:... -o json > agent.grype.json
+
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-syft-import agent.syft.json \
+  --target-kind ai_workload --target-key registry.example/agent@sha256:... \
+  --target-name agent-runtime
+
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-grype-import agent.grype.json \
+  --target-kind ai_workload --target-key registry.example/agent@sha256:...
+```
+
+The explicit target kind and key are a trust boundary: neither importer guesses durable
+asset identity from a scanner filename, image tag, or display name. Syft and Grype use
+the same target-and-package component identity, allowing vulnerability evidence to
+correlate with the retained SBOM. Scanner-reported filesystem locations are retained as
+evidence and do not multiply an installed package into separate components. Their native
+JSON metadata can contain manifests,
+configuration, package scripts, and secrets; Denali retains only bounded package,
+match, database, and provenance fields. Grype match confidence is visibly derived by
+Denali from the match type, and exploit status remains `unknown` until an explicit KEV
+or exploit-intelligence source supplies that evidence.
+
+Grype imports are additive by default. Use `--authoritative` only for a complete,
+unfiltered scan when absence should resolve prior observations for the same target and
+connection. Use `--partial` for truncated or otherwise incomplete scanner output; a
+partial or failed import can never resolve by absence.
+
+The Grype report's native source identity is stored separately from the explicit target.
+Code to cloud shows vulnerability results on a workload only when that scanner-reported
+artifact exactly matches the workload's currently observed image locator or digest. A
+mismatch is shown as refused correlation, and an unscanned workload is shown as not
+evaluated—neither state is rendered as zero vulnerabilities. A complete matched scan reports
+both vulnerable package occurrences and distinct vulnerability IDs; multiple packages or
+targets affected by one vulnerability can make the former larger than the latter. The complete
+correlation contract is
+documented in
+[`docs/architecture/0013-artifact-vulnerability-correlation.md`](docs/architecture/0013-artifact-vulnerability-correlation.md).
+
 Evaluate deterministic issues after collecting inventory and findings with:
 
 ```bash
@@ -171,6 +314,111 @@ DENALI_TEST_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
 
 The fast suite skips rather than disguises the Postgres integration tests when
 `DENALI_TEST_DSN` is absent.
+
+## Runtime activity imports
+
+Denali can ingest bounded exports from four AI runtime sources without treating an
+event as a detection or security issue:
+
+- AWS Bedrock CloudTrail events
+- Google Cloud Vertex AI audit-log entries
+- Google Workspace Gemini audit activity
+- Microsoft Entra AI-application sign-ins
+
+Import a JSON document with the provider-neutral activity importer:
+
+```bash
+denali-activity-import activity.json \
+  --format aws-bedrock-cloudtrail \
+  --connection-id aws:123456789012 \
+  --scope-key aws:123456789012:us-east-1 \
+  --dsn postgresql://denali:denali-local@127.0.0.1:55450/denali
+```
+
+The accepted format names are `aws-bedrock-cloudtrail`, `gcp-vertex-audit`,
+`google-workspace-gemini`, and `entra-ai-signin`. Imports preserve bounded raw evidence,
+actor and session context, outcome, and collection coverage. Entity references link to
+inventory only when an exact independently collected identifier already exists; an
+activity event never creates an asset or a graph edge.
+
+For live AWS accounts, Denali can collect Bedrock model-invocation metadata from the
+account's regional CloudTrail Event History. This does not require a configured trail,
+does not enable Bedrock model-invocation logging, and does not collect prompt or response
+content:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-aws-runtime --profile my-read-only-profile --region ap-south-1 \
+  --lookback-hours 24
+```
+
+The live connector declares coverage only for the Bedrock management operations it
+queries: `Converse`, `ConverseStream`, `InvokeModel`, and
+`InvokeModelWithResponseStream`. Bedrock Agent Runtime and other data events require a
+separate data-event source and are never implied by this collection.
+
+Vertex AI activity can be collected with Google Application Default Credentials:
+
+```bash
+gcloud auth application-default login
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-gcp-vertex-runtime --project-id my-test-project --lookback-hours 24
+```
+
+The Vertex connector reads matching Cloud Audit Log entries only. A complete query does
+not claim that the project's Data Access logging settings captured every possible
+invocation; that source-side boundary remains visible in the coverage detail.
+
+Microsoft Entra enterprise applications, OAuth permission topology, sign-ins, and
+application-management changes can be collected directly from Microsoft Graph:
+
+```bash
+export DENALI_ENTRA_TENANT_ID=00000000-0000-0000-0000-000000000000
+export DENALI_ENTRA_CLIENT_ID=00000000-0000-0000-0000-000000000000
+export DENALI_ENTRA_CLIENT_SECRET='replace-me'
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-entra-scan --lookback-hours 168
+```
+
+The app registration needs Microsoft Graph application permissions appropriate to the
+enabled planes: `Application.Read.All`, `DelegatedPermissionGrant.Read.All`,
+`AuditLog.Read.All`, and `Directory.Read.All`, with tenant admin consent. Each plane
+reports coverage independently. A conservative catalog match adds an enterprise app to
+the review inventory; it is not a security finding and does not assert how the vendor
+uses customer data. Denali retains identifiers, permission topology, outcomes, and
+bounded evidence, but not access tokens or sign-in IP addresses.
+
+## Runtime detections
+
+Evaluate deterministic runtime rules after collecting activity and inventory with:
+
+```bash
+DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali \
+  denali-evaluate-detections
+```
+
+The first rules deliberately cover two narrow Entra conditions:
+
+- three or more failed sign-ins by the same exact actor to the same exact AI
+  application within a sliding 24-hour window;
+- a successful consent or delegated-permission change for an active, unreviewed AI
+  application, raised to high severity when the independently collected application
+  inventory contains a high-impact delegated scope such as `Mail.ReadWrite`.
+
+Both rules require an exact link to an independently inventoried `ai_application`.
+Display-name similarity and unresolved activity references cannot create a detection.
+Every detection retains references to the activity observations and asset assertions
+that support it, along with the evaluation's coverage state. Re-evaluation is
+idempotent. These event-backed detections do not resolve merely because their source
+events age outside the query window; resolution requires explicit later lifecycle
+evidence or a human decision.
+
+The API exposes `/v1/detections`, `/v1/detections/summary`,
+`/v1/detections/evaluations`, and `/v1/detections/{id}`. The web UI keeps these
+detections separate from raw runtime activity and from composed graph issues.
+
+The complete evidence and lifecycle contract is documented in
+[`docs/architecture/0017-evidence-led-runtime-detections.md`](docs/architecture/0017-evidence-led-runtime-detections.md).
 
 ## Principles
 

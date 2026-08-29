@@ -71,8 +71,40 @@ class CorrelationSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class CorrelationRuntimeDetection:
+    id: str
+    rule_uid: str
+    title: str
+    severity: FindingSeverity
+    state: str
+    confidence: float
+    first_seen_at: datetime
+    last_seen_at: datetime
+    activity_ids: tuple[str, ...]
+    asset_ids: tuple[str, ...]
+    attributes: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.first_seen_at.tzinfo is None or self.last_seen_at.tzinfo is None:
+            raise ValueError("correlated detection timestamps must be timezone-aware")
+        object.__setattr__(self, "attributes", MappingProxyType(dict(self.attributes)))
+
+
+@dataclass(frozen=True, slots=True)
 class IssueFindingLink:
     finding_id: str
+    role: str
+
+
+@dataclass(frozen=True, slots=True)
+class IssueDetectionLink:
+    detection_id: str
+    role: str
+
+
+@dataclass(frozen=True, slots=True)
+class IssueActivityLink:
+    activity_id: str
     role: str
 
 
@@ -102,6 +134,8 @@ class IssueCandidate:
     findings: tuple[IssueFindingLink, ...]
     path_nodes: tuple[IssuePathNode, ...]
     path_edges: tuple[IssuePathEdge, ...]
+    detections: tuple[IssueDetectionLink, ...] = ()
+    activities: tuple[IssueActivityLink, ...] = ()
     attributes: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -111,6 +145,10 @@ class IssueCandidate:
             raise ValueError("issue confidence must be between zero and one")
         if len({item.finding_id for item in self.findings}) != len(self.findings):
             raise ValueError("an issue cannot repeat a contributing finding")
+        if len({item.detection_id for item in self.detections}) != len(self.detections):
+            raise ValueError("an issue cannot repeat a contributing detection")
+        if len({item.activity_id for item in self.activities}) != len(self.activities):
+            raise ValueError("an issue cannot repeat a contributing activity")
         if len({item.position for item in self.path_nodes}) != len(self.path_nodes):
             raise ValueError("issue path node positions must be unique")
         if len({item.position for item in self.path_edges}) != len(self.path_edges):

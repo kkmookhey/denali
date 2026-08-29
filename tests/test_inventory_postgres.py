@@ -10,25 +10,46 @@ import os
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
+from denali.connectors.code_to_cloud import CodeToCloudConnector, DeploymentTarget
 from denali.connectors.demo import demo_batch, demo_findings_batch
+from denali.connectors.repository_posture import RepositoryPostureConnector
 from denali.domain import (
+    ActivityBatch,
+    ActivityCategory,
+    ActivityCorrelation,
+    ActivityEntity,
+    ActivityEntityRole,
+    ActivityOutcome,
+    ActivityRecord,
     AffectedResource,
     AssertionType,
     AssetAssertion,
     AssetKind,
     AssetRef,
+    ComponentIdentity,
+    ComponentScope,
     Coverage,
     CoverageState,
     EvaluationResult,
     Evidence,
+    ExploitState,
     FindingAssertion,
     FindingBatch,
     FindingSeverity,
     FindingState,
     InventoryBatch,
+    RelationshipAssertion,
+    RelationshipKind,
+    SoftwareComponentAssertion,
+    VulnerabilityAssertion,
+    VulnerabilityBatch,
+    VulnerabilityFixState,
+    VulnerabilityMatchMethod,
+    VulnerabilityScanSubject,
 )
 from denali.store.db import migrate
 from denali.store.repository import PostgresInventoryRepository
@@ -123,12 +144,737 @@ def findings_batch(
     )
 
 
+def component_assertion(observed_at: datetime) -> SoftwareComponentAssertion:
+    return SoftwareComponentAssertion(
+        identity=ComponentIdentity(
+            target=AssetRef(AssetKind.AI_WORKLOAD, "fixture-workload"),
+            name="ray",
+            version="2.3.1",
+            ecosystem="python",
+            package_type="python",
+            purl="pkg:pypi/ray@2.3.1",
+            location="/usr/local/lib/python3.11/site-packages/ray",
+        ),
+        coverage_plane="software_components",
+        scope=ComponentScope.INSTALLED,
+        assertion_type=AssertionType.OBSERVED,
+        confidence=1.0,
+        evidence=Evidence("syft", "file:///syft.json#artifact=ray", observed_at),
+    )
+
+
+def vulnerability_batch(
+    *,
+    connector_id: str,
+    run_id: str,
+    observed_at: datetime,
+    vulnerabilities: tuple[VulnerabilityAssertion, ...],
+    state: CoverageState = CoverageState.COMPLETE,
+    authoritative: bool = False,
+) -> VulnerabilityBatch:
+    return VulnerabilityBatch(
+        connector_id=connector_id,
+        connection_id=f"{connector_id}-local",
+        run_id=run_id,
+        scope_key="fixture-workload",
+        collected_at=observed_at,
+        coverage=(Coverage("vulnerabilities", state, "fixture-workload"),),
+        vulnerabilities=vulnerabilities,
+        authoritative=authoritative,
+    )
+
+
+def vulnerability_assertion(
+    observed_at: datetime, *, source_uid: str, source: str
+) -> VulnerabilityAssertion:
+    component = component_assertion(observed_at)
+    return VulnerabilityAssertion(
+        source_uid=source_uid,
+        vulnerability_id="CVE-2023-6020",
+        aliases=("GHSA-fixture",),
+        component=component.identity.asset_ref,
+        target=component.identity.target,
+        title="Ray local file inclusion",
+        description="A vulnerable Ray version is installed.",
+        severity=FindingSeverity.CRITICAL,
+        state=FindingState.OPEN,
+        observed_at=observed_at,
+        evidence=Evidence(source, f"file:///{source}.json#match=0", observed_at),
+        match_method=VulnerabilityMatchMethod.EXACT_DIRECT,
+        match_confidence=1.0,
+        cvss_score=7.5,
+        fix_state=VulnerabilityFixState.FIXED,
+        fixed_versions=("2.8.1",),
+        exploit_state=ExploitState.PUBLIC_EXPLOIT,
+    )
+
+
+def software_inventory_batch(observed_at: datetime, *, run_id: str) -> InventoryBatch:
+    component = component_assertion(observed_at)
+    target = AssetAssertion(
+        asset=component.identity.target,
+        coverage_plane="software_components",
+        display_name="Fixture AI workload",
+        assertion_type=AssertionType.OBSERVED,
+        confidence=1.0,
+        evidence=Evidence("syft", "fixture://workload", observed_at),
+    )
+    return InventoryBatch(
+        connector_id="denali.syft",
+        connection_id="syft-local",
+        run_id=run_id,
+        scope_key="fixture-workload",
+        collected_at=observed_at,
+        coverage=(Coverage("software_components", CoverageState.COMPLETE, "fixture-workload"),),
+        assets=(target, component.asset_assertion()),
+        relationships=(component.containment_assertion(),),
+    )
+
+
 @pytest.fixture
 def repository():
     assert DSN
     migrate(DSN)
     tenant = str(uuid.uuid4())
     return tenant, PostgresInventoryRepository(DSN)
+
+
+def test_activity_can_be_filtered_by_correlated_asset(repository) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    first = AssetRef(AssetKind.AI_APPLICATION, "entra:tenant:application:first")
+    second = AssetRef(AssetKind.AI_APPLICATION, "entra:tenant:application:second")
+    repo.ingest(
+        tenant,
+        InventoryBatch(
+            connector_id="fixture",
+            connection_id="fixture-connection",
+            run_id="activity-assets",
+            scope_key="fixture-scope",
+            collected_at=now,
+            coverage=(Coverage("applications", CoverageState.COMPLETE, "fixture-scope"),),
+            assets=(
+                AssetAssertion(
+                    asset=first,
+                    coverage_plane="applications",
+                    display_name="First AI app",
+                    assertion_type=AssertionType.EXTERNALLY_VERIFIED,
+                    confidence=1.0,
+                    evidence=Evidence("fixture", "fixture://first", now),
+                ),
+                AssetAssertion(
+                    asset=second,
+                    coverage_plane="applications",
+                    display_name="Second AI app",
+                    assertion_type=AssertionType.EXTERNALLY_VERIFIED,
+                    confidence=1.0,
+                    evidence=Evidence("fixture", "fixture://second", now),
+                ),
+            ),
+        ),
+    )
+    activities = tuple(
+        ActivityRecord(
+            source_uid=f"sign-in-{index}",
+            category=ActivityCategory.AI_APP_SIGN_IN,
+            activity_name="entra.auditLogs.signIns",
+            title=f"User signed in to {label}",
+            occurred_at=now + timedelta(seconds=index),
+            observed_at=now,
+            outcome=ActivityOutcome.SUCCESS,
+            provider="Microsoft Entra",
+            evidence=Evidence("fixture", f"fixture://sign-in-{index}", now),
+            entities=(
+                ActivityEntity(
+                    role=ActivityEntityRole.APPLICATION,
+                    external_uid=asset.natural_key,
+                    display_name=label,
+                    asset=asset,
+                    correlation=ActivityCorrelation.EXACT_IDENTIFIER,
+                    confidence=1.0,
+                ),
+            ),
+        )
+        for index, (asset, label) in enumerate(((first, "First AI app"), (second, "Second AI app")))
+    )
+    repo.ingest_activity(
+        tenant,
+        ActivityBatch(
+            connector_id="fixture.activity",
+            connection_id="fixture-activity",
+            run_id="activity-run",
+            scope_key="fixture-scope",
+            collected_at=now,
+            coverage=(Coverage("activity", CoverageState.COMPLETE, "fixture-scope"),),
+            activities=activities,
+        ),
+    )
+
+    first_id = next(
+        row["id"] for row in repo.list_assets(tenant) if row["natural_key"] == first.natural_key
+    )
+    rows = repo.list_activity(tenant, asset_id=str(first_id))
+
+    assert [row["source_uid"] for row in rows] == ["sign-in-0"]
+
+    fixture_activity = replace(
+        activities[0],
+        source_uid="transparent-fixture-sign-in",
+        attributes={"fixture": True},
+    )
+    repo.ingest_activity(
+        tenant,
+        ActivityBatch(
+            connector_id="denali.demo",
+            connection_id="local-demo-runtime",
+            run_id="transparent-fixture-run",
+            scope_key="runtime-preview",
+            collected_at=now,
+            coverage=(Coverage("activity", CoverageState.COMPLETE, "runtime-preview"),),
+            activities=(fixture_activity,),
+        ),
+    )
+
+    assert {row["source_uid"] for row in repo.list_activity(tenant)} == {
+        "sign-in-0",
+        "sign-in-1",
+    }
+    assert {row["source_uid"] for row in repo.list_activity(tenant, include_fixtures=True)} == {
+        "sign-in-0",
+        "sign-in-1",
+        "transparent-fixture-sign-in",
+    }
+    assert repo.activity_summary(tenant) == {
+        "total": 2,
+        "last_24h": 2,
+        "providers": 1,
+        "failures": 0,
+        "fixture_total": 1,
+        "by_category": {"ai_app_sign_in": 2},
+    }
+    assert repo.activity_summary(tenant, include_fixtures=True)["total"] == 3
+
+
+def test_runtime_detections_are_evidence_linked_and_idempotent(repository) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    application = AssetRef(
+        AssetKind.AI_APPLICATION,
+        "entra:tenant:application:fireflies",
+    )
+    repo.ingest(
+        tenant,
+        InventoryBatch(
+            connector_id="denali.entra_ai",
+            connection_id="entra:tenant",
+            run_id="entra-inventory",
+            scope_key="entra:tenant:enterprise-applications",
+            collected_at=now,
+            coverage=(
+                Coverage(
+                    "entra_ai_application_inventory",
+                    CoverageState.COMPLETE,
+                    "entra:tenant:enterprise-applications",
+                ),
+            ),
+            assets=(
+                AssetAssertion(
+                    asset=application,
+                    coverage_plane="entra_ai_application_inventory",
+                    display_name="Fireflies.ai",
+                    assertion_type=AssertionType.EXTERNALLY_VERIFIED,
+                    confidence=1.0,
+                    evidence=Evidence("microsoft_graph", "graph://servicePrincipals/1", now),
+                    attributes={"delegated_scopes": ["User.Read", "Mail.ReadWrite"]},
+                ),
+            ),
+        ),
+    )
+
+    actor = ActivityEntity(
+        role=ActivityEntityRole.ACTOR,
+        external_uid="analyst@example.com",
+        display_name="analyst@example.com",
+    )
+    app_entity = ActivityEntity(
+        role=ActivityEntityRole.APPLICATION,
+        external_uid=application.natural_key,
+        display_name="Fireflies.ai",
+        asset=application,
+        correlation=ActivityCorrelation.EXACT_IDENTIFIER,
+        confidence=1.0,
+    )
+    failures = tuple(
+        ActivityRecord(
+            source_uid=f"failed-sign-in-{index}",
+            category=ActivityCategory.AI_APP_SIGN_IN,
+            activity_name="entra.auditLogs.signIns",
+            title="Fireflies.ai sign-in failed",
+            occurred_at=now + timedelta(hours=index),
+            observed_at=now,
+            outcome=ActivityOutcome.FAILURE,
+            provider="Microsoft Entra",
+            evidence=Evidence("microsoft_graph_signin", f"graph://signIns/{index}", now),
+            entities=(actor, app_entity),
+        )
+        for index in range(3)
+    )
+    consent = tuple(
+        ActivityRecord(
+            source_uid=f"consent-change-{index}",
+            category=ActivityCategory.ADMIN_CHANGE,
+            activity_name="entra.auditLogs.directoryAudits",
+            title="Consent changed for Fireflies.ai",
+            occurred_at=now + timedelta(hours=4, seconds=index),
+            observed_at=now,
+            outcome=ActivityOutcome.SUCCESS,
+            provider="Microsoft Entra",
+            evidence=Evidence(
+                "microsoft_graph_directory_audit",
+                f"graph://directoryAudits/{index}",
+                now,
+            ),
+            trace_uid="consent-correlation-1",
+            entities=(actor, app_entity),
+            attributes={"activity_operation": "Add delegated permission grant"},
+        )
+        for index in range(2)
+    )
+    repo.ingest_activity(
+        tenant,
+        ActivityBatch(
+            connector_id="denali.entra_ai",
+            connection_id="entra:tenant",
+            run_id="entra-activity",
+            scope_key="entra:tenant:activity",
+            collected_at=now,
+            coverage=(
+                Coverage("entra_ai_signins", CoverageState.COMPLETE, "entra:tenant:signins"),
+                Coverage(
+                    "entra_ai_directory_audits",
+                    CoverageState.COMPLETE,
+                    "entra:tenant:directory-audits",
+                ),
+            ),
+            activities=failures + consent,
+        ),
+    )
+
+    first = repo.evaluate_runtime_detections(tenant)
+    rows = repo.list_runtime_detections(tenant)
+    assert first["confirmed_detections"] == 2
+    assert len(rows) == 2
+    assert {row["severity"] for row in rows} == {"medium", "high"}
+    assert {row["activity_count"] for row in rows} == {2, 3}
+    assert {row["asset_count"] for row in rows} == {1}
+
+    consent_row = next(row for row in rows if row["severity"] == "high")
+    detail = repo.get_runtime_detection(tenant, str(consent_row["id"]))
+    assert detail is not None
+    assert len(detail["activities"]) == 2
+    assert detail["attributes"]["high_impact_scopes"] == ["Mail.ReadWrite"]
+    assert detail["assets"][0]["natural_key"] == application.natural_key
+
+    second = repo.evaluate_runtime_detections(tenant)
+    assert second["confirmed_detections"] == 2
+    assert [row["id"] for row in repo.list_runtime_detections(tenant)] == [
+        row["id"] for row in rows
+    ]
+    assert repo.runtime_detection_summary(tenant) == {
+        "total": 2,
+        "by_state": {"open": 2},
+        "open_by_severity": {"high": 1, "medium": 1},
+    }
+    evaluations = repo.latest_runtime_detection_evaluations(tenant)
+    assert {row["state"] for row in evaluations} == {"complete"}
+    assert {row["confirmed_detections"] for row in evaluations} == {1}
+
+
+def test_consent_then_use_issue_persists_exact_detection_and_activity_evidence(
+    repository,
+) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    application = AssetRef(
+        AssetKind.AI_APPLICATION,
+        "entra:tenant:application:claude-for-office",
+    )
+    repo.ingest(
+        tenant,
+        InventoryBatch(
+            connector_id="denali.entra_ai",
+            connection_id="entra:tenant",
+            run_id="entra-issue-inventory",
+            scope_key="entra:tenant:enterprise-applications",
+            collected_at=now,
+            coverage=(
+                Coverage(
+                    "entra_ai_application_inventory",
+                    CoverageState.COMPLETE,
+                    "entra:tenant:enterprise-applications",
+                ),
+            ),
+            assets=(
+                AssetAssertion(
+                    asset=application,
+                    coverage_plane="entra_ai_application_inventory",
+                    display_name="Claude for Office",
+                    assertion_type=AssertionType.EXTERNALLY_VERIFIED,
+                    confidence=1.0,
+                    evidence=Evidence(
+                        "microsoft_graph",
+                        "graph://servicePrincipals/claude-for-office",
+                        now,
+                    ),
+                    attributes={"delegated_scopes": ["Mail.ReadWrite"]},
+                ),
+            ),
+        ),
+    )
+
+    application_entity = ActivityEntity(
+        role=ActivityEntityRole.APPLICATION,
+        external_uid=application.natural_key,
+        display_name="Claude for Office",
+        asset=application,
+        correlation=ActivityCorrelation.EXACT_IDENTIFIER,
+        confidence=1.0,
+    )
+    consent_actor = ActivityEntity(
+        role=ActivityEntityRole.ACTOR,
+        external_uid="admin@example.com",
+        display_name="admin@example.com",
+    )
+    use_actor = ActivityEntity(
+        role=ActivityEntityRole.ACTOR,
+        external_uid="user@example.com",
+        display_name="user@example.com",
+    )
+    consent = ActivityRecord(
+        source_uid="claude-consent-change",
+        category=ActivityCategory.ADMIN_CHANGE,
+        activity_name="entra.auditLogs.directoryAudits",
+        title="Consent changed for Claude for Office",
+        occurred_at=now,
+        observed_at=now,
+        outcome=ActivityOutcome.SUCCESS,
+        provider="Microsoft Entra",
+        evidence=Evidence(
+            "microsoft_graph_directory_audit",
+            "graph://directoryAudits/claude-consent",
+            now,
+        ),
+        trace_uid="claude-consent-correlation",
+        entities=(consent_actor, application_entity),
+        attributes={"activity_operation": "Add delegated permission grant"},
+    )
+    later_sign_in = ActivityRecord(
+        source_uid="claude-sign-in-after-consent",
+        category=ActivityCategory.AI_APP_SIGN_IN,
+        activity_name="entra.auditLogs.signIns",
+        title="Claude for Office sign-in succeeded",
+        occurred_at=now + timedelta(hours=1),
+        observed_at=now + timedelta(hours=1),
+        outcome=ActivityOutcome.SUCCESS,
+        provider="Microsoft Entra",
+        evidence=Evidence(
+            "microsoft_graph_signin",
+            "graph://signIns/claude-after-consent",
+            now + timedelta(hours=1),
+        ),
+        entities=(use_actor, application_entity),
+    )
+    repo.ingest_activity(
+        tenant,
+        ActivityBatch(
+            connector_id="denali.entra_ai",
+            connection_id="entra:tenant",
+            run_id="entra-issue-activity",
+            scope_key="entra:tenant:activity",
+            collected_at=now + timedelta(hours=1),
+            coverage=(
+                Coverage("entra_ai_signins", CoverageState.COMPLETE, "entra:tenant:signins"),
+                Coverage(
+                    "entra_ai_directory_audits",
+                    CoverageState.COMPLETE,
+                    "entra:tenant:directory-audits",
+                ),
+            ),
+            activities=(consent, later_sign_in),
+        ),
+    )
+
+    assert repo.evaluate_runtime_detections(tenant)["confirmed_detections"] == 1
+    result = repo.evaluate_issues(tenant)
+    assert result["confirmed_issues"] == 1
+
+    rows = repo.list_issues(tenant)
+    assert len(rows) == 1
+    assert rows[0]["rule_uid"] == "DENALI-ISSUE-SHADOW-AI-CONSENT-USE-001"
+    assert rows[0]["detection_count"] == 1
+    assert rows[0]["activity_count"] == 1
+    assert rows[0]["asset_count"] == 1
+    assert rows[0]["finding_count"] == 0
+
+    detail = repo.get_issue(tenant, str(rows[0]["id"]))
+    assert detail is not None
+    assert detail["path_edges"] == []
+    assert detail["detections"][0]["role"] == "high_impact_consent"
+    assert detail["activities"][0]["role"] == "subsequent_successful_sign_in"
+    assert detail["activities"][0]["actors"][0]["display_name"] == "user@example.com"
+    assert detail["attributes"]["high_impact_scopes"] == ["Mail.ReadWrite"]
+
+
+def test_code_to_cloud_query_preserves_proven_runtime_context(repository, tmp_path: Path) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    workload = AssetRef(
+        AssetKind.AI_WORKLOAD,
+        "arn:aws:lambda:ap-south-1:123456789012:function:anna-agent",
+    )
+    model = AssetRef(AssetKind.AI_MODEL, "aws:bedrock:model:claude")
+    identity = AssetRef(
+        AssetKind.IDENTITY,
+        "arn:aws:iam::123456789012:role/anna-agent-role",
+    )
+    evidence = Evidence("aws_control_plane", "aws://fixture/anna-agent", now)
+    observed = InventoryBatch(
+        connector_id="denali.aws_stack",
+        connection_id="aws:123456789012",
+        run_id="aws-run",
+        scope_key="aws:123456789012:stack:Anna",
+        collected_at=now,
+        coverage=(
+            Coverage("aws_stack_inventory", CoverageState.COMPLETE, "stack:Anna"),
+            Coverage("aws_stack_relationships", CoverageState.COMPLETE, "stack:Anna"),
+        ),
+        assets=(
+            AssetAssertion(
+                asset=workload,
+                coverage_plane="aws_stack_inventory",
+                display_name="anna-agent",
+                assertion_type=AssertionType.OBSERVED,
+                confidence=1.0,
+                evidence=evidence,
+                attributes={
+                    "service": "lambda",
+                    "logical_id": "AgentFnC1FD126F",
+                    "account_id": "123456789012",
+                    "region": "ap-south-1",
+                    "deployment_artifact": {
+                        "kind": "container_image",
+                        "image": "registry.example/anna@sha256:fixture",
+                    },
+                },
+            ),
+            AssetAssertion(
+                asset=model,
+                coverage_plane="aws_stack_inventory",
+                display_name="Claude",
+                assertion_type=AssertionType.OBSERVED,
+                confidence=1.0,
+                evidence=evidence,
+            ),
+            AssetAssertion(
+                asset=identity,
+                coverage_plane="aws_stack_inventory",
+                display_name="anna-agent-role",
+                assertion_type=AssertionType.OBSERVED,
+                confidence=1.0,
+                evidence=evidence,
+            ),
+        ),
+        relationships=(
+            RelationshipAssertion(
+                source=workload,
+                target=model,
+                coverage_plane="aws_stack_relationships",
+                kind=RelationshipKind.USES,
+                assertion_type=AssertionType.OBSERVED,
+                confidence=1.0,
+                evidence=evidence,
+            ),
+            RelationshipAssertion(
+                source=workload,
+                target=identity,
+                coverage_plane="aws_stack_relationships",
+                kind=RelationshipKind.RUNS_AS,
+                assertion_type=AssertionType.OBSERVED,
+                confidence=1.0,
+                evidence=evidence,
+            ),
+        ),
+    )
+    repo.ingest(tenant, observed)
+    targets = tuple(DeploymentTarget(**item) for item in repo.deployment_targets(tenant))
+    assert [item.natural_key for item in targets] == [workload.natural_key]
+
+    (tmp_path / "stack.ts").write_text(
+        """
+new nodejs.NodejsFunction(this, 'AgentFn', {
+  functionName: 'anna-agent',
+  entry: 'src/handler.ts',
+});
+"""
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "handler.ts").write_text(
+        "import { ConverseCommand } from '@aws-sdk/client-bedrock-runtime';\n"
+        "new ConverseCommand({ modelId: 'model' });\n"
+    )
+    (tmp_path / "src" / "other.ts").write_text(
+        "import { InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';\n"
+        "new InvokeModelCommand({ modelId: 'other' });\n"
+    )
+    posture = RepositoryPostureConnector(
+        tmp_path,
+        repository_name="github.com/example/anna",
+    ).collect()
+    repo.ingest_findings(tenant, posture)
+    correlated = CodeToCloudConnector(
+        tmp_path,
+        targets=targets,
+        repository_name="github.com/example/anna",
+    ).collect()
+    repo.ingest(tenant, correlated)
+
+    scan_time = now + timedelta(minutes=1)
+    component = SoftwareComponentAssertion(
+        identity=ComponentIdentity(
+            target=workload,
+            name="boto3",
+            version="1.34.0",
+            ecosystem="python",
+            package_type="python",
+            purl="pkg:pypi/boto3@1.34.0",
+            location="/var/task/boto3",
+        ),
+        coverage_plane="software_components",
+        scope=ComponentScope.INSTALLED,
+        assertion_type=AssertionType.OBSERVED,
+        confidence=1.0,
+        evidence=Evidence("syft", "file:///anna.syft.json#artifact=0", scan_time),
+    )
+    scan_scope = workload.canonical_key
+    repo.ingest(
+        tenant,
+        InventoryBatch(
+            connector_id="denali.syft",
+            connection_id=f"syft:{scan_scope}",
+            run_id="syft-anna-1",
+            scope_key=scan_scope,
+            collected_at=scan_time,
+            coverage=(Coverage("software_components", CoverageState.COMPLETE, scan_scope),),
+            assets=(component.asset_assertion(),),
+            relationships=(component.containment_assertion(),),
+        ),
+    )
+    vulnerability = VulnerabilityAssertion(
+        source_uid="grype:CVE-2026-0001:boto3",
+        vulnerability_id="CVE-2026-0001",
+        component=component.identity.asset_ref,
+        target=workload,
+        title="Fixture boto3 vulnerability",
+        severity=FindingSeverity.HIGH,
+        state=FindingState.OPEN,
+        observed_at=scan_time,
+        evidence=Evidence("grype", "file:///anna.grype.json#match=0", scan_time),
+        match_method=VulnerabilityMatchMethod.EXACT_DIRECT,
+        match_confidence=1.0,
+        cvss_score=8.1,
+        fix_state=VulnerabilityFixState.FIXED,
+        fixed_versions=("1.34.1",),
+    )
+    repo.ingest_vulnerabilities(
+        tenant,
+        VulnerabilityBatch(
+            connector_id="denali.grype",
+            connection_id=f"grype:{scan_scope}",
+            run_id="grype-anna-1",
+            scope_key=scan_scope,
+            collected_at=scan_time,
+            coverage=(Coverage("vulnerabilities", CoverageState.COMPLETE, scan_scope),),
+            vulnerabilities=(vulnerability,),
+            scan_subject=VulnerabilityScanSubject(
+                target=workload,
+                artifact_kind="container_image",
+                artifact_locator="registry.example/anna@sha256:fixture",
+                evidence=Evidence(
+                    "grype_scan_subject",
+                    "file:///anna.grype.json#source",
+                    scan_time,
+                ),
+            ),
+            authoritative=True,
+        ),
+    )
+
+    deployments = repo.code_to_cloud_deployments(tenant)
+
+    assert len(deployments) == 1
+    assert deployments[0]["repository_natural_key"] == "github.com/example/anna"
+    assert deployments[0]["workload_natural_key"] == workload.natural_key
+    assert deployments[0]["models"][0]["natural_key"] == model.natural_key
+    assert deployments[0]["identity"]["natural_key"] == identity.natural_key
+    assert [item["applicability"] for item in deployments[0]["code_findings"]] == [
+        "artifact_included",
+        "repository_only",
+    ]
+    included = deployments[0]["code_findings"][0]
+    assert included["source_path"] == "src/handler.ts"
+    assert included["import_chain"] == ["src/handler.ts"]
+    assert deployments[0]["vulnerability_coverage"]["state"] == "complete"
+    assert deployments[0]["vulnerability_coverage"]["artifact_identity_status"] == "matched"
+    assert deployments[0]["vulnerability_coverage"]["artifact_identity_method"] == "exact_locator"
+    assert deployments[0]["artifact_vulnerability_count"] == 1
+    assert deployments[0]["artifact_vulnerability_id_count"] == 1
+    assert len(deployments[0]["artifact_vulnerabilities"]) == 1
+    artifact_vulnerability = deployments[0]["artifact_vulnerabilities"][0]
+    assert artifact_vulnerability["vulnerability_id"] == "CVE-2026-0001"
+    assert artifact_vulnerability["component_name"] == "boto3 1.34.0"
+    assert artifact_vulnerability["component_purl"] == "pkg:pypi/boto3@1.34.0"
+    assert artifact_vulnerability["source_count"] == 1
+
+    mismatch_time = scan_time + timedelta(minutes=1)
+    repo.ingest_vulnerabilities(
+        tenant,
+        VulnerabilityBatch(
+            connector_id="denali.grype",
+            connection_id=f"grype:{scan_scope}",
+            run_id="grype-anna-mismatched",
+            scope_key=scan_scope,
+            collected_at=mismatch_time,
+            coverage=(Coverage("vulnerabilities", CoverageState.PARTIAL, scan_scope),),
+            vulnerabilities=(
+                replace(
+                    vulnerability,
+                    observed_at=mismatch_time,
+                    evidence=Evidence(
+                        "grype",
+                        "file:///other.grype.json#match=0",
+                        mismatch_time,
+                    ),
+                ),
+            ),
+            scan_subject=VulnerabilityScanSubject(
+                target=workload,
+                artifact_kind="container_image",
+                artifact_locator="registry.example/other@sha256:not-deployed",
+                evidence=Evidence(
+                    "grype_scan_subject",
+                    "file:///other.grype.json#source",
+                    mismatch_time,
+                ),
+            ),
+        ),
+    )
+
+    mismatched = repo.code_to_cloud_deployments(tenant)[0]
+    assert mismatched["vulnerability_coverage"]["state"] == "partial"
+    assert mismatched["vulnerability_coverage"]["artifact_identity_status"] == "not_matched"
+    assert mismatched["artifact_vulnerability_count"] == 0
+    assert mismatched["artifact_vulnerability_id_count"] == 0
+    assert mismatched["artifact_vulnerabilities"] == []
 
 
 def test_complete_empty_snapshot_withdraws_but_partial_does_not(repository) -> None:
@@ -318,7 +1064,222 @@ def test_pass_without_a_prior_failure_does_not_create_finding_noise(repository) 
     )
 
     assert result == {"findings": 0, "resolved_missing": 0}
+
+
+def test_vulnerability_sources_deduplicate_and_resolve_independently(repository) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    repo.ingest(tenant, software_inventory_batch(now, run_id="syft-run-1"))
+
+    grype = vulnerability_assertion(now, source_uid="grype:CVE-2023-6020:ray", source="grype")
+    repo.ingest_vulnerabilities(
+        tenant,
+        vulnerability_batch(
+            connector_id="denali.grype",
+            run_id="grype-run-1",
+            observed_at=now,
+            vulnerabilities=(grype,),
+        ),
+    )
+    later = now + timedelta(minutes=1)
+    trivy = replace(
+        grype,
+        source_uid="trivy:CVE-2023-6020:ray",
+        observed_at=later,
+        evidence=Evidence("trivy", "file:///trivy.json#match=0", later),
+        match_method=VulnerabilityMatchMethod.ECOSYSTEM,
+        match_confidence=0.95,
+    )
+    repo.ingest_vulnerabilities(
+        tenant,
+        vulnerability_batch(
+            connector_id="denali.trivy",
+            run_id="trivy-run-1",
+            observed_at=later,
+            vulnerabilities=(trivy,),
+        ),
+    )
+
+    rows = repo.list_vulnerabilities(tenant)
+    assert len(rows) == 1
+    assert rows[0]["source_count"] == 2
+    assert rows[0]["component_correlated"] is True
+    assert rows[0]["target_correlated"] is True
+    detail = repo.get_vulnerability(tenant, str(rows[0]["id"]))
+    assert detail is not None
+    assert {row["connector_id"] for row in detail["observations"]} == {
+        "denali.grype",
+        "denali.trivy",
+    }
+
+    grype_empty_at = later + timedelta(minutes=1)
+    repo.ingest_vulnerabilities(
+        tenant,
+        vulnerability_batch(
+            connector_id="denali.grype",
+            run_id="grype-run-2",
+            observed_at=grype_empty_at,
+            vulnerabilities=(),
+            authoritative=True,
+        ),
+    )
+    assert repo.list_vulnerabilities(tenant)[0]["state"] == "open"
+    assert repo.list_vulnerabilities(tenant)[0]["source_count"] == 1
+
+    trivy_empty_at = grype_empty_at + timedelta(minutes=1)
+    result = repo.ingest_vulnerabilities(
+        tenant,
+        vulnerability_batch(
+            connector_id="denali.trivy",
+            run_id="trivy-run-2",
+            observed_at=trivy_empty_at,
+            vulnerabilities=(),
+            authoritative=True,
+        ),
+    )
+    assert result["resolved_missing"] == 1
+    assert repo.list_vulnerabilities(tenant)[0]["state"] == "resolved"
+
+
+def test_vulnerability_references_correlate_when_inventory_arrives_later(repository) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    item = vulnerability_assertion(now, source_uid="grype:CVE-2023-6020:ray", source="grype")
+    repo.ingest_vulnerabilities(
+        tenant,
+        vulnerability_batch(
+            connector_id="denali.grype",
+            run_id="grype-first",
+            observed_at=now,
+            vulnerabilities=(item,),
+        ),
+    )
+    before = repo.list_vulnerabilities(tenant)[0]
+    assert before["component_correlated"] is False
+    assert before["target_correlated"] is False
+
+    repo.ingest(
+        tenant,
+        software_inventory_batch(now + timedelta(minutes=1), run_id="syft-later"),
+    )
+    after = repo.list_vulnerabilities(tenant)[0]
+    assert after["component_correlated"] is True
+    assert after["target_correlated"] is True
     assert repo.finding_summary(tenant)["total"] == 0
+
+
+def test_vulnerability_component_correlates_across_bounded_purl_qualifier_drift(
+    repository,
+) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    target = AssetRef(AssetKind.AI_WORKLOAD, "fixture-debian-workload")
+    syft_component = SoftwareComponentAssertion(
+        identity=ComponentIdentity(
+            target=target,
+            name="perl-base",
+            version="5.36.0-7+deb12u3",
+            ecosystem="deb",
+            package_type="deb",
+            purl=(
+                "pkg:deb/debian/perl-base@5.36.0-7%2Bdeb12u3"
+                "?arch=amd64&distro=debian-12&upstream=perl"
+            ),
+            location="/var/lib/dpkg/status",
+        ),
+        coverage_plane="software_components",
+        scope=ComponentScope.INSTALLED,
+        assertion_type=AssertionType.OBSERVED,
+        confidence=1.0,
+        evidence=Evidence("syft", "file:///syft.json#artifact=perl-base", now),
+        attributes={"syft": {"artifact_ids": ["artifact-perl-base"]}},
+    )
+    repo.ingest(
+        tenant,
+        InventoryBatch(
+            connector_id="denali.syft",
+            connection_id="syft-debian",
+            run_id="syft-debian-1",
+            scope_key=target.canonical_key,
+            collected_at=now,
+            coverage=(
+                Coverage(
+                    "software_components",
+                    CoverageState.COMPLETE,
+                    target.canonical_key,
+                ),
+            ),
+            assets=(syft_component.asset_assertion(),),
+            relationships=(syft_component.containment_assertion(),),
+        ),
+    )
+
+    grype_identity = ComponentIdentity(
+        target=target,
+        name="perl-base",
+        version="5.36.0-7+deb12u3",
+        ecosystem="deb",
+        package_type="deb",
+        purl=(
+            "pkg:deb/debian/perl-base@5.36.0-7%2Bdeb12u3"
+            "?arch=amd64&distro=debian-12.15&upstream=perl"
+        ),
+        location="/var/lib/dpkg/status",
+    )
+    vulnerability = VulnerabilityAssertion(
+        source_uid="grype:CVE-2026-12087:perl-base",
+        vulnerability_id="CVE-2026-12087",
+        component=grype_identity.asset_ref,
+        target=target,
+        title="Perl Socket out-of-bounds heap read",
+        severity=FindingSeverity.CRITICAL,
+        state=FindingState.OPEN,
+        observed_at=now,
+        evidence=Evidence(
+            "grype_json",
+            "file:///grype.json#match=0",
+            now,
+            payload={
+                "artifact_id": "artifact-perl-base",
+                "location": "/var/lib/dpkg/status",
+            },
+        ),
+        match_method=VulnerabilityMatchMethod.EXACT_INDIRECT,
+        match_confidence=0.95,
+        attributes={
+            "component": {
+                "artifact_id": "artifact-perl-base",
+                "name": "perl-base",
+                "version": "5.36.0-7+deb12u3",
+                "ecosystem": "deb",
+                "package_type": "deb",
+                "purl": grype_identity.purl,
+                "location": "/var/lib/dpkg/status",
+            }
+        },
+    )
+    repo.ingest_vulnerabilities(
+        tenant,
+        vulnerability_batch(
+            connector_id="denali.grype",
+            run_id="grype-debian-1",
+            observed_at=now,
+            vulnerabilities=(vulnerability,),
+        ),
+    )
+
+    row = repo.list_vulnerabilities(tenant)[0]
+    assert row["component_correlated"] is True
+    assert row["component_name"] == "perl-base 5.36.0-7+deb12u3"
+    assert row["component_natural_key"] == grype_identity.natural_key
+    detail = repo.get_vulnerability(tenant, str(row["id"]))
+    assert detail is not None
+    component_asset = next(
+        item
+        for item in repo.list_assets(tenant, kind="software_component")
+        if item["natural_key"] == syft_component.identity.natural_key
+    )
+    assert detail["component"]["asset_id"] == component_asset["id"]
 
 
 def test_reobservation_time_does_not_look_like_a_semantic_finding_change(repository) -> None:

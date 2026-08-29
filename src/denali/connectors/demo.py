@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from denali.domain import (
+    ActivityBatch,
+    ActivityCategory,
+    ActivityCorrelation,
+    ActivityEntity,
+    ActivityEntityRole,
+    ActivityOutcome,
+    ActivityRecord,
     AffectedResource,
     AssertionType,
     AssetAssertion,
     AssetKind,
     AssetRef,
+    ComponentIdentity,
+    ComponentScope,
     ConnectorCapabilities,
     Coverage,
     CoverageState,
     EvaluationResult,
     Evidence,
+    ExploitState,
     FindingAssertion,
     FindingBatch,
     FindingSeverity,
@@ -23,12 +33,19 @@ from denali.domain import (
     InventoryBatch,
     RelationshipAssertion,
     RelationshipKind,
+    SoftwareComponentAssertion,
+    VulnerabilityAssertion,
+    VulnerabilityBatch,
+    VulnerabilityFixState,
+    VulnerabilityMatchMethod,
 )
 from denali.store.db import migrate
 from denali.store.repository import PostgresInventoryRepository
 
 CONNECTOR_ID = "denali.demo"
-CAPABILITIES = ConnectorCapabilities(findings=True, inventory=True, relationships=True)
+CAPABILITIES = ConnectorCapabilities(
+    findings=True, inventory=True, relationships=True, activity=True
+)
 DEFAULT_TENANT = "00000000-0000-4000-8000-000000000001"
 
 
@@ -266,6 +283,376 @@ def demo_findings_batch(at: datetime | None = None) -> FindingBatch:
     )
 
 
+def demo_software_batch(at: datetime | None = None) -> InventoryBatch:
+    observed_at = at or datetime.now(UTC)
+    target = AssetRef(AssetKind.AI_WORKLOAD, "demo:eiger-api")
+    specs = (
+        (
+            "denali-demo-model-server",
+            "1.8.2",
+            "pkg:pypi/denali-demo-model-server@1.8.2",
+            "/app/site-packages/denali_demo_model_server",
+        ),
+        (
+            "denali-demo-mcp-runtime",
+            "1.6.0",
+            "pkg:pypi/denali-demo-mcp-runtime@1.6.0",
+            "/app/site-packages/denali_demo_mcp_runtime",
+        ),
+        (
+            "denali-demo-vector-client",
+            "0.9.4",
+            "pkg:npm/denali-demo-vector-client@0.9.4",
+            "/app/node_modules/denali-demo-vector-client",
+        ),
+    )
+    components = tuple(
+        SoftwareComponentAssertion(
+            identity=ComponentIdentity(
+                target=target,
+                name=name,
+                version=version,
+                ecosystem="python" if purl.startswith("pkg:pypi") else "javascript",
+                package_type="python" if purl.startswith("pkg:pypi") else "npm",
+                purl=purl,
+                location=location,
+            ),
+            coverage_plane="software_components",
+            scope=ComponentScope.INSTALLED,
+            assertion_type=AssertionType.OBSERVED,
+            confidence=1.0,
+            evidence=Evidence(
+                "denali_demo_fixture",
+                f"fixture://vulnerability-preview/syft/{name}",
+                observed_at,
+                {"fixture": True, "scanner": "Syft", "artifact_id": f"demo-{name}"},
+            ),
+            licenses=("Apache-2.0",),
+            attributes={
+                "fixture": True,
+                "syft": {"tool_version": "1.42.3-demo", "artifact_ids": [f"demo-{name}"]},
+            },
+        )
+        for name, version, purl, location in specs
+    )
+    target_assertion = AssetAssertion(
+        asset=target,
+        coverage_plane="software_components",
+        display_name="Eiger API",
+        assertion_type=AssertionType.OBSERVED,
+        confidence=1.0,
+        evidence=Evidence(
+            "denali_demo_fixture",
+            "fixture://vulnerability-preview/syft/source",
+            observed_at,
+            {"fixture": True, "scanner": "Syft", "source_type": "image"},
+        ),
+        attributes={"fixture": True, "software_inventory": {"source": "Syft"}},
+    )
+    return InventoryBatch(
+        connector_id="denali.demo.syft",
+        connection_id="local-demo-syft",
+        run_id=f"demo-syft-{observed_at.isoformat()}",
+        scope_key="vulnerability-preview",
+        collected_at=observed_at,
+        coverage=(
+            Coverage(
+                "software_components",
+                CoverageState.COMPLETE,
+                "vulnerability-preview",
+            ),
+        ),
+        assets=(target_assertion, *(item.asset_assertion() for item in components)),
+        relationships=tuple(item.containment_assertion() for item in components),
+    )
+
+
+def demo_vulnerability_batch(at: datetime | None = None) -> VulnerabilityBatch:
+    observed_at = at or datetime.now(UTC)
+    target = AssetRef(AssetKind.AI_WORKLOAD, "demo:eiger-api")
+    component_specs = (
+        (
+            "denali-demo-model-server",
+            "1.8.2",
+            "pkg:pypi/denali-demo-model-server@1.8.2",
+            "/app/site-packages/denali_demo_model_server",
+            "DEMO-2026-0001",
+            "Unsafe model artifact deserialization in demo serving runtime",
+            FindingSeverity.CRITICAL,
+            9.8,
+            VulnerabilityFixState.FIXED,
+            ("1.8.5",),
+            ExploitState.PUBLIC_EXPLOIT,
+            VulnerabilityMatchMethod.EXACT_DIRECT,
+            1.0,
+        ),
+        (
+            "denali-demo-mcp-runtime",
+            "1.6.0",
+            "pkg:pypi/denali-demo-mcp-runtime@1.6.0",
+            "/app/site-packages/denali_demo_mcp_runtime",
+            "DEMO-2026-0002",
+            "Authentication bypass in demo MCP transport",
+            FindingSeverity.HIGH,
+            8.1,
+            VulnerabilityFixState.FIXED,
+            ("1.8.0",),
+            ExploitState.UNKNOWN,
+            VulnerabilityMatchMethod.EXACT_DIRECT,
+            1.0,
+        ),
+        (
+            "denali-demo-vector-client",
+            "0.9.4",
+            "pkg:npm/denali-demo-vector-client@0.9.4",
+            "/app/node_modules/denali-demo-vector-client",
+            "DEMO-2026-0003",
+            "Unbounded response parsing in demo vector client",
+            FindingSeverity.MEDIUM,
+            5.9,
+            VulnerabilityFixState.NOT_FIXED,
+            (),
+            ExploitState.UNKNOWN,
+            VulnerabilityMatchMethod.CPE,
+            0.6,
+        ),
+    )
+    vulnerabilities = []
+    for (
+        name,
+        version,
+        purl,
+        location,
+        vulnerability_id,
+        title,
+        severity,
+        cvss_score,
+        fix_state,
+        fixed_versions,
+        exploit_state,
+        match_method,
+        match_confidence,
+    ) in component_specs:
+        component = ComponentIdentity(
+            target=target,
+            name=name,
+            version=version,
+            ecosystem="python" if purl.startswith("pkg:pypi") else "javascript",
+            package_type="python" if purl.startswith("pkg:pypi") else "npm",
+            purl=purl,
+            location=location,
+        )
+        evidence = Evidence(
+            "denali_demo_fixture",
+            f"fixture://vulnerability-preview/grype/{vulnerability_id}",
+            observed_at,
+            {
+                "fixture": True,
+                "scanner": "Grype",
+                "match_type": match_method.value,
+                "artifact": name,
+            },
+        )
+        vulnerabilities.append(
+            VulnerabilityAssertion(
+                source_uid=f"demo-grype:{vulnerability_id}:{component.natural_key}",
+                vulnerability_id=vulnerability_id,
+                component=component.asset_ref,
+                target=target,
+                title=title,
+                description=(
+                    f"Transparent fixture: Grype matched {name} {version} in the Eiger "
+                    "API image. This synthetic record exists only for product review."
+                ),
+                severity=severity,
+                state=FindingState.OPEN,
+                observed_at=observed_at,
+                evidence=evidence,
+                match_method=match_method,
+                match_confidence=match_confidence,
+                cvss_score=cvss_score,
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                fix_state=fix_state,
+                fixed_versions=fixed_versions,
+                exploit_state=exploit_state,
+                database_version="6.1.9-demo",
+                database_built_at=observed_at,
+                attributes={
+                    "fixture": True,
+                    "grype": {
+                        "match_confidence_basis": "denali_derived_from_match_type",
+                        "tool_version": "0.116.1-demo",
+                    },
+                },
+            )
+        )
+    return VulnerabilityBatch(
+        connector_id="denali.demo.grype",
+        connection_id="local-demo-grype",
+        run_id=f"demo-grype-{observed_at.isoformat()}",
+        scope_key="vulnerability-preview",
+        collected_at=observed_at,
+        coverage=(Coverage("vulnerabilities", CoverageState.COMPLETE, "vulnerability-preview"),),
+        vulnerabilities=tuple(vulnerabilities),
+        authoritative=True,
+    )
+
+
+def demo_activity_batch(at: datetime | None = None) -> ActivityBatch:
+    observed_at = at or datetime.now(UTC)
+    refs = {
+        "actor": AssetRef(AssetKind.IDENTITY, "demo:customer-agent-role"),
+        "agent": AssetRef(AssetKind.AI_AGENT, "demo:customer-support-agent"),
+        "model": AssetRef(AssetKind.AI_MODEL, "demo:anthropic.claude-3-5-sonnet"),
+        "tool": AssetRef(AssetKind.AI_TOOL, "demo:mcp:update-customer"),
+        "workload": AssetRef(AssetKind.AI_WORKLOAD, "demo:eiger-api"),
+    }
+
+    def linked(role: ActivityEntityRole, key: str, name: str) -> ActivityEntity:
+        return ActivityEntity(
+            role=role,
+            external_uid=refs[key].natural_key,
+            display_name=name,
+            asset=refs[key],
+            correlation=ActivityCorrelation.EXACT_IDENTIFIER,
+            confidence=1.0,
+        )
+
+    fixture_events = (
+        (
+            "demo-runtime-bedrock-converse",
+            ActivityCategory.MODEL_INVOCATION,
+            "aws.bedrock.Converse",
+            "Customer Support Agent invoked Claude 3.5 Sonnet",
+            ActivityOutcome.SUCCESS,
+            "aws_bedrock",
+            (
+                linked(ActivityEntityRole.ACTOR, "actor", "Customer Agent Role"),
+                linked(ActivityEntityRole.AGENT, "agent", "Customer Support Agent"),
+                linked(ActivityEntityRole.MODEL, "model", "Claude 3.5 Sonnet"),
+                linked(ActivityEntityRole.WORKLOAD, "workload", "Eiger API"),
+            ),
+        ),
+        (
+            "demo-runtime-tool-update",
+            ActivityCategory.TOOL_INVOCATION,
+            "mcp.tools.call",
+            "Customer Support Agent called Update Customer",
+            ActivityOutcome.SUCCESS,
+            "mcp",
+            (
+                linked(ActivityEntityRole.ACTOR, "actor", "Customer Agent Role"),
+                linked(ActivityEntityRole.AGENT, "agent", "Customer Support Agent"),
+                linked(ActivityEntityRole.TOOL, "tool", "Update Customer"),
+            ),
+        ),
+        (
+            "demo-runtime-bedrock-denied",
+            ActivityCategory.MODEL_INVOCATION,
+            "aws.bedrock.InvokeModel",
+            "Bedrock model invocation was denied",
+            ActivityOutcome.FAILURE,
+            "aws_bedrock",
+            (
+                linked(ActivityEntityRole.ACTOR, "actor", "Customer Agent Role"),
+                linked(ActivityEntityRole.MODEL, "model", "Claude 3.5 Sonnet"),
+            ),
+        ),
+    )
+    activities = [
+        ActivityRecord(
+            source_uid=uid,
+            category=category,
+            activity_name=name,
+            title=title,
+            occurred_at=observed_at - timedelta(minutes=(index + 1) * 7),
+            observed_at=observed_at,
+            outcome=outcome,
+            provider=provider,
+            account_uid="123456789012" if provider == "aws_bedrock" else None,
+            region="us-east-1" if provider == "aws_bedrock" else None,
+            session_uid="demo-session-001",
+            trace_uid=f"demo-trace-{index + 1:03d}",
+            entities=entities,
+            evidence=Evidence(
+                "denali_demo_fixture",
+                f"fixture://runtime-activity/{uid}",
+                observed_at,
+                {"fixture": True, "scenario": "runtime-activity", "event_name": name},
+            ),
+            attributes={"fixture": True},
+        )
+        for index, (uid, category, name, title, outcome, provider, entities) in enumerate(
+            fixture_events
+        )
+    ]
+    for index, (uid, provider, title, actor, app) in enumerate(
+        (
+            (
+                "demo-runtime-vertex",
+                "gcp_vertex_ai",
+                "Vertex AI prediction completed",
+                "analyst@example.com",
+                "projects/demo/locations/us-central1/endpoints/42",
+            ),
+            (
+                "demo-runtime-workspace",
+                "google_workspace_gemini",
+                "Gemini assisted content generation",
+                "seller@example.com",
+                "gemini_in_workspace_apps",
+            ),
+            (
+                "demo-runtime-entra",
+                "microsoft_entra",
+                "Sign-in to Microsoft Copilot",
+                "founder@example.com",
+                "Microsoft Copilot",
+            ),
+        ),
+        start=4,
+    ):
+        category = (
+            ActivityCategory.MODEL_INVOCATION
+            if provider == "gcp_vertex_ai"
+            else ActivityCategory.AI_APP_SIGN_IN
+            if provider == "microsoft_entra"
+            else ActivityCategory.OTHER
+        )
+        activities.append(
+            ActivityRecord(
+                source_uid=uid,
+                category=category,
+                activity_name=f"{provider}.demo",
+                title=title,
+                occurred_at=observed_at - timedelta(minutes=index * 11),
+                observed_at=observed_at,
+                outcome=ActivityOutcome.SUCCESS,
+                provider=provider,
+                entities=(
+                    ActivityEntity(ActivityEntityRole.ACTOR, actor, actor),
+                    ActivityEntity(ActivityEntityRole.APPLICATION, app, app),
+                ),
+                evidence=Evidence(
+                    "denali_demo_fixture",
+                    f"fixture://runtime-activity/{uid}",
+                    observed_at,
+                    {"fixture": True, "scenario": "runtime-activity"},
+                ),
+                attributes={"fixture": True},
+            )
+        )
+    return ActivityBatch(
+        connector_id=CONNECTOR_ID,
+        connection_id="local-demo-runtime",
+        run_id=f"demo-runtime-{observed_at.isoformat()}",
+        scope_key="runtime-preview",
+        collected_at=observed_at,
+        coverage=(Coverage("runtime_activity", CoverageState.COMPLETE, "runtime-preview"),),
+        activities=tuple(activities),
+    )
+
+
 def seed_main() -> None:
     dsn = os.environ.get("DENALI_DSN")
     if not dsn:
@@ -274,11 +661,17 @@ def seed_main() -> None:
     migrate(dsn)
     repository = PostgresInventoryRepository(dsn)
     counts = repository.ingest(tenant, demo_batch())
+    software_counts = repository.ingest(tenant, demo_software_batch())
     finding_counts = repository.ingest_findings(tenant, demo_findings_batch())
+    vulnerability_counts = repository.ingest_vulnerabilities(tenant, demo_vulnerability_batch())
+    activity_counts = repository.ingest_activity(tenant, demo_activity_batch())
     issue_counts = repository.evaluate_issues(tenant)
     print(
         f"Seeded {counts['assets']} assets and {counts['relationships']} relationships "
-        f"and {finding_counts['findings']} findings and "
+        f"plus {software_counts['assets'] - 1} software components and "
+        f"{finding_counts['findings']} findings and "
+        f"{vulnerability_counts['vulnerabilities']} vulnerabilities and "
+        f"{activity_counts['activities']} runtime activities and "
         f"{issue_counts['confirmed_issues']} confirmed issues for tenant {tenant}"
     )
 
