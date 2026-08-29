@@ -90,23 +90,37 @@ reports two enabled subscriptions:
 - `Azure subscription 1` (`cb0d6ed4-a7c9-4929-8707-4a477a2cc9b5`)
 - `Azure CIS Agent Testing` (`8cd2b4cc-c789-466d-a8f7-8f51fb20985d`)
 
-These are identifiers, not credentials. No matching Denali app registration exists in the
-signed-in tenant, and this slice made no Azure cloud mutation. Creating the operator-owned
-multitenant application is a material security and external-state action, so it was left for
-explicit human authorization.
+These are identifiers, not credentials. After explicit human authorization, the live
+acceptance prerequisite was created:
+
+- App registration: `Denali Security Audit`
+- Application/client ID: `37735ceb-483b-4a43-a084-1989ed720de5`
+- Home-tenant application object ID: `f054accc-7c49-4d7c-b3f5-6f234bd84cab`
+- Home-tenant service-principal object ID: `72bd7ece-a047-4489-ba3b-014b862c703c`
+- Audience: `AzureADMultipleOrgs`
+- Registered redirect: `http://127.0.0.1:3080`
+- Required Microsoft Graph/API permissions: none
+
+The local acceptance credential expires `2026-11-27` and is stored only in the macOS
+Keychain entry with service `denali-azure-client-secret` and account `denali-local`. Its
+value was never printed, documented, or committed. Client-credential token issuance was
+verified, and all four Azure runtime settings are active in the healthy local API container.
+
+The pre-existing `Transilience Managed Compliance` registration was deliberately not
+reused. It is single-tenant, has four Microsoft Graph application permissions
+(`AuditLog.Read.All`, `Directory.Read.All`, `Policy.Read.All`, and
+`RoleManagement.Read.Directory`), and already has Reader plus Security Reader assignments
+on the Azure CIS test subscription. Reusing or converting it would couple credential
+lifecycle and cause Denali consent to exceed this slice's no-Graph evidence boundary.
 
 The live acceptance pass must:
 
-1. create or designate the Denali multitenant Entra application and a client credential;
-2. configure `DENALI_AZURE_CLIENT_ID`, `DENALI_AZURE_CLIENT_SECRET`, the private onboarding
-   bucket, and the intended consent redirect URI in the Denali runtime without committing
-   them;
-3. create a test Azure connection for the exact tenant;
-4. verify consent, Cloud Shell subscription enumeration/selection, role assignments, and
+1. create a test Azure connection for the exact tenant;
+2. verify consent, Cloud Shell subscription enumeration/selection, role assignments, and
    one-time completion-code replay rejection;
-5. validate both a selected-subscription path and an intentionally unselected subscription;
-6. visually verify setup, partial coverage, disable, and delete safeguards; and
-7. remove test role assignments and the customer enterprise application if the acceptance
+3. validate both a selected-subscription path and an intentionally unselected subscription;
+4. visually verify setup, partial coverage, disable, and delete safeguards; and
+5. remove test role assignments and the customer enterprise application if the acceptance
    environment should not retain them.
 
 ## Local runtime
@@ -127,8 +141,9 @@ Local endpoints:
 - API: <http://127.0.0.1:8088>
 - PostgreSQL: `127.0.0.1:55450`
 
-Azure setup is intentionally unavailable in this local runtime until its operator app and
-secret-backed environment values are configured.
+Azure setup is configured in the current API container. Recreating that container without
+supplying the four `DENALI_AZURE_*` values will clear them; retrieve the secret from the
+macOS Keychain rather than copying it into the repository or the invalid `.env` file.
 
 ## Known limits
 
