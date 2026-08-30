@@ -81,22 +81,30 @@ customer-project IAM bindings. The UI surfaces that cleanup boundary and retaine
 
 One non-blocking Starlette `TestClient`/httpx deprecation warning remains.
 
-## Human acceptance pending
+## Human acceptance completed
 
-The local Google CLI configuration names `vertex-api-502308`, but its interactive user token
-requires reauthentication. The saved Application Default Credentials also lack access to
-that project. A browser-based `gcloud auth login` was attempted and returned without an
-authorization code; no Google Cloud resource was created.
+The user refreshed both the Google CLI and Application Default Credentials, and
+`vertex-api-502308` was selected as the Denali operator project for this local acceptance.
+The IAM Service Account Credentials API was already enabled. The signed-in local operator
+identity was granted Service Account Token Creator in that operator project so the Denali
+runtime could impersonate connection-specific principals without a JSON key.
 
-Live acceptance therefore needs a human to authenticate an identity that can create service
-accounts in the selected Denali operator project, configure the two environment values above,
-and run the UI flow against one or more customer test projects. Human review should confirm:
+The browser flow then completed successfully:
 
-1. each new connection shows a different Denali service-account email;
-2. Cloud Shell enumerates visible projects and grants only the two displayed roles;
-3. the pasted completion code records only the selected projects;
-4. validation binds immutable project numbers and shows independent partial failures; and
-5. no key, Google session, prompt, response, or false zero-risk claim appears.
+1. Denali created a unique keyless connection principal and exposed both its email and
+   immutable service-account ID.
+2. Cloud Shell enumerated the projects visible to the signed-in user.
+3. The user selected exactly three projects: `ciso-copilot-496523`,
+   `gen-lang-client-0693606939`, and `gen-lang-client-0374500022`.
+4. The completion capability was accepted once and the project IDs were rebound to their
+   immutable project numbers.
+5. All 15 project/plane validation results passed across all resource locations, producing a
+   healthy connection without any customer key or user token entering Denali.
+
+The initial validation remained visibly in its retry state while Google Cloud IAM propagated,
+then completed normally. Future UX should show elapsed time and retry context more clearly so
+a bounded propagation wait is not mistaken for a frozen request; this does not change the
+recorded validation evidence.
 
 ## Parked application UX
 
@@ -107,7 +115,6 @@ not lost or silently mixed into this security contract.
 
 ## Next bounded slice
 
-Complete the live Google Cloud acceptance above. Only after it passes, implement GitHub as a
-GitHub App connection with explicit organization/repository boundaries, least-privilege
-permissions, installation identity validation, and the same separation between access health,
-collection evidence, findings, and risk conclusions.
+Implement GitHub as a GitHub App connection with explicit organization/repository boundaries,
+least-privilege permissions, installation identity validation, and the same separation between
+access health, collection evidence, findings, and risk conclusions.
