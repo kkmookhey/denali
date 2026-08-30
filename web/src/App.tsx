@@ -54,6 +54,7 @@ import type {
   AzureSetupLaunch,
   GcpConnectionCreate,
   GcpSetupLaunch,
+  GitHubConnectionCreate,
   CodeToCloudDeployment,
   Connection,
   Coverage,
@@ -137,6 +138,12 @@ type AzureConsentReturn = {
   detail?: string;
 };
 
+type GitHubSetupReturn = {
+  connectionId: string;
+  state: "succeeded" | "failed";
+  detail?: string;
+};
+
 function readAzureConsentReturn(): AzureConsentReturn | null {
   const query = new URLSearchParams(window.location.search);
   const connectionId = query.get("state") ?? "";
@@ -158,11 +165,21 @@ function readAzureConsentReturn(): AzureConsentReturn | null {
   };
 }
 
+function readGitHubSetupReturn(): GitHubSetupReturn | null {
+  const query = new URLSearchParams(window.location.search);
+  const connectionId = query.get("connection_id") ?? "";
+  const state = query.get("github_setup");
+  if (state !== "succeeded" && state !== "failed") return null;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(connectionId)) return null;
+  return { connectionId, state, detail: query.get("detail")?.slice(0, 500) || undefined };
+}
+
 function App() {
   const [azureConsentReturn] = useState(readAzureConsentReturn);
+  const [githubSetupReturn] = useState(readGitHubSetupReturn);
   const [page, setPage] = useState<Page>(() => {
     const query = new URLSearchParams(window.location.search);
-    return query.has("state") && (query.has("admin_consent") || query.has("error"))
+    return query.has("github_setup") || (query.has("state") && (query.has("admin_consent") || query.has("error")))
       ? "connections"
       : "dashboard";
   });
@@ -265,13 +282,13 @@ function App() {
   }, [loadAll]);
 
   useEffect(() => {
-    if (!azureConsentReturn) return;
+    if (!azureConsentReturn && !githubSetupReturn) return;
     const returnUrl = new URL(window.location.href);
-    ["admin_consent", "tenant", "state", "error", "error_description"].forEach((key) =>
+    ["admin_consent", "tenant", "state", "error", "error_description", "github_setup", "connection_id"].forEach((key) =>
       returnUrl.searchParams.delete(key),
     );
     window.history.replaceState({}, "", `${returnUrl.pathname}${returnUrl.search}${returnUrl.hash}`);
-  }, [azureConsentReturn]);
+  }, [azureConsentReturn, githubSetupReturn]);
 
   async function toggleActivityFixtures() {
     const next = !includeActivityFixtures;
@@ -338,7 +355,7 @@ function App() {
               onNavigate={navigate}
             />
           ) : page === "connections" ? (
-            <ConnectionsPage connections={connections} onChanged={loadAll} azureConsentReturn={azureConsentReturn} />
+            <ConnectionsPage connections={connections} onChanged={loadAll} azureConsentReturn={azureConsentReturn} githubSetupReturn={githubSetupReturn} />
           ) : page === "inventory" ? (
             <Inventory
               assets={assets}
@@ -1785,22 +1802,30 @@ const GCP_CONNECTION_SCOPES = [
   { id: "gcp.ai_activity", label: "Google Cloud AI management activity", detail: "Cloud Audit Log metadata; no prompts or responses" },
 ];
 
+const GITHUB_CONNECTION_SCOPES = [
+  { id: "github.repository_metadata", label: "Repository metadata", detail: "Immutable repository identity and basic metadata" },
+  { id: "github.repository_contents", label: "Source revision access", detail: "Read the default Git revision; no source writes" },
+  { id: "github.actions_workflows", label: "GitHub Actions workflows", detail: "Workflow inventory only; no workflow runs, secrets, or writes" },
+];
+
 function ConnectionsPage({
   connections,
   onChanged,
   azureConsentReturn,
+  githubSetupReturn,
 }: {
   connections: Connection[];
   onChanged: () => Promise<void>;
   azureConsentReturn: AzureConsentReturn | null;
+  githubSetupReturn: GitHubSetupReturn | null;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(() =>
-    connections.some((connection) => connection.id === azureConsentReturn?.connectionId)
-      ? azureConsentReturn?.connectionId ?? null
+    connections.some((connection) => connection.id === (githubSetupReturn?.connectionId ?? azureConsentReturn?.connectionId))
+      ? githubSetupReturn?.connectionId ?? azureConsentReturn?.connectionId ?? null
       : connections[0]?.id ?? null,
   );
   const [showCreate, setShowCreate] = useState(connections.length === 0);
-  const [provider, setProvider] = useState<"aws" | "azure" | "gcp">("aws");
+  const [provider, setProvider] = useState<"aws" | "azure" | "gcp" | "github">("aws");
   const [displayName, setDisplayName] = useState("");
   const [accountId, setAccountId] = useState("");
   const [partition, setPartition] = useState<AwsConnectionCreate["partition"]>("aws");
@@ -1822,7 +1847,7 @@ function ConnectionsPage({
     setBusy("create");
     setActionError(null);
     try {
-      const payload: AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate = provider === "aws" ? {
+      const payload: AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate | GitHubConnectionCreate = provider === "aws" ? {
           provider: "aws",
           display_name: displayName,
           account_id: accountId,
@@ -1837,8 +1862,12 @@ function ConnectionsPage({
           tenant_id: azureTenantId,
           cloud: "AzureCloud",
           declared_scopes: scopes,
-        } : {
+        } : provider === "gcp" ? {
           provider: "gcp",
+          display_name: displayName,
+          declared_scopes: scopes,
+        } : {
+          provider: "github",
           display_name: displayName,
           declared_scopes: scopes,
         };
@@ -1973,6 +2002,18 @@ function ConnectionsPage({
     }
   }
 
+  async function prepareGitHubSetup(connection: Connection) {
+    setBusy(`launch:${connection.id}`);
+    setActionError(null);
+    try {
+      const launch = await api.launchGitHubSetup(connection.id);
+      window.location.assign(launch.install_url);
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to open GitHub App setup");
+      setBusy(null);
+    }
+  }
+
   async function disableConnection(connection: Connection) {
     if (!window.confirm(`Disable ${connection.display_name}? Scheduled collection must stop using this connection.`)) return;
     setBusy(`disable:${connection.id}`);
@@ -2013,7 +2054,7 @@ function ConnectionsPage({
 
   return <div className="page-stack connections-page">
     <section className="page-intro connection-intro">
-      <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali customer credentials.</h2><p>AWS uses assume-role; Azure uses a tenant-local enterprise application; Google Cloud grants bounded roles to Denali’s service account. Customers select exact subscriptions or projects, and every declared plane is validated separately.</p></div>
+      <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali customer credentials.</h2><p>AWS uses assume-role; Azure and Google Cloud use provider-native, keyless identities; GitHub uses short-lived App installation tokens. Customers select exact cloud scopes or repositories, and every declared plane is validated separately.</p></div>
       <button className="primary-action" onClick={() => setShowCreate((visible) => !visible)}><Plus /> Add connection</button>
     </section>
     <section className="connection-boundary"><ShieldCheck /><div><strong>Connection health is not a risk verdict.</strong><span>A healthy connection means the configured role and declared validation calls worked. It does not mean collection is complete, findings are absent, or the connected environment is safe.</span></div></section>
@@ -2021,12 +2062,16 @@ function ConnectionsPage({
       {azureConsentReturn.state === "succeeded" ? <CircleCheck /> : <CircleAlert />}
       <span><strong>{azureConsentReturn.state === "succeeded" ? "Denali’s tenant identity is ready" : "Microsoft Entra could not add Denali to the tenant"}</strong><small>{azureConsentReturn.state === "succeeded" ? `Entra confirmed Denali’s enterprise application${azureConsentReturn.tenantId ? ` in tenant ${azureConsentReturn.tenantId}` : ""}. This step grants no subscription or Microsoft Graph access; selected-subscription Reader access is granted separately in Cloud Shell and verified by Denali.` : azureConsentReturn.detail}</small></span>
     </div>}
+    {githubSetupReturn && <div className={`connection-consent-return ${githubSetupReturn.state}`}>
+      {githubSetupReturn.state === "succeeded" ? <CircleCheck /> : <CircleAlert />}
+      <span><strong>{githubSetupReturn.state === "succeeded" ? "GitHub App installation verified" : "GitHub App installation could not be verified"}</strong><small>{githubSetupReturn.state === "succeeded" ? "Denali confirmed the signed-in installer could access this exact installation, recorded its current repository IDs, discarded the temporary user token, and started read-only validation." : githubSetupReturn.detail ?? "Return to the connection and try the GitHub App setup again."}</small></span>
+    </div>}
     {actionError && <div className="connection-error"><CircleAlert /><span>{actionError}</span></div>}
     {showCreate && <form className="panel connection-create" onSubmit={(event) => void createConnection(event)}>
-      <div className="connection-provider-picker"><button type="button" className={provider === "aws" ? "active" : ""} onClick={() => { setProvider("aws"); setScopes(AWS_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Amazon Web Services</button><button type="button" className={provider === "azure" ? "active" : ""} onClick={() => { setProvider("azure"); setScopes(AZURE_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Microsoft Azure</button><button type="button" className={provider === "gcp" ? "active" : ""} onClick={() => { setProvider("gcp"); setScopes(GCP_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Google Cloud</button></div>
-      <div className="connection-create-head"><div><span>NEW CONNECTION</span><h3>{provider === "aws" ? "Amazon Web Services" : provider === "azure" ? "Microsoft Azure" : "Google Cloud"}</h3><p>{provider === "aws" ? "CloudFormation creates one read-only role with an external-ID trust condition. No access keys are created or stored." : provider === "azure" ? "Denali’s multi-tenant application receives Reader only on subscriptions you select in Azure Cloud Shell. No customer client secret is created or stored." : "Denali creates a unique keyless service account for this connection. Google Cloud Shell grants it bounded read roles only on projects you select; no customer key or user token is stored."}</p></div><span className="provider-mark">{provider === "aws" ? "AWS" : provider === "azure" ? "AZURE" : "GCP"}</span></div>
+      <div className="connection-provider-picker"><button type="button" className={provider === "aws" ? "active" : ""} onClick={() => { setProvider("aws"); setScopes(AWS_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Amazon Web Services</button><button type="button" className={provider === "azure" ? "active" : ""} onClick={() => { setProvider("azure"); setScopes(AZURE_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Microsoft Azure</button><button type="button" className={provider === "gcp" ? "active" : ""} onClick={() => { setProvider("gcp"); setScopes(GCP_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Google Cloud</button><button type="button" className={provider === "github" ? "active" : ""} onClick={() => { setProvider("github"); setScopes(GITHUB_CONNECTION_SCOPES.map((scope) => scope.id)); }}>GitHub</button></div>
+      <div className="connection-create-head"><div><span>NEW CONNECTION</span><h3>{provider === "aws" ? "Amazon Web Services" : provider === "azure" ? "Microsoft Azure" : provider === "gcp" ? "Google Cloud" : "GitHub"}</h3><p>{provider === "aws" ? "CloudFormation creates one read-only role with an external-ID trust condition. No access keys are created or stored." : provider === "azure" ? "Denali’s multi-tenant application receives Reader only on subscriptions you select in Azure Cloud Shell. No customer client secret is created or stored." : provider === "gcp" ? "Denali creates a unique keyless service account for this connection. Google Cloud Shell grants it bounded read roles only on projects you select; no customer key or user token is stored." : "Install Denali’s GitHub App on repositories you select. Denali uses short-lived, exact-repository installation tokens and never stores a personal access token or GitHub user token."}</p></div><span className="provider-mark">{provider === "aws" ? "AWS" : provider === "azure" ? "AZURE" : provider === "gcp" ? "GCP" : "GITHUB"}</span></div>
       <div className="connection-form-grid">
-        <label><span>Connection name</span><input required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder={provider === "aws" ? "Production AWS" : "Production Azure"} /></label>
+        <label><span>Connection name</span><input required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder={provider === "aws" ? "Production AWS" : provider === "azure" ? "Production Azure" : provider === "gcp" ? "Production Google Cloud" : "Production GitHub"} /></label>
         {provider === "aws" ? <>
         <label><span>AWS account ID</span><input required inputMode="numeric" pattern="[0-9]{12}" maxLength={12} value={accountId} onChange={(event) => setAccountId(event.target.value)} placeholder="123456789012" /></label>
         <label><span>Partition</span><select value={partition} onChange={(event) => setPartition(event.target.value as AwsConnectionCreate["partition"])}><option value="aws">Commercial AWS</option><option value="aws-us-gov">AWS GovCloud</option><option value="aws-cn">AWS China</option></select></label>
@@ -2034,19 +2079,21 @@ function ConnectionsPage({
         <label><span>Inventory region coverage</span><select value={coverageMode} onChange={(event) => setCoverageMode(event.target.value as AwsConnectionCreate["coverage_mode"])}><option value="automatic">All enabled regions (recommended)</option><option value="selected">Selected regions only</option></select><small>Automatic mode rediscovers enabled and opted-in regions on every validation.</small></label>
         {coverageMode === "selected" && <label><span>Selected inventory regions</span><input required value={regions} onChange={(event) => setRegions(event.target.value)} placeholder="us-east-1, us-west-2" /><small>Coverage outside this explicit allowlist will be reported as excluded.</small></label>}</> : provider === "azure" ? <>
         <label><span>Microsoft Entra tenant ID</span><input required pattern="[0-9a-fA-F-]{36}" maxLength={36} value={azureTenantId} onChange={(event) => setAzureTenantId(event.target.value)} placeholder="00000000-0000-0000-0000-000000000000" /><small>Cloud Shell will enumerate enabled subscriptions in this tenant and let you choose.</small></label>
-        <label><span>Resource location coverage</span><input value="All locations in selected subscriptions" disabled /><small>Azure Resource Graph queries are subscription-wide; no single region limits coverage.</small></label></> : <>
+        <label><span>Resource location coverage</span><input value="All locations in selected subscriptions" disabled /><small>Azure Resource Graph queries are subscription-wide; no single region limits coverage.</small></label></> : provider === "gcp" ? <>
         <label><span>Project selection</span><input value="Choose in Google Cloud Shell" disabled /><small>Cloud Shell enumerates active projects visible to your signed-in Google identity and lets you choose.</small></label>
-        <label><span>Resource location coverage</span><input value="All locations in selected projects" disabled /><small>Cloud Asset Inventory queries are project-wide; no preferred region limits coverage.</small></label></>}
+        <label><span>Resource location coverage</span><input value="All locations in selected projects" disabled /><small>Cloud Asset Inventory queries are project-wide; no preferred region limits coverage.</small></label></> : <>
+        <label><span>Repository selection</span><input value="Choose in GitHub" disabled /><small>GitHub’s installation page lets you select repositories in one user or organization account.</small></label>
+        <label><span>Token boundary</span><input value="One exact repository per short-lived token" disabled /><small>Denali records immutable repository IDs and does not silently include repositories added later.</small></label></>}
       </div>
-      <fieldset className="connection-scope-picker"><legend>Declared collection planes</legend>{(provider === "aws" ? AWS_CONNECTION_SCOPES : provider === "azure" ? AZURE_CONNECTION_SCOPES : GCP_CONNECTION_SCOPES).map((scope) => <label key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={() => toggleScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.detail}</small></span></label>)}</fieldset>
+      <fieldset className="connection-scope-picker"><legend>Declared collection planes</legend>{(provider === "aws" ? AWS_CONNECTION_SCOPES : provider === "azure" ? AZURE_CONNECTION_SCOPES : provider === "gcp" ? GCP_CONNECTION_SCOPES : GITHUB_CONNECTION_SCOPES).map((scope) => <label key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={() => toggleScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.detail}</small></span></label>)}</fieldset>
       <div className="connection-form-actions"><button type="button" onClick={() => setShowCreate(false)}>Cancel</button><button className="primary-action" type="submit" disabled={busy === "create" || scopes.length === 0}>{busy === "create" ? "Creating…" : "Create onboarding plan"}</button></div>
     </form>}
     <div className="connections-layout">
       <section className="panel connection-list-panel">
-        <PanelHeader eyebrow="CLOUD" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
-        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : connection.provider === "azure" ? `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions` : `${connection.configuration.projects?.length ?? 0} selected projects`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No cloud connections configured</strong><span>Create an AWS, Azure, or Google Cloud onboarding plan to begin.</span></div>}</div>
+        <PanelHeader eyebrow="SOURCES" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
+        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : connection.provider === "azure" ? `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions` : connection.provider === "gcp" ? `${connection.configuration.projects?.length ?? 0} selected projects` : `${connection.configuration.account_login ?? "not installed"} · ${connection.configuration.repositories?.length ?? 0} exact repositories`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No connections configured</strong><span>Create an AWS, Azure, Google Cloud, or GitHub onboarding plan to begin.</span></div>}</div>
       </section>
-      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
+      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onPrepareGitHub={() => void prepareGitHubSetup(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
     </div>
   </div>;
 }
@@ -2056,9 +2103,10 @@ function ConnectionHealth({ state }: { state: Connection["health_state"] }) {
   return <span className={`connection-health ${state}`}><Icon />{titleCase(state)}</span>;
 }
 
-function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onPrepareGitHub, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onPrepareGitHub: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
   if (connection.provider === "azure") return <AzureConnectionDetail connection={connection} busy={busy} launch={azureLaunch} completionCode={azureCompletionCode} onCompletionCode={onAzureCompletionCode} onPrepare={onPrepareAzure} onComplete={onCompleteAzure} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   if (connection.provider === "gcp") return <GcpConnectionDetail connection={connection} busy={busy} launch={gcpLaunch} completionCode={gcpCompletionCode} onCompletionCode={onGcpCompletionCode} onPrepare={onPrepareGcp} onComplete={onCompleteGcp} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
+  if (connection.provider === "github") return <GitHubConnectionDetail connection={connection} busy={busy} onPrepare={onPrepareGitHub} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   const validation = connection.last_validation;
   const awsCredential = connection.credential_reference.type === "aws_assume_role" ? connection.credential_reference : null;
   const launching = busy === `launch:${connection.id}`;
@@ -2082,7 +2130,7 @@ function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, 
     <div className="connection-detail-head"><div><span>AMAZON WEB SERVICES</span><h3>{connection.display_name}</h3><code>{awsCredential?.role_arn}</code></div><ConnectionHealth state={connection.health_state} /></div>
     <div className="setup-progress">
       <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Account, scopes, role ARN, and {coverageMode === "automatic" ? "automatic enabled-region coverage" : "the selected-region boundary"} are recorded.</small></div></div>
-      <div className={validatedRole ? "complete" : "current"}><span>{validatedRole ? <Check /> : "2"}</span><div><strong>2. Deploy the CloudFormation stack</strong><small>The stack is managed in {connection.configuration.deployment_region ?? "us-east-1"}; its account-wide IAM role does not restrict inventory to that Region. AWS lets you inspect the exact template and permissions before creating it.</small><div className="connection-launch-actions"><button className="primary-action" disabled={launching || !connection.setup_capabilities.cloudformation_quick_create} onClick={onLaunch}><ExternalLink />{launching ? "Waiting for AWS deployment…" : "Launch in AWS"}</button><a className="secondary-action" href={api.cloudFormationUrl(connection.id)} download><Download /> Download template</a></div>{!connection.setup_capabilities.cloudformation_quick_create && <small className="launch-unavailable">One-click launch requires the Denali onboarding bucket and runtime principal configuration. Manual template download remains available.</small>}{connection.configuration.onboarding?.template_sha256 && <small className="launch-record">Last launch prepared {formatTime(connection.configuration.onboarding.published_at)} · template {connection.configuration.onboarding.template_sha256.slice(0, 12)}</small>}</div></div>
+      <div className={validatedRole ? "complete" : "current"}><span>{validatedRole ? <Check /> : "2"}</span><div><strong>2. Deploy the CloudFormation stack</strong><small>The stack is managed in {connection.configuration.deployment_region ?? "us-east-1"}; its account-wide IAM role does not restrict inventory to that Region. AWS lets you inspect the exact template and permissions before creating it.</small><div className="connection-launch-actions"><button className="primary-action" disabled={launching || !connection.setup_capabilities.cloudformation_quick_create} onClick={onLaunch}><ExternalLink />{launching ? "Waiting for AWS deployment…" : "Launch in AWS"}</button><a className="secondary-action" href={api.cloudFormationUrl(connection.id)} download><Download /> Download template</a></div>{!connection.setup_capabilities.cloudformation_quick_create && <small className="launch-unavailable">One-click launch requires the Denali onboarding bucket and runtime principal configuration. Manual template download remains available.</small>}{connection.configuration.onboarding?.template_sha256 && connection.configuration.onboarding.published_at && <small className="launch-record">Last launch prepared {formatTime(connection.configuration.onboarding.published_at)} · template {connection.configuration.onboarding.template_sha256.slice(0, 12)}</small>}</div></div>
       <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Discover Regions and validate every plane</strong><small>Role assumption and account binding run first. Enabled Regions are observed next; each applicable regional plane then succeeds or fails independently.</small>{connection.lifecycle_state === "active" && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating across AWS…" : validation ? "Validate again" : "Validate connection"}</button>}{validating && <small className="validation-progress-note">This continues in the background. Large accounts can take a few minutes.</small>}</div></div>
     </div>
     <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed account {validation.account_id_observed ?? "not established"}</small></div>{regionDiscovery && <div className={`region-discovery ${regionDiscovery.state}`}><span>{regionDiscovery.state === "passed" ? <CircleCheck /> : regionDiscovery.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{coverageMode === "automatic" ? "Automatic enabled-region coverage" : "Selected-region coverage"}</strong><p>{regionDiscovery.detail}</p>{regionDiscovery.discovered_regions && regionDiscovery.discovered_regions.length > 0 && <small>{regionDiscovery.discovered_regions.join(", ")}</small>}{regionDiscovery.excluded_enabled_regions && regionDiscovery.excluded_enabled_regions.length > 0 && <small className="excluded-regions">Outside declared scope: {regionDiscovery.excluded_enabled_regions.join(", ")}</small>}</div></div>}<div className="validation-plane-rollup">{planeSummaries.map((summary) => <div className={summary.failed || summary.unknown ? "attention" : "complete"} key={summary.label}><span>{summary.failed || summary.unknown ? <CircleAlert /> : <CircleCheck />}</span><div><strong>{summary.label}</strong><small>{summary.total} Region checks</small></div><div className="rollup-counts"><b className="passed">{summary.passed} passed</b>{summary.notApplicable > 0 && <b>{summary.notApplicable} not applicable</b>}{summary.failed > 0 && <b className="failed">{summary.failed} failed</b>}{summary.unknown > 0 && <b className="failed">{summary.unknown} unknown</b>}</div></div>)}</div><details className="plane-validation-results"><summary>View all {planeResults.length} raw plane/Region results</summary><div className="validation-grid">{planeResults.map((result) => <div key={`${result.scope}:${result.plane}:${result.region}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.region} · {result.state === "not_applicable" ? "Not applicable" : titleCase(result.plane)}</small><p>{result.detail}</p></div></div>)}</div></details></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>No coverage conclusion is available until the stack is deployed and validation runs.</small></span></div>}</div>
@@ -2132,6 +2180,27 @@ function GcpConnectionDetail({ connection, busy, launch, completionCode, onCompl
     <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed projects {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.project_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.project_name ?? result.project_id} · all resource locations</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Select projects in Cloud Shell and paste its completion code first.</small></span></div>}</div>
     <details className="connection-permissions"><summary>Review {permissions.length || 2} declared Google Cloud permissions</summary><div>{(permissions.length ? permissions : ["cloudasset.assets.searchAllResources", "logging.logEntries.list"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>The customer grants Cloud Asset Viewer and Logs Viewer only on selected projects. This does not grant writes, service-account key access, prompt or response contents, or remediation.</p></details>
     <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes only connection configuration and validation history; customer-project IAM bindings and the Denali-owned service account require separate cleanup, while collected evidence remains.</span>{credential?.principal_unique_id && <code>Immutable service-account ID {credential.principal_unique_id}</code>}</div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
+  </section>;
+}
+
+function GitHubConnectionDetail({ connection, busy, onPrepare, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; onPrepare: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+  const validation = connection.last_validation;
+  const repositories = connection.configuration.repositories ?? [];
+  const setupComplete = repositories.length > 0;
+  const preparing = busy === `launch:${connection.id}`;
+  const validating = connection.validation_state === "running" || busy === `validate:${connection.id}`;
+  const credential = connection.credential_reference.type === "github_app_installation" ? connection.credential_reference : null;
+  const permissions = [...new Set(connection.coverage_plan.flatMap((item) => item.permissions))].sort();
+  return <section className="panel connection-detail">
+    <div className="connection-detail-head"><div><span>GITHUB</span><h3>{connection.display_name}</h3><code>{connection.configuration.account_login ? `${connection.configuration.account_type ?? "Account"} ${connection.configuration.account_login}` : credential ? `GitHub App ${credential.app_slug}` : "GitHub App"}</code></div><ConnectionHealth state={connection.health_state} /></div>
+    <div className="setup-progress">
+      <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Denali’s GitHub App, declared read planes, and an initially empty repository boundary are recorded. No personal access token is requested or stored.</small></div></div>
+      <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Install the App and select repositories</strong><small>GitHub shows the App’s exact read permissions and lets you choose repositories. After installation, Denali briefly verifies that the signed-in GitHub user can access that exact installation, records immutable repository IDs, and immediately discards the user token.</small><button className="primary-action" disabled={preparing || !connection.setup_capabilities.github_app} onClick={onPrepare}><ExternalLink />{preparing ? "Opening GitHub…" : setupComplete ? "Reconfigure GitHub App" : "Install / configure GitHub App"}</button>{!connection.setup_capabilities.github_app && <small className="launch-unavailable">GitHub onboarding requires Denali’s configured GitHub App and private signing key.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{repositories.length} exact repositor{repositories.length === 1 ? "y" : "ies"}</strong>{repositories.map((repository) => <code key={repository.id}>{repository.full_name} · ID {repository.id}{repository.private ? " · private" : " · public"}</code>)}{connection.configuration.installation_repository_selection === "all" && <small>GitHub’s installation is set to all repositories, but Denali’s stored coverage remains this exact list. Newly created repositories are not claimed until you reconfigure and verify again.</small>}</div>}</div></div>
+      <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every exact repository</strong><small>Denali mints a separate short-lived installation token for one recorded repository at a time, rebinds its immutable identity, and tests each declared read plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating GitHub…" : validation ? "Validate again" : "Validate connection"}</button>}</div></div>
+    </div>
+    <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed GitHub account ID {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.repository_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.repository_full_name ?? result.repository_id} · exact repository</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Install the GitHub App and finish repository selection first.</small></span></div>}</div>
+    <details className="connection-permissions"><summary>Review {permissions.length || 3} declared GitHub permissions</summary><div>{(permissions.length ? permissions : ["metadata:read", "contents:read", "actions:read"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>This slice cannot write source, dispatch workflows, read Actions secrets, administer repositories, receive webhooks, or access repositories outside the recorded immutable IDs. Branch-protection posture is not claimed.</p></details>
+    <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes Denali’s connection configuration and validation history only; uninstall the GitHub App separately in GitHub. Previously collected evidence remains.</span>{credential?.installation_id && <code>Installation ID {credential.installation_id}</code>}{connection.configuration.installer && <code>Verified installer {connection.configuration.installer.login} · user ID {connection.configuration.installer.id}</code>}</div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
   </section>;
 }
 

@@ -45,6 +45,16 @@ from denali.connections.gcp_onboarding import (
     GcpSetupScriptLauncher,
     render_gcp_setup_script,
 )
+from denali.connections.github import (
+    GITHUB_REQUIRED_PERMISSIONS,
+    GITHUB_SCOPE_ACTIONS_WORKFLOWS,
+    GITHUB_SCOPE_REPOSITORY_CONTENTS,
+    GITHUB_SCOPE_REPOSITORY_METADATA,
+    GITHUB_SCOPES,
+    GitHubAppClient,
+    GitHubConnectionValidator,
+    github_coverage_plan,
+)
 
 __all__ = [
     "AWS_COVERAGE_AUTOMATIC",
@@ -73,10 +83,18 @@ __all__ = [
     "GcpConnectionPrincipalProvisioner",
     "GcpConnectionValidator",
     "GcpSetupScriptLauncher",
+    "GITHUB_REQUIRED_PERMISSIONS",
+    "GITHUB_SCOPE_ACTIONS_WORKFLOWS",
+    "GITHUB_SCOPE_REPOSITORY_CONTENTS",
+    "GITHUB_SCOPE_REPOSITORY_METADATA",
+    "GITHUB_SCOPES",
+    "GitHubAppClient",
+    "GitHubConnectionValidator",
     "aws_connection_coverage_plan",
     "aws_coverage_plan",
     "azure_coverage_plan",
     "gcp_coverage_plan",
+    "github_coverage_plan",
     "render_cloudformation",
     "render_setup_script",
     "render_gcp_setup_script",

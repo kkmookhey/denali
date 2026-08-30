@@ -75,6 +75,11 @@ def _connection_response(row: dict[str, Any]) -> dict[str, Any]:
             credential_reference["principal_unique_id"] = internal_reference[
                 "principal_unique_id"
             ]
+    elif credential_type == "github_app_installation":
+        credential_reference["app_id"] = internal_reference["app_id"]
+        credential_reference["app_slug"] = internal_reference["app_slug"]
+        if internal_reference.get("installation_id"):
+            credential_reference["installation_id"] = internal_reference["installation_id"]
     result["credential_reference"] = credential_reference
     return result
 
@@ -2133,6 +2138,143 @@ class PostgresInventoryRepository:
                     tenant_id,
                     connection_id,
                     expected_setup_token_sha256,
+                ),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def record_github_install_launch(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        launch: dict[str, Any],
+        state_sha256: str,
+    ) -> dict[str, Any] | None:
+        """Record only the hash of the one-time GitHub installation state."""
+
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET credential_reference = jsonb_set(
+                        credential_reference,
+                        '{install_state_sha256}',
+                        to_jsonb(%s::text),
+                        true
+                    ),
+                    configuration = jsonb_set(
+                        configuration, '{onboarding}', %s::jsonb, true
+                    ),
+                    updated_at = now()
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                  AND provider = 'github' AND lifecycle_state = 'active'
+                RETURNING id
+                """,
+                (state_sha256, json.dumps(launch), tenant_id, connection_id),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def record_github_install_return(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_install_state_sha256: str,
+        installation_id: int,
+        oauth: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Consume install state and stage short-lived OAuth/PKCE verifier state."""
+
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET credential_reference =
+                      jsonb_set(
+                        jsonb_set(
+                          jsonb_set(
+                            credential_reference - 'install_state_sha256',
+                            '{installation_id}', to_jsonb(%s::bigint), true
+                          ),
+                          '{oauth_state_sha256}', to_jsonb(%s::text), true
+                        ),
+                        '{pkce_verifier}', to_jsonb(%s::text), true
+                      ),
+                    configuration = jsonb_set(
+                      jsonb_set(
+                        configuration,
+                        '{onboarding,installation_id}', to_jsonb(%s::bigint), true
+                      ),
+                      '{onboarding,oauth_expires_at}', to_jsonb(%s::text), true
+                    ),
+                    updated_at = now()
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                  AND provider = 'github' AND lifecycle_state = 'active'
+                  AND credential_reference->>'install_state_sha256' = %s
+                RETURNING id
+                """,
+                (
+                    installation_id,
+                    oauth["state_sha256"],
+                    oauth["pkce_verifier"],
+                    installation_id,
+                    oauth["expires_at"],
+                    tenant_id,
+                    connection_id,
+                    expected_install_state_sha256,
+                ),
+            ).fetchone()
+        return None if row is None else self.get_connection(tenant_id, connection_id)
+
+    def complete_github_connection_setup(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_oauth_state_sha256: str,
+        installation: dict[str, Any],
+        installer: dict[str, Any],
+        repositories: list[dict[str, Any]],
+        coverage_plan: list[dict[str, Any]],
+        completed_at: datetime,
+    ) -> dict[str, Any] | None:
+        """Bind verified installation repositories and discard transient user auth state."""
+
+        configuration_patch = {
+            "account_id": installation["account_id"],
+            "account_login": installation["account_login"],
+            "account_type": installation["account_type"],
+            "installation_repository_selection": installation["repository_selection"],
+            "repositories": repositories,
+            "installer": installer,
+        }
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                UPDATE provider_connection
+                SET credential_reference =
+                      credential_reference - 'oauth_state_sha256' - 'pkce_verifier',
+                    configuration =
+                      jsonb_set(
+                        configuration || %s::jsonb,
+                        '{onboarding,completed_at}', to_jsonb(%s::text), true
+                      ),
+                    coverage_plan = %s::jsonb,
+                    health_state = 'unknown',
+                    updated_at = %s
+                WHERE tenant_id = %s::uuid AND id = %s::uuid
+                  AND provider = 'github' AND lifecycle_state = 'active'
+                  AND credential_reference->>'oauth_state_sha256' = %s
+                RETURNING id
+                """,
+                (
+                    json.dumps(configuration_patch),
+                    completed_at.isoformat(),
+                    json.dumps(coverage_plan),
+                    completed_at,
+                    tenant_id,
+                    connection_id,
+                    expected_oauth_state_sha256,
                 ),
             ).fetchone()
         return None if row is None else self.get_connection(tenant_id, connection_id)

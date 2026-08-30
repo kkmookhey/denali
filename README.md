@@ -45,7 +45,7 @@ Requires Python 3.11 or newer and Docker for the runnable stack.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[api,aws,azure,dev]'
+python -m pip install -e '.[api,aws,azure,gcp,github,dev]'
 docker compose up -d --build
 DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali denali-demo-seed
 ```
@@ -170,6 +170,49 @@ independent Cloud Asset Inventory and Cloud Logging planes across all resource l
 New IAM bindings receive the same bounded propagation retry as Azure. Successful connection
 validation is not collection evidence or a risk verdict. See
 [`docs/architecture/0020-self-service-gcp-connections.md`](docs/architecture/0020-self-service-gcp-connections.md).
+
+### Self-service GitHub connection
+
+GitHub uses a Denali-owned GitHub App, not a customer personal access token. Open
+**Connections**, select **GitHub**, create a plan, and choose **Install / configure GitHub
+App**. GitHub shows the requested read permissions and its native repository picker. Denali
+then verifies the signed-in installer against the exact returned installation, records each
+repository's immutable ID and node ID, discards the temporary GitHub user token, and starts
+validation.
+
+Register the GitHub App with these local callback settings:
+
+- Setup URL: `http://127.0.0.1:8088/v1/connections/github/setup/callback`
+- OAuth callback URL: `http://127.0.0.1:8088/v1/connections/github/oauth/callback`
+- Repository permissions: Metadata read, Contents read, and Actions read
+- Webhooks: inactive; no event subscriptions
+- Installation scope: any account that should be able to onboard itself
+
+Keep GitHub's “Request user authorization (OAuth) during installation” option off; Denali
+starts an explicit PKCE-protected installer-verification step after the setup return. Generate
+one client secret and one private key for Denali's operator infrastructure, then configure:
+
+```bash
+export DENALI_GITHUB_APP_ID=123456
+export DENALI_GITHUB_CLIENT_ID=Iv1.example
+export DENALI_GITHUB_CLIENT_SECRET='operator-managed-github-app-secret'
+export DENALI_GITHUB_APP_SLUG=denali-security
+export DENALI_GITHUB_PRIVATE_KEY_FILE=/run/secrets/denali-github-app.pem
+export DENALI_GITHUB_CALLBACK_URL=http://127.0.0.1:8088/v1/connections/github/oauth/callback
+```
+
+Mount the private-key file read-only into the API container; never commit it or place it in
+the database. The client secret and private key belong to Denali's infrastructure and are
+never returned by the API. Installer user and refresh tokens are transient and are discarded
+immediately after installation verification. Runtime validation mints a separate short-lived
+installation token for one recorded repository at a time, with only the three declared read
+permissions.
+
+Even when a GitHub installation is configured for all repositories, Denali records and claims
+only the exact repository list verified during setup. New repositories do not silently expand
+coverage. Validation proves repository-bound API access only; it is not source collection,
+branch-protection posture, a finding, or a risk verdict. See
+[`docs/architecture/0021-self-service-github-connections.md`](docs/architecture/0021-self-service-github-connections.md).
 
 Scan a source repository into Denali with the first-party repository connector:
 

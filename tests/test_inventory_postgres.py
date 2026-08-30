@@ -18,9 +18,11 @@ from denali.connections import (
     AWS_SCOPE_BEDROCK_AGENTS,
     AZURE_SCOPES,
     GCP_SCOPES,
+    GITHUB_SCOPES,
     aws_coverage_plan,
     azure_coverage_plan,
     gcp_coverage_plan,
+    github_coverage_plan,
 )
 from denali.connectors.code_to_cloud import CodeToCloudConnector, DeploymentTarget
 from denali.connectors.demo import demo_batch, demo_findings_batch
@@ -496,6 +498,123 @@ def test_gcp_setup_completion_consumes_token_and_binds_selected_projects(reposit
         connection_id,
         expected_setup_token_sha256=setup_token_sha256,
         projects=projects,
+        coverage_plan=plan,
+        completed_at=now,
+    )
+    assert replay is None
+
+
+def test_github_setup_consumes_transient_state_and_binds_exact_repositories(
+    repository,
+) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    connection_id = str(uuid.uuid4())
+    install_state_sha256 = "a" * 64
+    oauth_state_sha256 = "b" * 64
+    repositories = [
+        {
+            "id": 101,
+            "node_id": "R_fixture_one",
+            "name": "service-one",
+            "full_name": "example/service-one",
+            "owner_id": 44,
+            "owner_login": "example",
+            "private": True,
+            "archived": False,
+            "default_branch": "main",
+        }
+    ]
+    created = repo.create_connection(
+        tenant,
+        connection_id=connection_id,
+        provider="github",
+        display_name="Fixture GitHub",
+        credential_type="github_app_installation",
+        credential_reference={"app_id": 12345, "app_slug": "denali-fixture"},
+        declared_scopes=list(GITHUB_SCOPES),
+        coverage_plan=[],
+        configuration={
+            "coverage_mode": "exact-installation-repositories",
+            "repositories": [],
+        },
+    )
+    assert created["credential_reference"] == {
+        "type": "github_app_installation",
+        "app_id": 12345,
+        "app_slug": "denali-fixture",
+    }
+
+    launched = repo.record_github_install_launch(
+        tenant,
+        connection_id,
+        launch={
+            "method": "github_app_installation",
+            "app_id": 12345,
+            "app_slug": "denali-fixture",
+            "created_at": now.isoformat(),
+            "install_expires_at": (now + timedelta(minutes=30)).isoformat(),
+        },
+        state_sha256=install_state_sha256,
+    )
+    assert launched is not None
+    assert "install_state" not in str(launched)
+
+    returned = repo.record_github_install_return(
+        tenant,
+        connection_id,
+        expected_install_state_sha256=install_state_sha256,
+        installation_id=24680,
+        oauth={
+            "state_sha256": oauth_state_sha256,
+            "pkce_verifier": "transient-pkce-verifier",
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=30)).isoformat(),
+        },
+    )
+    assert returned is not None
+    assert returned["credential_reference"]["installation_id"] == 24680
+    assert "pkce" not in str(returned)
+
+    plan = github_coverage_plan(list(GITHUB_SCOPES), repositories)
+    completed = repo.complete_github_connection_setup(
+        tenant,
+        connection_id,
+        expected_oauth_state_sha256=oauth_state_sha256,
+        installation={
+            "account_id": 44,
+            "account_login": "example",
+            "account_type": "Organization",
+            "repository_selection": "selected",
+        },
+        installer={"id": 55, "login": "installer"},
+        repositories=repositories,
+        coverage_plan=plan,
+        completed_at=now,
+    )
+    assert completed is not None
+    assert completed["configuration"]["repositories"] == repositories
+    assert completed["configuration"]["account_id"] == 44
+    assert completed["configuration"]["onboarding"]["completed_at"] == now.isoformat()
+    assert len(completed["coverage_plan"]) == len(GITHUB_SCOPES)
+    target = repo.get_connection_validation_target(tenant, connection_id)
+    assert target is not None
+    assert "install_state_sha256" not in target["credential_reference"]
+    assert "oauth_state_sha256" not in target["credential_reference"]
+    assert "pkce_verifier" not in target["credential_reference"]
+
+    replay = repo.complete_github_connection_setup(
+        tenant,
+        connection_id,
+        expected_oauth_state_sha256=oauth_state_sha256,
+        installation={
+            "account_id": 44,
+            "account_login": "example",
+            "account_type": "Organization",
+            "repository_selection": "selected",
+        },
+        installer={"id": 55, "login": "installer"},
+        repositories=repositories,
         coverage_plan=plan,
         completed_at=now,
     )

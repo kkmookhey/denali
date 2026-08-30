@@ -97,6 +97,8 @@ export type ConnectionValidationResult = {
   project_id?: string;
   project_name?: string;
   project_number?: string;
+  repository_id?: number;
+  repository_full_name?: string;
 };
 
 export type ConnectionValidation = {
@@ -117,11 +119,26 @@ export type ConnectionCoveragePlan = {
   region: string;
   permissions: string[];
   validation_state: "not_validated";
+  repository_id?: number;
+  repository_node_id?: string;
+  repository_full_name?: string;
+};
+
+export type GitHubRepositoryBoundary = {
+  id: number;
+  node_id: string;
+  name: string;
+  full_name: string;
+  owner_id: number;
+  owner_login: string;
+  private: boolean;
+  archived: boolean;
+  default_branch: string | null;
 };
 
 export type Connection = {
   id: string;
-  provider: "aws" | "azure" | "gcp";
+  provider: "aws" | "azure" | "gcp" | "github";
   display_name: string;
   lifecycle_state: "active" | "disabled";
   health_state: "unknown" | "healthy" | "partial" | "unhealthy" | "disabled";
@@ -130,6 +147,7 @@ export type Connection = {
     cloudformation_quick_create: boolean;
     azure_cloud_shell: boolean;
     gcp_cloud_shell: boolean;
+    github_app: boolean;
   };
   credential_reference:
     | {
@@ -145,6 +163,12 @@ export type Connection = {
         type: "gcp_service_account";
         principal_email: string;
         principal_unique_id?: string;
+      }
+    | {
+        type: "github_app_installation";
+        app_id: number;
+        app_slug: string;
+        installation_id?: number;
       };
   declared_scopes: string[];
   coverage_plan: ConnectionCoveragePlan[];
@@ -152,7 +176,7 @@ export type Connection = {
     account_id?: string;
     partition?: "aws" | "aws-us-gov" | "aws-cn";
     deployment_region?: string;
-    coverage_mode?: "automatic" | "selected" | "selected-subscriptions" | "selected-projects";
+    coverage_mode?: "automatic" | "selected" | "selected-subscriptions" | "selected-projects" | "exact-installation-repositories";
     regions?: string[];
     role_name?: string;
     stack_scopes?: string[];
@@ -160,8 +184,13 @@ export type Connection = {
     cloud?: "AzureCloud";
     subscriptions?: Array<{ id: string; name: string }>;
     projects?: Array<{ id: string; name: string; number: string }>;
+    account_login?: string;
+    account_type?: string;
+    installation_repository_selection?: "all" | "selected";
+    repositories?: GitHubRepositoryBoundary[];
+    installer?: { id: number; login: string };
     onboarding?: {
-      method: "cloudformation_quick_create" | "azure_cloud_shell" | "gcp_cloud_shell";
+      method: "cloudformation_quick_create" | "azure_cloud_shell" | "gcp_cloud_shell" | "github_app_installation";
       template_version?: string;
       template_sha256?: string;
       principal_arn?: string;
@@ -169,8 +198,12 @@ export type Connection = {
       script_sha256?: string;
       client_id?: string;
       principal_email?: string;
-      published_at: string;
-      url_expires_at: string;
+      published_at?: string;
+      url_expires_at?: string;
+      created_at?: string;
+      install_expires_at?: string;
+      installation_id?: number;
+      oauth_expires_at?: string;
       completed_at?: string;
     };
   };
@@ -232,6 +265,18 @@ export type GcpSetupLaunch = {
   script_version: string;
   script_sha256: string;
   principal_email: string;
+  expires_at: string;
+};
+
+export type GitHubConnectionCreate = {
+  provider: "github";
+  display_name: string;
+  declared_scopes: string[];
+};
+
+export type GitHubSetupLaunch = {
+  install_url: string;
+  app_slug: string;
   expires_at: string;
 };
 

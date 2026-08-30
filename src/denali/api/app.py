@@ -11,9 +11,11 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Lock
 from time import monotonic, sleep
 from typing import Annotated, Any, Literal, Protocol
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
@@ -28,6 +30,7 @@ from denali.connections import (
     AZURE_CLOUD_PUBLIC,
     AZURE_SCOPES,
     GCP_SCOPES,
+    GITHUB_SCOPES,
     AwsCloudFormationLauncher,
     AwsConnectionValidator,
     AzureConnectionValidator,
@@ -35,9 +38,12 @@ from denali.connections import (
     GcpConnectionPrincipalProvisioner,
     GcpConnectionValidator,
     GcpSetupScriptLauncher,
+    GitHubAppClient,
+    GitHubConnectionValidator,
     aws_connection_coverage_plan,
     azure_coverage_plan,
     gcp_coverage_plan,
+    github_coverage_plan,
 )
 from denali.connections.aws import render_cloudformation
 from denali.connections.gcp import valid_gcp_project_id
@@ -115,6 +121,38 @@ class InventoryReader(Protocol):
         *,
         expected_setup_token_sha256: str,
         projects: list[dict[str, str]],
+        coverage_plan: list[dict[str, Any]],
+        completed_at: datetime,
+    ) -> dict[str, Any] | None: ...
+
+    def record_github_install_launch(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        launch: dict[str, Any],
+        state_sha256: str,
+    ) -> dict[str, Any] | None: ...
+
+    def record_github_install_return(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_install_state_sha256: str,
+        installation_id: int,
+        oauth: dict[str, Any],
+    ) -> dict[str, Any] | None: ...
+
+    def complete_github_connection_setup(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        expected_oauth_state_sha256: str,
+        installation: dict[str, Any],
+        installer: dict[str, Any],
+        repositories: list[dict[str, Any]],
         coverage_plan: list[dict[str, Any]],
         completed_at: datetime,
     ) -> dict[str, Any] | None: ...
@@ -297,8 +335,20 @@ class GcpSetupCompletion(BaseModel):
     completion_code: str = Field(min_length=16, max_length=32768)
 
 
+class GitHubConnectionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["github"] = "github"
+    display_name: str = Field(min_length=1, max_length=120)
+    declared_scopes: list[str] = Field(
+        default_factory=lambda: list(GITHUB_SCOPES),
+        min_length=1,
+        max_length=len(GITHUB_SCOPES),
+    )
+
+
 ConnectionCreate = Annotated[
-    AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate,
+    AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate | GitHubConnectionCreate,
     Field(discriminator="provider"),
 ]
 
@@ -313,6 +363,8 @@ def create_app(
     azure_setup_launcher: AzureSetupScriptLauncher | None = None,
     gcp_principal_provisioner: GcpConnectionPrincipalProvisioner | None = None,
     gcp_setup_launcher: GcpSetupScriptLauncher | None = None,
+    github_app_client: GitHubAppClient | None = None,
+    github_connection_validator: GitHubConnectionValidator | None = None,
     onboarding_validation_timeout_seconds: int | None = None,
     onboarding_validation_retry_seconds: int | None = None,
     tenant_id: str | None = None,
@@ -326,6 +378,7 @@ def create_app(
         gcp_principal_provisioner or _gcp_principal_provisioner_from_environment()
     )
     configured_gcp_launcher = gcp_setup_launcher or _gcp_setup_launcher_from_environment()
+    configured_github_app = github_app_client or _github_app_from_environment()
     onboarding_validation_timeout = (
         onboarding_validation_timeout_seconds
         if onboarding_validation_timeout_seconds is not None
@@ -364,6 +417,12 @@ def create_app(
         app.state.azure_setup_launcher = configured_azure_launcher
         app.state.gcp_principal_provisioner = configured_gcp_provisioner
         app.state.gcp_setup_launcher = configured_gcp_launcher
+        app.state.github_app_client = configured_github_app
+        app.state.github_connection_validator = github_connection_validator or (
+            GitHubConnectionValidator(configured_github_app)
+            if configured_github_app is not None
+            else None
+        )
         app.state.onboarding_validation_timeout = onboarding_validation_timeout
         app.state.onboarding_validation_retry = onboarding_validation_retry
         app.state.active_connection_validations = set()
@@ -407,8 +466,11 @@ def create_app(
             "aws": request.app.state.connection_validator,
             "azure": request.app.state.azure_connection_validator,
             "gcp": request.app.state.gcp_connection_validator,
+            "github": request.app.state.github_connection_validator,
         }
         validator = validators[target["provider"]]
+        if validator is None:
+            raise HTTPException(status_code=503, detail="connection validator is not configured")
         retry_seconds = request.app.state.onboarding_validation_retry
         timeout_seconds = request.app.state.onboarding_validation_timeout
 
@@ -545,6 +607,46 @@ def create_app(
                     configuration={
                         "coverage_mode": "selected-projects",
                         "projects": [],
+                    },
+                )
+                return _with_validation_state(request, current_tenant, created)
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+
+        if isinstance(connection, GitHubConnectionCreate):
+            github_app = request.app.state.github_app_client
+            if github_app is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "GitHub onboarding is not configured; set the GitHub App ID, "
+                        "client credentials, slug, callback URL, and private-key file"
+                    ),
+                )
+            scopes = list(dict.fromkeys(connection.declared_scopes))
+            unsupported_scopes = [scope for scope in scopes if scope not in GITHUB_SCOPES]
+            if unsupported_scopes:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"unsupported GitHub scope: {', '.join(unsupported_scopes)}",
+                )
+            connection_id = str(uuid4())
+            try:
+                created = repo.create_connection(
+                    current_tenant,
+                    connection_id=connection_id,
+                    provider="github",
+                    display_name=display_name,
+                    credential_type="github_app_installation",
+                    credential_reference={
+                        "app_id": github_app.app_id,
+                        "app_slug": github_app.app_slug,
+                    },
+                    declared_scopes=scopes,
+                    coverage_plan=[],
+                    configuration={
+                        "coverage_mode": "exact-installation-repositories",
+                        "repositories": [],
                     },
                 )
                 return _with_validation_state(request, current_tenant, created)
@@ -955,6 +1057,168 @@ def create_app(
             wait_for_healthy=True,
         )
 
+    @app.post("/v1/connections/{connection_id}/github/setup/launch", status_code=201)
+    def launch_github_setup(
+        request: Request,
+        response: Response,
+        connection_id: UUID,
+    ) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "github":
+            raise HTTPException(status_code=404, detail="GitHub connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot be launched")
+        github_app = request.app.state.github_app_client
+        if github_app is None:
+            raise HTTPException(status_code=503, detail="GitHub App onboarding is not configured")
+        launch = github_app.create_install_launch(
+            tenant_id=current_tenant,
+            connection_id=str(connection_id),
+        )
+        recorded = repo.record_github_install_launch(
+            current_tenant,
+            str(connection_id),
+            launch={
+                "method": "github_app_installation",
+                "app_id": github_app.app_id,
+                "app_slug": github_app.app_slug,
+                "created_at": launch["created_at"].isoformat(),
+                "install_expires_at": launch["expires_at"].isoformat(),
+            },
+            state_sha256=launch["state_sha256"],
+        )
+        if recorded is None:
+            raise HTTPException(status_code=409, detail="connection changed during launch")
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "install_url": launch["install_url"],
+            "app_slug": github_app.app_slug,
+            "expires_at": launch["expires_at"],
+        }
+
+    @app.get("/v1/connections/github/setup/callback", include_in_schema=False)
+    def github_install_callback(
+        request: Request,
+        state: str = Query(min_length=32, max_length=1024),
+        installation_id: int = Query(gt=0),
+    ) -> RedirectResponse:
+        repo, current_tenant = _context(request)
+        state_tenant, connection_id = _github_state_context(state)
+        if state_tenant != current_tenant:
+            raise HTTPException(status_code=409, detail="GitHub setup state is invalid")
+        target = repo.get_connection_validation_target(current_tenant, connection_id)
+        if target is None or target["provider"] != "github":
+            raise HTTPException(status_code=404, detail="GitHub connection not found")
+        expected_hash = target["credential_reference"].get("install_state_sha256")
+        if not expected_hash or not hmac.compare_digest(expected_hash, _sha256_text(state)):
+            raise HTTPException(status_code=409, detail="GitHub setup state is invalid")
+        _require_current_setup_expiry(
+            target,
+            key="install_expires_at",
+            detail="GitHub installation launch has expired",
+        )
+        github_app = request.app.state.github_app_client
+        if github_app is None:
+            raise HTTPException(status_code=503, detail="GitHub App onboarding is not configured")
+        oauth = github_app.create_oauth_launch(
+            tenant_id=current_tenant,
+            connection_id=connection_id,
+        )
+        recorded = repo.record_github_install_return(
+            current_tenant,
+            connection_id,
+            expected_install_state_sha256=expected_hash,
+            installation_id=installation_id,
+            oauth={
+                "state_sha256": oauth["state_sha256"],
+                "pkce_verifier": oauth["pkce_verifier"],
+                "created_at": oauth["created_at"].isoformat(),
+                "expires_at": oauth["expires_at"].isoformat(),
+            },
+        )
+        if recorded is None:
+            raise HTTPException(status_code=409, detail="GitHub connection changed during setup")
+        return RedirectResponse(oauth["authorize_url"], status_code=303)
+
+    @app.get("/v1/connections/github/oauth/callback", include_in_schema=False)
+    def github_oauth_callback(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        state: str = Query(min_length=32, max_length=1024),
+        code: str = Query(min_length=8, max_length=1024),
+    ) -> RedirectResponse:
+        repo, current_tenant = _context(request)
+        state_tenant, connection_id = _github_state_context(state)
+        if state_tenant != current_tenant:
+            raise HTTPException(status_code=409, detail="GitHub OAuth state is invalid")
+        target = repo.get_connection_validation_target(current_tenant, connection_id)
+        if target is None or target["provider"] != "github":
+            raise HTTPException(status_code=404, detail="GitHub connection not found")
+        expected_hash = target["credential_reference"].get("oauth_state_sha256")
+        if not expected_hash or not hmac.compare_digest(expected_hash, _sha256_text(state)):
+            raise HTTPException(status_code=409, detail="GitHub OAuth state is invalid")
+        _require_current_setup_expiry(
+            target,
+            key="oauth_expires_at",
+            detail="GitHub installer verification has expired",
+        )
+        github_app = request.app.state.github_app_client
+        if github_app is None:
+            raise HTTPException(status_code=503, detail="GitHub App onboarding is not configured")
+        try:
+            user_token = github_app.exchange_user_code(
+                code=code,
+                pkce_verifier=target["credential_reference"]["pkce_verifier"],
+            )
+            verified = github_app.verify_user_installation(
+                installation_id=target["credential_reference"]["installation_id"],
+                user_token=user_token,
+            )
+        except Exception:
+            failure_query = urlencode(
+                {
+                    "github_setup": "failed",
+                    "connection_id": connection_id,
+                    "detail": "GitHub could not verify the installer and App installation",
+                }
+            )
+            return RedirectResponse(
+                f"{github_app.web_url}/?{failure_query}",
+                status_code=303,
+            )
+        installation = verified["installation"]
+        repositories = verified["repositories"]
+        completed_at = datetime.now(UTC)
+        updated = repo.complete_github_connection_setup(
+            current_tenant,
+            connection_id,
+            expected_oauth_state_sha256=expected_hash,
+            installation=installation,
+            installer=verified["installer"],
+            repositories=repositories,
+            coverage_plan=github_coverage_plan(target["declared_scopes"], repositories),
+            completed_at=completed_at,
+        )
+        if updated is None:
+            raise HTTPException(status_code=409, detail="GitHub connection changed during setup")
+        validation_target = repo.get_connection_validation_target(current_tenant, connection_id)
+        if validation_target is None:
+            raise HTTPException(status_code=409, detail="GitHub connection changed during setup")
+        queue_validation(
+            request,
+            background_tasks,
+            repo,
+            current_tenant,
+            validation_target,
+            wait_for_credentials=False,
+        )
+        return RedirectResponse(
+            f"{github_app.web_url}/?"
+            f"{urlencode({'github_setup': 'succeeded', 'connection_id': connection_id})}",
+            status_code=303,
+        )
+
     @app.post("/v1/connections/{connection_id}/validate", status_code=202)
     def validate_connection(
         request: Request,
@@ -968,7 +1232,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="connection not found")
         if target["lifecycle_state"] != "active":
             raise HTTPException(status_code=409, detail="disabled connections cannot be validated")
-        if target["provider"] not in {"aws", "azure", "gcp"}:
+        if target["provider"] not in {"aws", "azure", "gcp", "github"}:
             raise HTTPException(status_code=422, detail="connection provider is not supported")
         if target["provider"] == "azure" and not target["configuration"].get("subscriptions"):
             raise HTTPException(
@@ -979,6 +1243,11 @@ def create_app(
             raise HTTPException(
                 status_code=409,
                 detail="complete Google Cloud project selection before validation",
+            )
+        if target["provider"] == "github" and not target["configuration"].get("repositories"):
+            raise HTTPException(
+                status_code=409,
+                detail="complete GitHub App installation before validation",
             )
         return queue_validation(
             request,
@@ -1310,6 +1579,10 @@ def _with_validation_state(
             result["provider"] == "gcp"
             and request.app.state.gcp_setup_launcher is not None
         ),
+        "github_app": (
+            result["provider"] == "github"
+            and request.app.state.github_app_client is not None
+        ),
     }
     return result
 
@@ -1373,6 +1646,33 @@ def _gcp_principal_provisioner_from_environment(
     if not operator_project_id:
         return None
     return GcpConnectionPrincipalProvisioner(operator_project_id=operator_project_id)
+
+
+def _github_app_from_environment() -> GitHubAppClient | None:
+    app_id = os.environ.get("DENALI_GITHUB_APP_ID")
+    client_id = os.environ.get("DENALI_GITHUB_CLIENT_ID")
+    client_secret = os.environ.get("DENALI_GITHUB_CLIENT_SECRET")
+    app_slug = os.environ.get("DENALI_GITHUB_APP_SLUG")
+    private_key_file = os.environ.get("DENALI_GITHUB_PRIVATE_KEY_FILE")
+    callback_url = os.environ.get(
+        "DENALI_GITHUB_CALLBACK_URL",
+        "http://127.0.0.1:8088/v1/connections/github/oauth/callback",
+    )
+    web_url = os.environ.get("DENALI_WEB_URL", "http://127.0.0.1:3080")
+    if not all((app_id, client_id, client_secret, app_slug, private_key_file)):
+        return None
+    if not str(app_id).isdigit():
+        raise ValueError("DENALI_GITHUB_APP_ID must be a positive integer")
+    private_key = Path(str(private_key_file)).read_text(encoding="utf-8")
+    return GitHubAppClient(
+        app_id=int(str(app_id)),
+        client_id=str(client_id),
+        client_secret=str(client_secret),
+        private_key=private_key,
+        app_slug=str(app_slug),
+        callback_url=callback_url,
+        web_url=web_url,
+    )
 
 
 def _decode_azure_completion_code(value: str) -> dict[str, Any]:
@@ -1465,6 +1765,33 @@ def _valid_uuid_text(value: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _github_state_context(value: str) -> tuple[str, str]:
+    try:
+        tenant_id, connection_id, token = value.split(".", 2)
+        UUID(tenant_id)
+        UUID(connection_id)
+    except (ValueError, AttributeError) as error:
+        raise HTTPException(status_code=409, detail="GitHub setup state is invalid") from error
+    if len(token) < 32:
+        raise HTTPException(status_code=409, detail="GitHub setup state is invalid")
+    return tenant_id, connection_id
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _require_current_setup_expiry(
+    target: dict[str, Any], *, key: str, detail: str
+) -> None:
+    try:
+        expires_at = datetime.fromisoformat(target["configuration"]["onboarding"][key])
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=409, detail="GitHub setup launch is not current") from error
+    if datetime.now(UTC) > expires_at:
+        raise HTTPException(status_code=409, detail=detail)
 
 
 def _bounded_environment_integer(

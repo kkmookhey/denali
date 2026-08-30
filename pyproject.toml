@@ -50,6 +50,9 @@ gcp = [
   "google-auth>=2.35",
   "google-cloud-logging>=3.12",
 ]
+github = [
+  "PyJWT[crypto]>=2.9",
+]
 dev = [
   "pytest>=8",
   "ruff>=0.6",

@@ -7,6 +7,8 @@ import type {
   AzureSetupLaunch,
   GcpConnectionCreate,
   GcpSetupLaunch,
+  GitHubConnectionCreate,
+  GitHubSetupLaunch,
   Connection,
   Coverage,
   CodeToCloudDeployment,
@@ -52,7 +54,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   connections: () => request<{ items: Connection[] }>("/v1/connections"),
   connection: (id: string) => request<Connection>(`/v1/connections/${id}`),
-  createConnection: (connection: AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate) =>
+  createConnection: (connection: AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate | GitHubConnectionCreate) =>
     request<Connection>("/v1/connections", {
       method: "POST",
       body: JSON.stringify(connection),
@@ -95,6 +97,11 @@ export const api = {
     request<{ status: "started" | "already_running"; connection_id: string }>(
       `/v1/connections/${id}/gcp/setup/complete`,
       { method: "POST", body: JSON.stringify({ completion_code: completionCode }) },
+    ),
+  launchGitHubSetup: (id: string) =>
+    request<GitHubSetupLaunch>(
+      `/v1/connections/${id}/github/setup/launch`,
+      { method: "POST" },
     ),
   summary: () => request<Summary>("/v1/inventory/summary"),
   assets: () => request<{ items: Asset[] }>("/v1/inventory/assets?limit=500"),
