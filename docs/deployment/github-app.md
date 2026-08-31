@@ -3,8 +3,10 @@
 Denali connects to customers' GitHub repositories through an organization-owned GitHub
 App rather than anyone's personal login. Customers install the app on the repositories
 they choose, and it receives only the read-only permissions the connector requires
-(`src/denali/connections/github.py` enforces the same set at setup time). The API
-authenticates as the app with the client secret and PEM private key.
+(`src/denali/connections/github.py` enforces the same set at setup time). The API signs
+GitHub App JWTs with the PEM private key. The client secret is used only for the brief,
+PKCE-protected user OAuth exchange that verifies access to the selected installation;
+the resulting user token is discarded.
 
 The app was registered on 2026-08-30 at
 `https://github.com/organizations/transilienceai/settings/apps/new` so it is owned by
@@ -64,12 +66,17 @@ Registration result with the App ID and Client ID:
 Both credentials were generated on 2026-08-30 on the app's settings page
 (`https://github.com/organizations/transilienceai/settings/apps/transilience-denali`):
 
-- **Client secret** — generated under **Client secrets** (`*****bd277930`). GitHub shows
-  the full value only once, at generation time; it lives in the team secret manager.
+- **Client secret** — generated under **Client secrets**. Its value and suffix are
+  intentionally not recorded in this repository. GitHub shows the full value only once,
+  at generation time; production deployments should load it from a secret manager.
 - **Private key** — generated under **Private keys**, fingerprint
   `SHA256:Ysxinmx5uaCNl4AMXI3teiUeYDZhuJDFpJlWKbVZ0uc=`. GitHub downloads the `.pem`
-  file at generation time; it is stored in the secret manager and placed on the API host
-  outside the repository.
+  file at generation time. Production deployments should store it in a secret manager
+  and mount it read-only into the API container.
+
+For local acceptance only, the ignored `.env` and ignored PEM host file are mode `0600`;
+the key is mounted read-only and neither credential is stored in Denali's connection
+database or container image.
 
 Never commit either value. To rotate, generate a new secret/key on the same page, roll
 the deployment, then delete the old one.
