@@ -93,8 +93,9 @@ incur fixture cost. The six pre-existing Container Apps in other resource groups
 changed.
 
 Azure Resource Manager still reported the now-empty resource-group shell as `Deleting` at
-`2026-08-31T21:05:50Z`, more than 20 minutes after accepting the request. This is provider-side
-asynchronous cleanup, not a retained fixture. The exact non-mutating follow-up check is:
+`2026-08-31T21:05:50Z`, more than 20 minutes after accepting the request. Provider-side
+asynchronous cleanup then completed, and the exact non-mutating follow-up returned `false`
+before session close:
 
 ```bash
 az group exists --name denali-c2c-azure-20260831 -o tsv
