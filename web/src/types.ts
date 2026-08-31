@@ -143,6 +143,8 @@ export type Connection = {
   lifecycle_state: "active" | "disabled";
   health_state: "unknown" | "healthy" | "partial" | "unhealthy" | "disabled";
   validation_state?: "idle" | "running";
+  source_collection_state?: "idle" | "running";
+  last_source_collection?: GitHubSourceCollection | null;
   setup_capabilities: {
     cloudformation_quick_create: boolean;
     azure_cloud_shell: boolean;
@@ -211,6 +213,28 @@ export type Connection = {
   updated_at?: string;
   last_validated_at?: string | null;
   last_validation: ConnectionValidation | null;
+};
+
+export type GitHubSourceCollectionRepository = {
+  repository_id: number;
+  repository: string;
+  state: "complete" | "partial" | "failed";
+  detail?: string;
+  revision?: string;
+  files?: number;
+  bytes?: number;
+  correlation?: CodeToCloudCorrelationSummary;
+};
+
+export type GitHubSourceCollection = {
+  connection_id: string;
+  state: "complete" | "partial" | "failed";
+  completed_at: string;
+  repository_count: number;
+  failed_count: number;
+  partial_count: number;
+  repositories: GitHubSourceCollectionRepository[];
+  detail?: string;
 };
 
 export type AwsCloudFormationLaunch = {
@@ -547,6 +571,44 @@ export type CodeToCloudDeployment = {
   artifact_vulnerability_count: number;
   artifact_vulnerability_id_count: number;
   artifact_vulnerabilities: CodeToCloudVulnerability[];
+};
+
+export type CodeToCloudCorrelationSummary = {
+  declarations: number;
+  proven: number;
+  ambiguous: number;
+  unmatched: number;
+  targets_evaluated: number;
+};
+
+export type CodeToCloudCandidate = {
+  status: "proven" | "ambiguous" | "unmatched";
+  service: string;
+  construct_id: string;
+  deployment_identifier: string;
+  source_path: string;
+  source_line: number;
+  match_basis: string[];
+  matched_workloads: string[];
+  matched_workload_count: number;
+};
+
+export type CodeToCloudObservation = {
+  connection_id: string;
+  repository_id: string | null;
+  repository_natural_key: string;
+  repository_name: string | null;
+  source_state: "complete" | "partial" | "failed" | null;
+  source_detail: string | null;
+  source_run_id: string | null;
+  source_collected_at: string | null;
+  analysis_state: "complete" | "partial" | "failed" | null;
+  analysis_detail: string | null;
+  analysis_run_id: string | null;
+  analysis_collected_at: string | null;
+  correlation_summary: CodeToCloudCorrelationSummary | null;
+  correlation_candidates: CodeToCloudCandidate[];
+  evidence: Evidence | null;
 };
 
 export type Vulnerability = {

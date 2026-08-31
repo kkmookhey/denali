@@ -108,8 +108,8 @@ checks remain a later, separately permissioned plane.
 ## Deferred work
 
 - Branch-protection and pull-request posture with explicit Administration read permission.
-- Repository source collection and code-to-cloud correlation using the established evidence
-  ingestion contracts.
+- Repository source collection and code-to-cloud correlation are defined separately in
+  [ADR 0022](0022-github-source-collection.md); they do not broaden validation semantics.
 - Reconfiguration reconciliation when a repository is removed, transferred, renamed, or an
   installation is uninstalled.
 - GitHub Enterprise Server support; this slice is limited to `github.com`.

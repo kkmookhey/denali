@@ -12,6 +12,7 @@ import type {
   Connection,
   Coverage,
   CodeToCloudDeployment,
+  CodeToCloudObservation,
   Finding,
   FindingDetail,
   FindingSummary,
@@ -103,6 +104,11 @@ export const api = {
       `/v1/connections/${id}/github/setup/launch`,
       { method: "POST" },
     ),
+  collectGitHubSource: (id: string) =>
+    request<{ status: "started" | "already_running"; connection_id: string }>(
+      `/v1/connections/${id}/github/collect`,
+      { method: "POST" },
+    ),
   summary: () => request<Summary>("/v1/inventory/summary"),
   assets: () => request<{ items: Asset[] }>("/v1/inventory/assets?limit=500"),
   asset: (id: string) => request<AssetDetail>(`/v1/inventory/assets/${id}`),
@@ -120,6 +126,8 @@ export const api = {
   issueEvaluations: () => request<{ items: IssueEvaluation[] }>("/v1/issues/evaluations"),
   codeToCloudDeployments: () =>
     request<{ items: CodeToCloudDeployment[] }>("/v1/code-to-cloud/deployments"),
+  codeToCloudObservations: () =>
+    request<{ items: CodeToCloudObservation[] }>("/v1/code-to-cloud/observations"),
   activitySummary: (includeFixtures = false) =>
     request<RuntimeActivitySummary>(
       `/v1/activity/summary?include_fixtures=${includeFixtures}`,

@@ -269,6 +269,23 @@ class FakeGitHubApp:
         }
 
 
+class FakeGitHubRepositoryCollector:
+    def __init__(self):
+        self.calls: list[dict[str, Any]] = []
+
+    def collect(self, *, tenant_id: str, connection: dict[str, Any], repository: Any):
+        self.calls.append({"tenant_id": tenant_id, "connection": connection})
+        return {
+            "connection_id": connection["id"],
+            "state": "complete",
+            "completed_at": datetime.now(UTC).isoformat(),
+            "repository_count": 2,
+            "failed_count": 0,
+            "partial_count": 0,
+            "repositories": [],
+        }
+
+
 class PassingGitHubValidator:
     def validate(self, target: dict[str, Any]) -> dict[str, Any]:
         now = datetime.now(UTC)
@@ -370,6 +387,47 @@ def test_github_app_setup_verifies_installer_and_discards_transient_tokens() -> 
             oauth_state,
         ):
             assert secret not in serialized
+
+
+def test_github_source_collection_runs_in_background_and_reports_completion() -> None:
+    repository = GitHubConnectionRepositoryStub()
+    target = {
+        "id": CONNECTION_ID,
+        "provider": "github",
+        "display_name": "Production GitHub",
+        "lifecycle_state": "active",
+        "credential_reference": {
+            "app_id": 12345,
+            "app_slug": "denali-fixture",
+            "installation_id": INSTALLATION_ID,
+        },
+        "declared_scopes": list(GITHUB_SCOPES),
+        "coverage_plan": github_coverage_plan(list(GITHUB_SCOPES), REPOSITORIES),
+        "configuration": {
+            "account_id": 44,
+            "account_login": "example",
+            "repositories": REPOSITORIES,
+        },
+    }
+    repository.targets[CONNECTION_ID] = target
+    repository.rows[CONNECTION_ID] = repository._safe(target)
+    collector = FakeGitHubRepositoryCollector()
+    app = create_app(
+        repository=repository,
+        github_app_client=FakeGitHubApp(),  # type: ignore[arg-type]
+        github_repository_collector=collector,  # type: ignore[arg-type]
+        migrate_on_start=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(f"/v1/connections/{CONNECTION_ID}/github/collect")
+        assert response.status_code == 202
+        assert response.json()["status"] == "started"
+        detail = client.get(f"/v1/connections/{CONNECTION_ID}").json()
+
+    assert collector.calls[0]["tenant_id"] == DEFAULT_LOCAL_TENANT
+    assert detail["source_collection_state"] == "idle"
+    assert detail["last_source_collection"]["state"] == "complete"
 
 
 def test_github_app_setup_does_not_trust_the_returned_installation_id() -> None:

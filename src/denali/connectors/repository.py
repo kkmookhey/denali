@@ -132,17 +132,32 @@ class RepositoryConnector:
     capabilities = CAPABILITIES
 
     def __init__(
-        self, root: Path, *, repository_name: str | None = None, app_id: str | None = None
+        self,
+        root: Path,
+        *,
+        repository_name: str | None = None,
+        app_id: str | None = None,
+        remote: str | None = None,
+        commit: str | None = None,
+        dirty: bool | None = None,
+        source_type: str = "local_git_repository",
+        source_locator: str | None = None,
     ):
         self.root = root.expanduser().resolve()
         if not self.root.is_dir():
             raise ValueError(f"repository path is not a directory: {self.root}")
-        self.remote = _git(self.root, "remote", "get-url", "origin")
-        self.commit = _git(self.root, "rev-parse", "HEAD") or "working-tree"
-        self.dirty = bool(_git(self.root, "status", "--porcelain"))
+        self.remote = remote if remote is not None else _git(
+            self.root, "remote", "get-url", "origin"
+        )
+        self.commit = commit or _git(self.root, "rev-parse", "HEAD") or "working-tree"
+        self.dirty = (
+            dirty if dirty is not None else bool(_git(self.root, "status", "--porcelain"))
+        )
         self.revision = f"{self.commit}+dirty" if self.dirty else self.commit
         self.repository_name = repository_name or _canonical_repository(self.remote, self.root)
         self.app_id = _normalize_name(app_id or self.root.name)
+        self.source_type = source_type
+        self.source_locator = source_locator or f"file://{self.root}"
 
     def collect(self, *, connection_id: str | None = None) -> InventoryBatch:
         observed_at = datetime.now(UTC)
@@ -162,8 +177,8 @@ class RepositoryConnector:
             assertion_type=AssertionType.OBSERVED,
             confidence=1.0,
             evidence=Evidence(
-                source_type="local_git_repository",
-                locator=f"file://{self.root}",
+                source_type=self.source_type,
+                locator=self.source_locator,
                 observed_at=observed_at,
                 payload={"remote": self.remote, "commit": self.commit, "dirty": self.dirty},
             ),
@@ -171,7 +186,11 @@ class RepositoryConnector:
                 "remote": self.remote,
                 "commit": self.commit,
                 "dirty": self.dirty,
-                "local_path": str(self.root),
+                **(
+                    {"local_path": str(self.root)}
+                    if self.source_type == "local_git_repository"
+                    else {}
+                ),
             },
         )
 

@@ -79,9 +79,21 @@ class RepositoryPostureConnector:
         *,
         repository_name: str | None = None,
         app_id: str | None = None,
+        remote: str | None = None,
+        commit: str | None = None,
+        dirty: bool | None = None,
+        source_type: str = "local_git_repository",
+        source_locator: str | None = None,
     ) -> None:
         metadata = RepositoryConnector(
-            root, repository_name=repository_name, app_id=app_id
+            root,
+            repository_name=repository_name,
+            app_id=app_id,
+            remote=remote,
+            commit=commit,
+            dirty=dirty,
+            source_type=source_type,
+            source_locator=source_locator,
         )
         self.root = metadata.root
         self.repository_name = metadata.repository_name
@@ -187,7 +199,10 @@ class RepositoryPostureConnector:
             observed_at=observed_at,
             evidence=Evidence(
                 source_type="static_source_analysis",
-                locator=f"repo://{self.repository_name}/{site.path}#L{site.line}",
+                locator=(
+                    f"repo://{self.repository_name}@{self.revision}/"
+                    f"{site.path}#L{site.line}"
+                ),
                 observed_at=observed_at,
                 payload={
                     "command": site.command,

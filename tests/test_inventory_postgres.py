@@ -1120,6 +1120,20 @@ new nodejs.NodejsFunction(this, 'AgentFn', {
     ).collect()
     repo.ingest(tenant, correlated)
 
+    observations = repo.code_to_cloud_observations(tenant)
+    assert len(observations) == 1
+    assert observations[0]["repository_natural_key"] == "github.com/example/anna"
+    assert observations[0]["source_state"] is None
+    assert observations[0]["analysis_state"] == "complete"
+    assert observations[0]["correlation_summary"] == {
+        "declarations": 1,
+        "proven": 1,
+        "ambiguous": 0,
+        "unmatched": 0,
+        "targets_evaluated": 1,
+    }
+    assert observations[0]["correlation_candidates"][0]["status"] == "proven"
+
     scan_time = now + timedelta(minutes=1)
     component = SoftwareComponentAssertion(
         identity=ComponentIdentity(

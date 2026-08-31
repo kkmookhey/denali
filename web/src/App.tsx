@@ -56,6 +56,7 @@ import type {
   GcpSetupLaunch,
   GitHubConnectionCreate,
   CodeToCloudDeployment,
+  CodeToCloudObservation,
   Connection,
   ConnectionValidationResult,
   Coverage,
@@ -221,6 +222,7 @@ function App() {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [issueEvaluations, setIssueEvaluations] = useState<IssueEvaluation[]>([]);
   const [deployments, setDeployments] = useState<CodeToCloudDeployment[]>([]);
+  const [codeToCloudObservations, setCodeToCloudObservations] = useState<CodeToCloudObservation[]>([]);
   const [activitySummary, setActivitySummary] = useState<RuntimeActivitySummary | null>(null);
   const [activities, setActivities] = useState<RuntimeActivity[]>([]);
   const [detectionSummary, setDetectionSummary] = useState<RuntimeDetectionSummary | null>(null);
@@ -277,6 +279,7 @@ function App() {
         issuesResult,
         issueEvaluationsResult,
         deploymentsResult,
+        codeToCloudObservationsResult,
         activitySummaryResult,
         activityResult,
         detectionSummaryResult,
@@ -295,6 +298,7 @@ function App() {
         api.issues(),
         api.issueEvaluations(),
         api.codeToCloudDeployments(),
+        api.codeToCloudObservations(),
         api.activitySummary(),
         api.activity(),
         api.detectionSummary(),
@@ -313,6 +317,7 @@ function App() {
       setIssues(issuesResult.items);
       setIssueEvaluations(issueEvaluationsResult.items);
       setDeployments(deploymentsResult.items);
+      setCodeToCloudObservations(codeToCloudObservationsResult.items);
       setActivitySummary(activitySummaryResult);
       setActivities(activityResult.items);
       setDetectionSummary(detectionSummaryResult);
@@ -486,6 +491,7 @@ function App() {
           ) : page === "codeToCloud" ? (
             <CodeToCloud
               deployments={deployments}
+              observations={codeToCloudObservations}
               onOpenAsset={setSelectedId}
               onOpenFinding={setSelectedFindingId}
               onOpenVulnerability={setSelectedVulnerabilityId}
@@ -1306,11 +1312,13 @@ function IssueEvidence({ detail }: { detail: IssueDetail }) {
 
 function CodeToCloud({
   deployments,
+  observations,
   onOpenAsset,
   onOpenFinding,
   onOpenVulnerability,
 }: {
   deployments: CodeToCloudDeployment[];
+  observations: CodeToCloudObservation[];
   onOpenAsset: (id: string) => void;
   onOpenFinding: (id: string) => void;
   onOpenVulnerability: (id: string) => void;
@@ -1319,6 +1327,15 @@ function CodeToCloud({
   const modelCount = new Set(
     deployments.flatMap((item) => item.models.map((model) => model.id)),
   ).size;
+  const correlationTotals = observations.reduce(
+    (total, observation) => ({
+      declarations: total.declarations + (observation.correlation_summary?.declarations ?? 0),
+      proven: total.proven + (observation.correlation_summary?.proven ?? 0),
+      ambiguous: total.ambiguous + (observation.correlation_summary?.ambiguous ?? 0),
+      unmatched: total.unmatched + (observation.correlation_summary?.unmatched ?? 0),
+    }),
+    { declarations: 0, proven: 0, ambiguous: 0, unmatched: 0 },
+  );
 
   return <div className="page-stack code-to-cloud-page">
     <section className="page-intro">
@@ -1337,6 +1354,12 @@ function CodeToCloud({
       <ShieldCheck />
       <div><strong>{deployments.length} deterministic deployment links</strong><p>Each link requires both a literal IaC deployment identifier and an observed CloudFormation logical ID. Shared model names can corroborate a link, but never create one.</p></div>
       <span>100% correlation confidence</span>
+    </section>
+
+    <section className="panel correlation-observability">
+      <div className="correlation-observability-head"><div><span className="eyebrow">CORRELATION COVERAGE</span><h3>Every candidate has a disposition.</h3><p>Source collection and analysis health stay separate from proven deployment links.</p></div><div><strong>{correlationTotals.declarations}</strong><span>declarations evaluated</span></div></div>
+      <div className="correlation-status-grid"><div className="proven"><small>Proven</small><strong>{correlationTotals.proven}</strong><span>Exact code + control-plane join</span></div><div className="ambiguous"><small>Ambiguous</small><strong>{correlationTotals.ambiguous}</strong><span>No relationship emitted</span></div><div><small>Unmatched</small><strong>{correlationTotals.unmatched}</strong><span>No eligible observed workload</span></div><div><small>Repositories</small><strong>{observations.length}</strong><span>{observations.filter((item) => item.source_state === "failed" || item.analysis_state === "failed").length} failed collections</span></div></div>
+      {observations.length > 0 ? <div className="correlation-observation-list">{observations.map((observation) => <details key={`${observation.connection_id}:${observation.repository_natural_key}`} open={observation.source_state === "failed" || observation.analysis_state === "partial" || observation.analysis_state === "failed"}><summary><span className={`correlation-observation-state ${observation.source_state === "failed" || observation.analysis_state === "failed" ? "failed" : observation.analysis_state === "partial" ? "partial" : "complete"}`}>{observation.source_state === "failed" || observation.analysis_state === "failed" ? <CircleAlert /> : observation.analysis_state === "partial" ? <CircleHelp /> : <CircleCheck />}</span><span><strong>{observation.repository_name ?? observation.repository_natural_key}</strong><small>{observation.evidence?.payload.commit ? `Revision ${String(observation.evidence.payload.commit).slice(0, 12)}` : "Revision unavailable"}</small></span><span className="correlation-observation-counts"><b>{observation.correlation_summary?.proven ?? 0} proven</b><small>{observation.correlation_summary?.ambiguous ?? 0} ambiguous · {observation.correlation_summary?.unmatched ?? 0} unmatched</small></span></summary><div className="correlation-candidates">{observation.source_detail && <p><CircleAlert /> Source: {titleCase(observation.source_detail)}</p>}{observation.analysis_detail && <p><CircleHelp /> Analysis: {observation.analysis_detail}</p>}{observation.correlation_candidates.map((candidate, index) => <div key={`${candidate.source_path}:${candidate.source_line}:${index}`} className={candidate.status}><span>{candidate.status === "proven" ? <CircleCheck /> : candidate.status === "ambiguous" ? <CircleHelp /> : <CircleAlert />}</span><div><strong>{candidate.deployment_identifier}</strong><small>{titleCase(candidate.service)} · {candidate.source_path}:{candidate.source_line}</small><code>{candidate.matched_workloads.length > 0 ? candidate.matched_workloads.join(" · ") : "No exact observed workload match"}</code></div><b>{titleCase(candidate.status)}</b></div>)}</div></details>)}</div> : <div className="correlation-observability-empty"><CircleHelp /><span><strong>No repository analysis recorded</strong><small>Use Collect source & correlate on a configured GitHub connection.</small></span></div>}
     </section>
 
     {deployments.length === 0 ? <section className="panel empty-state"><CloudCog /><strong>No proven deployments yet</strong><span>Collect a repository and an independently observed cloud workload, then run the code-to-cloud correlator.</span></section> : <section className="deployment-list">
@@ -2101,6 +2124,30 @@ function ConnectionsPage({
     }
   }
 
+  async function collectGitHubSource(connection: Connection) {
+    setBusy(`collect:${connection.id}`);
+    setActionError(null);
+    const previousCompletion = connection.last_source_collection?.completed_at ?? null;
+    try {
+      await api.collectGitHubSource(connection.id);
+      for (let attempt = 0; attempt < 525; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        const current = await api.connection(connection.id);
+        if (current.source_collection_state === "running") continue;
+        if (current.last_source_collection?.completed_at !== previousCompletion) {
+          await onChanged();
+          return;
+        }
+        throw new Error("Source collection stopped before a result was recorded.");
+      }
+      throw new Error("Source collection is still running. Refresh shortly to see its result.");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to collect GitHub source");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function disableConnection(connection: Connection) {
     if (!window.confirm(`Disable ${connection.display_name}? Scheduled collection must stop using this connection.`)) return;
     setBusy(`disable:${connection.id}`);
@@ -2180,7 +2227,7 @@ function ConnectionsPage({
         <PanelHeader eyebrow="SOURCES" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
         <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : connection.provider === "azure" ? `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions` : connection.provider === "gcp" ? `${connection.configuration.projects?.length ?? 0} selected projects` : `${connection.configuration.account_login ?? "not installed"} · ${connection.configuration.repositories?.length ?? 0} exact repositories`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No connections configured</strong><span>Create an AWS, Azure, Google Cloud, or GitHub onboarding plan to begin.</span></div>}</div>
       </section>
-      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onPrepareGitHub={() => void prepareGitHubSetup(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
+      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onPrepareGitHub={() => void prepareGitHubSetup(selected)} onCollectGitHub={() => void collectGitHubSource(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
     </div>
   </div>;
 }
@@ -2190,10 +2237,10 @@ function ConnectionHealth({ state }: { state: Connection["health_state"] }) {
   return <span className={`connection-health ${state}`}><Icon />{titleCase(state)}</span>;
 }
 
-function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onPrepareGitHub, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onPrepareGitHub: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onPrepareGitHub, onCollectGitHub, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onPrepareGitHub: () => void; onCollectGitHub: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
   if (connection.provider === "azure") return <AzureConnectionDetail connection={connection} busy={busy} launch={azureLaunch} completionCode={azureCompletionCode} onCompletionCode={onAzureCompletionCode} onPrepare={onPrepareAzure} onComplete={onCompleteAzure} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   if (connection.provider === "gcp") return <GcpConnectionDetail connection={connection} busy={busy} launch={gcpLaunch} completionCode={gcpCompletionCode} onCompletionCode={onGcpCompletionCode} onPrepare={onPrepareGcp} onComplete={onCompleteGcp} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
-  if (connection.provider === "github") return <GitHubConnectionDetail connection={connection} busy={busy} onPrepare={onPrepareGitHub} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
+  if (connection.provider === "github") return <GitHubConnectionDetail connection={connection} busy={busy} onPrepare={onPrepareGitHub} onCollect={onCollectGitHub} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   const validation = connection.last_validation;
   const awsCredential = connection.credential_reference.type === "aws_assume_role" ? connection.credential_reference : null;
   const launching = busy === `launch:${connection.id}`;
@@ -2270,7 +2317,7 @@ function GcpConnectionDetail({ connection, busy, launch, completionCode, onCompl
   </section>;
 }
 
-function GitHubConnectionDetail({ connection, busy, onPrepare, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; onPrepare: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+function GitHubConnectionDetail({ connection, busy, onPrepare, onCollect, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; onPrepare: () => void; onCollect: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
   const validation = connection.last_validation;
   const repositories = connection.configuration.repositories ?? [];
   const setupComplete = repositories.length > 0;
@@ -2314,12 +2361,15 @@ function GitHubConnectionDetail({ connection, busy, onPrepare, onValidate, onDis
   const totalAttention = repositoryGroups.reduce((total, group) => total + group.attention, 0) + unboundResults.length;
   const effectiveFilter = validationFilter === "attention" && attentionRepositories === 0 && unboundResults.length === 0 ? "all" : validationFilter;
   const visibleGroups = repositoryGroups.filter((group) => effectiveFilter === "all" || (effectiveFilter === "attention" ? group.attention > 0 : group.attention === 0));
+  const collecting = connection.source_collection_state === "running" || busy === `collect:${connection.id}`;
+  const collection = connection.last_source_collection;
   return <section className="panel connection-detail">
     <div className="connection-detail-head"><div><span>GITHUB</span><h3>{connection.display_name}</h3><code>{connection.configuration.account_login ? `${connection.configuration.account_type ?? "Account"} ${connection.configuration.account_login}` : credential ? `GitHub App ${credential.app_slug}` : "GitHub App"}</code></div><ConnectionHealth state={connection.health_state} /></div>
     <div className="setup-progress">
       <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Denali’s GitHub App, declared read planes, and an initially empty repository boundary are recorded. No personal access token is requested or stored.</small></div></div>
       <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Install the App and select repositories</strong><small>GitHub shows the App’s exact read permissions and lets you choose repositories. After installation, Denali briefly verifies that the signed-in GitHub user can access that exact installation, records immutable repository IDs, and immediately discards the user token.</small><button className="primary-action" disabled={preparing || !connection.setup_capabilities.github_app} onClick={onPrepare}><ExternalLink />{preparing ? "Opening GitHub…" : setupComplete ? "Reconfigure GitHub App" : "Install / configure GitHub App"}</button>{!connection.setup_capabilities.github_app && <small className="launch-unavailable">GitHub onboarding requires Denali’s configured GitHub App and private signing key.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{repositories.length} exact repositor{repositories.length === 1 ? "y" : "ies"}</strong>{repositories.map((repository) => <code key={repository.id}>{repository.full_name} · ID {repository.id}{repository.private ? " · private" : " · public"}</code>)}{connection.configuration.installation_repository_selection === "all" && <small>GitHub’s installation is set to all repositories, but Denali’s stored coverage remains this exact list. Newly created repositories are not claimed until you reconfigure and verify again.</small>}</div>}</div></div>
       <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every exact repository</strong><small>Denali mints a separate short-lived installation token for one recorded repository at a time, rebinds its immutable identity, and tests each declared read plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating GitHub…" : validation ? "Validate again" : "Validate connection"}</button>}{validating && <small className="validation-progress-note">Validation continues in the background. This page refreshes automatically when every repository is complete.</small>}</div></div>
+      <div className={collection ? (collection.failed_count === 0 && collection.partial_count === 0 ? "complete" : "attention") : "pending"}><span>{collection?.failed_count === 0 && collection?.partial_count === 0 ? <Check /> : "4"}</span><div><strong>4. Collect source and correlate</strong><small>Denali resolves each default branch to an immutable commit, downloads only bounded analysis inputs with a repository-scoped token, and joins literal deployment identifiers to independently observed cloud workloads.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={collecting || validating} onClick={onCollect}><GitBranch className={collecting ? "spin" : undefined} />{collecting ? "Collecting and correlating…" : collection ? "Collect and correlate again" : "Collect source & correlate"}</button>}{collection && <small className="validation-progress-note">{collection.repository_count - collection.failed_count - collection.partial_count} complete · {collection.partial_count} partial · {collection.failed_count} failed · finished {formatTime(collection.completed_at)}</small>}</div></div>
     </div>
     <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed GitHub account ID {validation.account_id_observed ?? "not established"}</small></div><div className="github-validation-overview"><div><small>Exact repositories</small><strong>{repositories.length}</strong><span>{attentionRepositories > 0 ? `${attentionRepositories} need attention` : unboundResults.length > 0 ? `${unboundResults.length} unbound result${unboundResults.length === 1 ? "" : "s"}` : "All repository boundaries checked"}</span></div><div><small>Independent plane checks</small><strong>{repositoryGroups.reduce((total, group) => total + group.results.length, 0)}</strong><span>Metadata · Contents · Actions</span></div><div className="passed"><small>Passed</small><strong>{totalPassed}</strong><span>Successful read checks</span></div><div className={totalAttention > 0 ? "attention" : "passed"}><small>Failed or unknown</small><strong>{totalAttention}</strong><span>{totalAttention > 0 ? "Expanded below" : "No unresolved checks"}</span></div></div><div className="github-validation-toolbar"><div><strong>Repository results</strong><small>Failures and unknowns are listed first. Passing repositories stay compact until expanded.</small></div><div role="group" aria-label="Filter repository validation results"><button type="button" className={effectiveFilter === "attention" ? "active" : ""} disabled={attentionRepositories === 0 && unboundResults.length === 0} onClick={() => setValidationFilter("attention")}>Needs attention <span>{attentionRepositories + (unboundResults.length > 0 ? 1 : 0)}</span></button><button type="button" className={effectiveFilter === "all" ? "active" : ""} onClick={() => setValidationFilter("all")}>All <span>{repositoryGroups.length + (unboundResults.length > 0 ? 1 : 0)}</span></button><button type="button" className={effectiveFilter === "passed" ? "active" : ""} disabled={passingRepositories === 0} onClick={() => setValidationFilter("passed")}>Passing <span>{passingRepositories}</span></button></div></div>{effectiveFilter !== "passed" && unboundResults.length > 0 && <details className="github-repository-validation attention" open><summary><span className="github-repository-state"><CircleAlert /></span><span><strong>Unbound validation results</strong><small>These results do not match a repository in the recorded exact boundary.</small></span><span className="github-plane-statuses" /><span className="github-repository-counts"><b>{unboundResults.length} unknown</b></span></summary><div className="github-plane-results">{unboundResults.map((result, index) => <GitHubValidationResult key={`${result.repository_id ?? "unbound"}:${result.plane}:${index}`} result={result} />)}</div></details>}<div className="github-repository-validations">{visibleGroups.map((group) => <details className={`github-repository-validation ${group.attention > 0 ? "attention" : "passed"}`} key={group.repository.id} open={group.attention > 0}><summary><span className="github-repository-state">{group.attention > 0 ? <CircleAlert /> : <CircleCheck />}</span><span><strong>{group.repository.full_name}</strong><small><code>Repository ID {group.repository.id}</code><code>Node ID {group.repository.node_id}</code></small></span><span className="github-plane-statuses">{group.results.map((result) => <i className={result.state} key={result.plane} title={`${result.label}: ${titleCase(result.state)}`}>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}<em>{result.label.replace("Repository ", "")}</em></i>)}</span><span className="github-repository-counts"><b className={group.attention > 0 ? "attention" : "passed"}>{group.attention > 0 ? `${group.attention} need attention` : `${group.passed} passed`}</b><small>{group.attention > 0 ? "Details expanded" : "Details collapsed"}</small></span></summary><div className="github-plane-results">{group.results.map((result) => <GitHubValidationResult key={`${group.repository.id}:${result.plane}`} result={result} />)}</div></details>)}</div>{visibleGroups.length === 0 && <div className="connection-unknown"><CircleHelp /><span><strong>No repositories match this filter</strong><small>Choose another result filter to inspect the recorded repository boundary.</small></span></div>}</> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Install the GitHub App and finish repository selection first.</small></span></div>}</div>
     <details className="connection-permissions"><summary>Review {permissions.length || 3} declared GitHub permissions</summary><div>{(permissions.length ? permissions : ["metadata:read", "contents:read", "actions:read"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>This slice cannot write source, dispatch workflows, read Actions secrets, administer repositories, receive webhooks, or access repositories outside the recorded immutable IDs. Branch-protection posture is not claimed.</p></details>

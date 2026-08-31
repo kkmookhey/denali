@@ -77,6 +77,8 @@ _ESBUILD_RE = re.compile(
 _MODULE_SUFFIXES = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs")
 _MAX_CDK_MANIFESTS = 20
 _MAX_CDK_MANIFEST_BYTES = 2_000_000
+_MAX_CANDIDATE_OBSERVATIONS = 2_000
+_MAX_CANDIDATE_MATCHES = 25
 _MANIFEST_EXCLUDED_DIRS = frozenset(
     {".git", ".venv", "node_modules", "vendor", "dist", "build"}
 )
@@ -123,13 +125,28 @@ class CodeToCloudConnector:
         *,
         targets: tuple[DeploymentTarget, ...],
         repository_name: str | None = None,
+        remote: str | None = None,
+        commit: str | None = None,
+        dirty: bool | None = None,
+        source_type: str = "local_git_repository",
+        source_locator: str | None = None,
     ) -> None:
-        metadata = RepositoryConnector(root, repository_name=repository_name)
+        metadata = RepositoryConnector(
+            root,
+            repository_name=repository_name,
+            remote=remote,
+            commit=commit,
+            dirty=dirty,
+            source_type=source_type,
+            source_locator=source_locator,
+        )
         self.root = metadata.root
         self.repository_name = metadata.repository_name
         self.commit = metadata.commit
         self.dirty = metadata.dirty
         self.revision = metadata.revision
+        self.source_type = metadata.source_type
+        self.source_locator = metadata.source_locator
         self.targets = targets
 
     def collect(self, *, connection_id: str | None = None) -> InventoryBatch:
@@ -160,17 +177,38 @@ class CodeToCloudConnector:
 
         relationships: list[RelationshipAssertion] = []
         matched_targets: set[str] = set()
+        candidates: list[dict[str, Any]] = []
+        dispositions = {"proven": 0, "ambiguous": 0, "unmatched": 0}
         for declaration in declarations:
             matches = _matching_targets(declaration, self.targets)
             if len(matches) > 1:
+                dispositions["ambiguous"] += 1
+                if len(candidates) < _MAX_CANDIDATE_OBSERVATIONS:
+                    candidates.append(
+                        _candidate_observation(
+                            declaration,
+                            status="ambiguous",
+                            matches=matches,
+                        )
+                    )
                 warnings.append(
                     f"{declaration.path}:{declaration.line}: deployment identifier "
                     f"{declaration.deployment_name!r} matched multiple active workloads"
                 )
                 continue
             if not matches:
+                dispositions["unmatched"] += 1
+                if len(candidates) < _MAX_CANDIDATE_OBSERVATIONS:
+                    candidates.append(
+                        _candidate_observation(declaration, status="unmatched", matches=())
+                    )
                 continue
             target = matches[0]
+            dispositions["proven"] += 1
+            if len(candidates) < _MAX_CANDIDATE_OBSERVATIONS:
+                candidates.append(
+                    _candidate_observation(declaration, status="proven", matches=(target,))
+                )
             if target.natural_key in matched_targets:
                 continue
             matched_targets.add(target.natural_key)
@@ -231,6 +269,12 @@ class CodeToCloudConnector:
                 )
             )
 
+        if len(declarations) > _MAX_CANDIDATE_OBSERVATIONS:
+            warnings.append(
+                "correlation candidate observations exceed safety limit of "
+                f"{_MAX_CANDIDATE_OBSERVATIONS}"
+            )
+
         repo_assertion = AssetAssertion(
             asset=repo_ref,
             coverage_plane=INVENTORY_PLANE,
@@ -238,12 +282,22 @@ class CodeToCloudConnector:
             assertion_type=AssertionType.OBSERVED,
             confidence=1.0,
             evidence=Evidence(
-                source_type="local_git_repository",
-                locator=f"file://{self.root}",
+                source_type=self.source_type,
+                locator=self.source_locator,
                 observed_at=observed_at,
                 payload={"commit": self.commit, "dirty": self.dirty},
             ),
-            attributes={"commit": self.commit, "dirty": self.dirty},
+            attributes={
+                "commit": self.commit,
+                "dirty": self.dirty,
+                "repository_revision": self.revision,
+                "correlation_summary": {
+                    "declarations": len(declarations),
+                    **dispositions,
+                    "targets_evaluated": len(self.targets),
+                },
+                "correlation_candidates": candidates,
+            },
         )
         state = CoverageState.PARTIAL if warnings else CoverageState.COMPLETE
         detail = "; ".join(dict.fromkeys(warnings))[:4_000] if warnings else None
@@ -260,6 +314,29 @@ class CodeToCloudConnector:
             assets=(repo_assertion,),
             relationships=tuple(relationships),
         )
+
+
+def _candidate_observation(
+    declaration: DeploymentDeclaration,
+    *,
+    status: str,
+    matches: tuple[DeploymentTarget, ...],
+) -> dict[str, Any]:
+    """Record correlation disposition without manufacturing a deployment edge."""
+
+    return {
+        "status": status,
+        "service": declaration.service,
+        "construct_id": declaration.construct_id,
+        "deployment_identifier": declaration.deployment_name,
+        "source_path": declaration.path,
+        "source_line": declaration.line,
+        "match_basis": _match_basis(declaration),
+        "matched_workload_count": len(matches),
+        "matched_workloads": [
+            item.natural_key for item in matches[:_MAX_CANDIDATE_MATCHES]
+        ],
+    }
 
 
 def _deployment_declarations(

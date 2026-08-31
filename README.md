@@ -29,6 +29,7 @@ Status terms in this README are deliberately independent:
 | Self-service Microsoft Azure connection | **Shipped** | **Pending live acceptance**. Live subscription setup and healthy validation succeeded after RBAC propagation, but the final connected-browser, unselected-subscription, partial-state, disable, and delete pass remains open |
 | Self-service Google Cloud connection | **Shipped** | **Locally accepted** against three live projects, with a unique keyless principal and all declared project/plane validations passing |
 | Self-service GitHub connection | **Shipped** | **Locally accepted** through the organization-owned GitHub App against 18 exact repositories, with all 54 repository/plane validations passing |
+| GitHub source-to-cloud correlation | **Shipped** | Automated connector, API, PostgreSQL, and production-web gates pass; live GitHub collection and browser acceptance remain pending |
 
 These connection statuses describe onboarding and access validation. They do **not** mean
 that provider collection ran or that inventory, findings, or a security verdict exist.
@@ -42,8 +43,9 @@ Denali presents the following product surfaces in the web application and API:
   repositories, identities, and software components.
 - Atomic configuration and imported findings, scanner-neutral vulnerabilities, and
   deterministic issues assembled only from sufficient independent evidence.
-- Code-to-cloud views that require exact deployment identifiers and keep artifact identity
-  separate from unattested source revision claims.
+- GitHub-backed, immutable-revision source collection and code-to-cloud views that require
+  exact deployment identifiers, preserve unmatched and ambiguous candidates, and keep
+  artifact identity separate from unattested source revision claims.
 - Provider-neutral runtime activity plus deterministic, evidence-linked runtime detections.
 - Source coverage that keeps complete, partial, failed, unsupported, and unknown states
   visible.
@@ -55,7 +57,7 @@ Implemented collection and import paths include:
 
 | Source | Current path |
 | --- | --- |
-| Source repositories | Static Python, TypeScript, and JavaScript AI/MCP discovery; bounded repository posture; exact-identifier code-to-cloud correlation |
+| Source repositories | Local or GitHub App-backed static Python, TypeScript, and JavaScript AI/MCP discovery; bounded repository posture; exact-identifier code-to-cloud correlation |
 | MCP Streamable HTTP | Initialization and paginated `tools/list` observation without tool invocation |
 | AWS | Bedrock Agents Classic, AgentCore, bounded CloudFormation-stack inventory and posture, and Bedrock management activity from CloudTrail Event History |
 | Google Cloud | Vertex AI audit activity from Cloud Logging |
@@ -63,10 +65,10 @@ Implemented collection and import paths include:
 | External findings and scanners | OCSF findings, Syft SBOMs, and Grype vulnerability reports |
 | Runtime exports | AWS Bedrock CloudTrail, Google Cloud Vertex AI, Google Workspace Gemini, and Microsoft Entra AI sign-in JSON |
 
-The provider connections and the collectors are currently separate boundaries. Creating a
-healthy AWS, Azure, GCP, or GitHub connection does not automatically run the corresponding
-collectors. GitHub connection validation does not read source blobs; the existing repository
-scanner operates on a local checkout.
+Provider validation and collection remain separate boundaries. A healthy connection does not
+claim that collection ran. GitHub validation reads no source blobs; an explicit collection
+action separately resolves each selected repository to an immutable revision, applies hard
+tree/file/byte limits, analyzes a temporary snapshot, and discards its token and source files.
 
 ## Evidence boundaries
 
@@ -155,6 +157,7 @@ and evidence limits are documented here:
 - [ADR 0019 — Azure multi-tenant application and selected subscriptions](docs/architecture/0019-self-service-azure-connections.md)
 - [ADR 0020 — GCP keyless principal and selected projects](docs/architecture/0020-self-service-gcp-connections.md)
 - [ADR 0021 — GitHub App and exact repository boundaries](docs/architecture/0021-self-service-github-connections.md)
+- [ADR 0022 — GitHub immutable source collection](docs/architecture/0022-github-source-collection.md)
 - [GitHub App registration and operator configuration](docs/deployment/github-app.md)
 
 The latest acceptance records are the
@@ -196,8 +199,8 @@ Documented planned or deferred capabilities are not shipped:
 
 - GitHub branch-protection and pull-request posture through a separate, explicitly granted
   Administration-read plane.
-- Collection of repository source through the GitHub connection and its integration with
-  existing repository and code-to-cloud evidence paths.
+- Live acceptance of GitHub source collection and correlation against selected repositories
+  and independently observed cloud workloads.
 - GitHub installation/repository lifecycle reconciliation and GitHub Enterprise Server.
 - Slack and Jira onboarding after GitHub acceptance.
 - Application-wide typography and clearer elapsed-time context during bounded cloud-IAM

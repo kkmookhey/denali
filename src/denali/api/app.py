@@ -47,6 +47,8 @@ from denali.connections import (
 )
 from denali.connections.aws import render_cloudformation
 from denali.connections.gcp import valid_gcp_project_id
+from denali.connectors.github_repository import GitHubRepositoryCollector
+from denali.domain import FindingBatch, InventoryBatch
 from denali.store.db import migrate
 from denali.store.repository import PostgresInventoryRepository
 
@@ -54,6 +56,10 @@ DEFAULT_LOCAL_TENANT = "00000000-0000-4000-8000-000000000001"
 
 
 class InventoryReader(Protocol):
+    def ingest(self, tenant_id: str, batch: InventoryBatch) -> dict[str, int]: ...
+
+    def ingest_findings(self, tenant_id: str, batch: FindingBatch) -> dict[str, int]: ...
+
     def create_connection(
         self,
         tenant_id: str,
@@ -223,6 +229,10 @@ class InventoryReader(Protocol):
 
     def code_to_cloud_deployments(self, tenant_id: str) -> list[dict[str, Any]]: ...
 
+    def code_to_cloud_observations(self, tenant_id: str) -> list[dict[str, Any]]: ...
+
+    def deployment_targets(self, tenant_id: str) -> list[dict[str, Any]]: ...
+
     def list_activity(
         self,
         tenant_id: str,
@@ -365,6 +375,7 @@ def create_app(
     gcp_setup_launcher: GcpSetupScriptLauncher | None = None,
     github_app_client: GitHubAppClient | None = None,
     github_connection_validator: GitHubConnectionValidator | None = None,
+    github_repository_collector: GitHubRepositoryCollector | None = None,
     onboarding_validation_timeout_seconds: int | None = None,
     onboarding_validation_retry_seconds: int | None = None,
     tenant_id: str | None = None,
@@ -423,10 +434,18 @@ def create_app(
             if configured_github_app is not None
             else None
         )
+        app.state.github_repository_collector = github_repository_collector or (
+            GitHubRepositoryCollector(configured_github_app)
+            if configured_github_app is not None
+            else None
+        )
         app.state.onboarding_validation_timeout = onboarding_validation_timeout
         app.state.onboarding_validation_retry = onboarding_validation_retry
         app.state.active_connection_validations = set()
         app.state.connection_validation_lock = Lock()
+        app.state.active_github_collections = set()
+        app.state.github_collection_results = {}
+        app.state.github_collection_lock = Lock()
         yield
 
     app = FastAPI(
@@ -497,6 +516,53 @@ def create_app(
                     active_validations.discard(connection_key)
 
         background_tasks.add_task(run_validation)
+        return {"status": "started", "connection_id": connection_id}
+
+    def queue_github_collection(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        repo: InventoryReader,
+        current_tenant: str,
+        target: dict[str, Any],
+    ) -> dict[str, str]:
+        connection_id = str(target["id"])
+        connection_key = (current_tenant, connection_id)
+        collector = request.app.state.github_repository_collector
+        if collector is None:
+            raise HTTPException(
+                status_code=503, detail="GitHub source collection is not configured"
+            )
+        collection_lock = request.app.state.github_collection_lock
+        active_collections = request.app.state.active_github_collections
+        with collection_lock:
+            if connection_key in active_collections:
+                return {"status": "already_running", "connection_id": connection_id}
+            active_collections.add(connection_key)
+
+        def run_collection() -> None:
+            try:
+                result = collector.collect(
+                    tenant_id=current_tenant,
+                    connection=target,
+                    repository=repo,
+                )
+            except Exception:
+                result = {
+                    "connection_id": connection_id,
+                    "state": "failed",
+                    "completed_at": datetime.now(UTC).isoformat(),
+                    "repositories": [],
+                    "repository_count": 0,
+                    "failed_count": 0,
+                    "partial_count": 0,
+                    "detail": "source_collection_failed",
+                }
+            finally:
+                with collection_lock:
+                    request.app.state.github_collection_results[connection_key] = result
+                    active_collections.discard(connection_key)
+
+        background_tasks.add_task(run_collection)
         return {"status": "started", "connection_id": connection_id}
 
     @app.get("/", include_in_schema=False)
@@ -1258,6 +1324,27 @@ def create_app(
             wait_for_credentials=False,
         )
 
+    @app.post("/v1/connections/{connection_id}/github/collect", status_code=202)
+    def collect_github_repository_source(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        connection_id: UUID,
+    ) -> dict[str, str]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "github":
+            raise HTTPException(status_code=404, detail="GitHub connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot collect")
+        if not target["configuration"].get("repositories"):
+            raise HTTPException(
+                status_code=409,
+                detail="complete GitHub App installation before collecting source",
+            )
+        return queue_github_collection(
+            request, background_tasks, repo, current_tenant, target
+        )
+
     @app.post("/v1/connections/{connection_id}/disable")
     def disable_connection(request: Request, connection_id: UUID) -> dict[str, Any]:
         repo, current_tenant = _context(request)
@@ -1267,6 +1354,12 @@ def create_app(
                 raise HTTPException(
                     status_code=409,
                     detail="wait for the active validation to finish before disabling",
+                )
+        with request.app.state.github_collection_lock:
+            if connection_key in request.app.state.active_github_collections:
+                raise HTTPException(
+                    status_code=409,
+                    detail="wait for the active source collection to finish before disabling",
                 )
         row = repo.disable_connection(current_tenant, str(connection_id))
         if row is None:
@@ -1462,6 +1555,11 @@ def create_app(
         repo, current_tenant = _context(request)
         return {"items": repo.code_to_cloud_deployments(current_tenant)}
 
+    @app.get("/v1/code-to-cloud/observations")
+    def code_to_cloud_observations(request: Request) -> dict[str, Any]:
+        repo, current_tenant = _context(request)
+        return {"items": repo.code_to_cloud_observations(current_tenant)}
+
     @app.get("/v1/activity/summary")
     def activity_summary(
         request: Request,
@@ -1566,6 +1664,11 @@ def _with_validation_state(
     with request.app.state.connection_validation_lock:
         running = connection_key in request.app.state.active_connection_validations
     result["validation_state"] = "running" if running else "idle"
+    with request.app.state.github_collection_lock:
+        collecting = connection_key in request.app.state.active_github_collections
+        collection_result = request.app.state.github_collection_results.get(connection_key)
+    result["source_collection_state"] = "running" if collecting else "idle"
+    result["last_source_collection"] = collection_result
     result["setup_capabilities"] = {
         "cloudformation_quick_create": (
             result["provider"] == "aws"

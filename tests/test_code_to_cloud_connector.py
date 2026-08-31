@@ -351,3 +351,27 @@ def test_ambiguous_matches_are_visible_and_not_correlated(tmp_path: Path) -> Non
     assert batch.relationships == ()
     assert {item.state for item in batch.coverage} == {CoverageState.PARTIAL}
     assert "matched multiple active workloads" in (batch.coverage[0].detail or "")
+    summary = batch.assets[0].attributes["correlation_summary"]
+    assert summary == {
+        "declarations": 1,
+        "proven": 0,
+        "ambiguous": 1,
+        "unmatched": 0,
+        "targets_evaluated": 2,
+    }
+    assert batch.assets[0].attributes["correlation_candidates"] == [
+        {
+            "status": "ambiguous",
+            "service": "lambda",
+            "construct_id": "AgentFn",
+            "deployment_identifier": "ni-sales-agent",
+            "source_path": "stack.ts",
+            "source_line": 2,
+            "match_basis": [
+                "cloudformation_logical_id_prefix",
+                "literal_lambda_function_name",
+            ],
+            "matched_workload_count": 2,
+            "matched_workloads": [matching.natural_key, second.natural_key],
+        }
+    ]

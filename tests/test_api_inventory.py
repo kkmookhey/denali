@@ -141,6 +141,24 @@ class RepositoryStub:
     def code_to_cloud_deployments(self, tenant_id: str) -> list[dict[str, Any]]:
         return [{"id": "deployment-1", "repository_name": "anna", "workload_name": "api"}]
 
+    def code_to_cloud_observations(self, tenant_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "connection_id": "github-fixture",
+                "repository_natural_key": "github.com/acme/agent",
+                "source_state": "complete",
+                "analysis_state": "complete",
+                "correlation_summary": {
+                    "declarations": 1,
+                    "proven": 0,
+                    "ambiguous": 0,
+                    "unmatched": 1,
+                    "targets_evaluated": 0,
+                },
+                "correlation_candidates": [],
+            }
+        ]
+
     def list_activity(
         self,
         tenant_id: str,
@@ -322,6 +340,9 @@ def test_code_to_cloud_surface() -> None:
         response = test_client.get("/v1/code-to-cloud/deployments")
         assert response.status_code == 200
         assert response.json()["items"][0]["repository_name"] == "anna"
+        observations = test_client.get("/v1/code-to-cloud/observations")
+        assert observations.status_code == 200
+        assert observations.json()["items"][0]["correlation_summary"]["unmatched"] == 1
 
 
 def test_vulnerability_surface_and_filters() -> None:

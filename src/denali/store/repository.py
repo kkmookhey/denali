@@ -1756,6 +1756,76 @@ class PostgresInventoryRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def code_to_cloud_observations(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Return latest source-collection and correlation disposition per repository."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                WITH latest_source AS (
+                  SELECT DISTINCT ON (connection_id, scope)
+                         connection_id, scope, state, detail, run_id, collected_at
+                  FROM collection_coverage
+                  WHERE tenant_id = %s::uuid
+                    AND connector_id = 'denali.github_repository'
+                    AND plane = 'github_source_collection'
+                  ORDER BY connection_id, scope, collected_at DESC
+                ), latest_analysis AS (
+                  SELECT DISTINCT ON (connection_id, scope)
+                         connection_id, scope, state, detail, run_id, collected_at
+                  FROM collection_coverage
+                  WHERE tenant_id = %s::uuid
+                    AND connector_id = 'denali.code_to_cloud'
+                    AND plane = 'code_to_cloud_deployments'
+                  ORDER BY connection_id, scope, collected_at DESC
+                ), combined AS (
+                  SELECT COALESCE(source.connection_id, analysis.connection_id) AS connection_id,
+                         COALESCE(source.scope, analysis.scope) AS scope,
+                         source.state AS source_state, source.detail AS source_detail,
+                         source.run_id AS source_run_id,
+                         source.collected_at AS source_collected_at,
+                         analysis.state AS analysis_state,
+                         analysis.detail AS analysis_detail,
+                         analysis.run_id AS analysis_run_id,
+                         analysis.collected_at AS analysis_collected_at
+                  FROM latest_source source
+                  FULL OUTER JOIN latest_analysis analysis
+                    ON analysis.connection_id = source.connection_id
+                   AND analysis.scope = source.scope
+                )
+                SELECT combined.*,
+                       substring(combined.scope from 12) AS repository_natural_key,
+                       asset.id AS repository_id,
+                       assertion.display_name AS repository_name,
+                       assertion.attributes->'correlation_summary' AS correlation_summary,
+                       COALESCE(
+                         assertion.attributes->'correlation_candidates', '[]'::jsonb
+                       ) AS correlation_candidates,
+                       assertion.evidence AS evidence
+                FROM combined
+                LEFT JOIN asset
+                  ON asset.tenant_id = %s::uuid
+                 AND asset.kind = 'code_repository'
+                 AND asset.natural_key = substring(combined.scope from 12)
+                LEFT JOIN asset_assertion assertion
+                  ON assertion.tenant_id = asset.tenant_id
+                 AND assertion.asset_id = asset.id
+                 AND assertion.connector_id = 'denali.code_to_cloud'
+                 AND assertion.connection_id = combined.connection_id
+                 AND assertion.scope_key = combined.scope
+                 AND assertion.coverage_plane = 'code_to_cloud_inventory'
+                 AND assertion.last_observed_run_id = combined.analysis_run_id
+                 AND assertion.withdrawn_at IS NULL
+                ORDER BY GREATEST(
+                           combined.source_collected_at,
+                           combined.analysis_collected_at
+                         ) DESC NULLS LAST,
+                         repository_natural_key
+                """,
+                (tenant_id, tenant_id, tenant_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def create_connection(
         self,
         tenant_id: str,
