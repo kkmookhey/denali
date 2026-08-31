@@ -1,0 +1,7 @@
+{
+  "id": "/subscriptions/8cd2b4cc-c789-466d-a8f7-8f51fb20985d/resourceGroups/denali-c2c-azure-20260831/providers/Microsoft.App/containerapps/denali-code-to-cloud",
+  "kind": null,
+  "location": "Central India",
+  "name": "denali-code-to-cloud",
+  "type": "Microsoft.App/containerApps"
+}

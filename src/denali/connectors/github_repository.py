@@ -51,6 +51,8 @@ _SOURCE_SUFFIXES = frozenset(
         ".mts",
         ".cts",
         ".tf",
+        ".bicep",
+        ".json",
         ".yaml",
         ".yml",
     }

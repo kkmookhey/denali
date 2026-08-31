@@ -104,6 +104,11 @@ export const api = {
       `/v1/connections/${id}/gcp/collect-deployments`,
       { method: "POST" },
     ),
+  collectAzureDeployments: (id: string) =>
+    request<{ status: "started" | "already_running"; connection_id: string }>(
+      `/v1/connections/${id}/azure/collect-deployments`,
+      { method: "POST" },
+    ),
   launchGitHubSetup: (id: string) =>
     request<GitHubSetupLaunch>(
       `/v1/connections/${id}/github/setup/launch`,

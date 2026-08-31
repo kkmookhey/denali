@@ -1904,6 +1904,7 @@ const AZURE_CONNECTION_SCOPES = [
   { id: "azure.ai_services", label: "Azure AI services", detail: "AI service accounts and Azure AI Search" },
   { id: "azure.ai_platform", label: "Azure AI platform", detail: "Machine Learning workspaces and Bot Service" },
   { id: "azure.ai_activity", label: "Azure AI management activity", detail: "Subscription Activity Log metadata; no prompts or responses" },
+  { id: "azure.code_to_cloud", label: "Code-to-cloud deployments", detail: "Container Apps and Function Apps identities, revisions, images, and managed identities" },
 ];
 
 const GCP_CONNECTION_SCOPES = [
@@ -2136,6 +2137,30 @@ function ConnectionsPage({
     }
   }
 
+  async function collectAzureDeployments(connection: Connection) {
+    setBusy(`collect-azure:${connection.id}`);
+    setActionError(null);
+    const previousCompletion = connection.last_deployment_collection?.completed_at ?? null;
+    try {
+      await api.collectAzureDeployments(connection.id);
+      for (let attempt = 0; attempt < 525; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        const current = await api.connection(connection.id);
+        if (current.deployment_collection_state === "running") continue;
+        if (current.last_deployment_collection?.completed_at !== previousCompletion) {
+          await onChanged();
+          return;
+        }
+        throw new Error("Deployment collection stopped before a result was recorded.");
+      }
+      throw new Error("Deployment collection is still running. Refresh shortly to see its result.");
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : "Unable to collect Azure deployments");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function prepareGitHubSetup(connection: Connection) {
     setBusy(`launch:${connection.id}`);
     setActionError(null);
@@ -2251,7 +2276,7 @@ function ConnectionsPage({
         <PanelHeader eyebrow="SOURCES" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
         <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : connection.provider === "azure" ? `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions` : connection.provider === "gcp" ? `${connection.configuration.projects?.length ?? 0} selected projects` : `${connection.configuration.account_login ?? "not installed"} · ${connection.configuration.repositories?.length ?? 0} exact repositories`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No connections configured</strong><span>Create an AWS, Azure, Google Cloud, or GitHub onboarding plan to begin.</span></div>}</div>
       </section>
-      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onCollectGcp={() => void collectGcpDeployments(selected)} onPrepareGitHub={() => void prepareGitHubSetup(selected)} onCollectGitHub={() => void collectGitHubSource(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
+      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} onCollectAzure={() => void collectAzureDeployments(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onCollectGcp={() => void collectGcpDeployments(selected)} onPrepareGitHub={() => void prepareGitHubSetup(selected)} onCollectGitHub={() => void collectGitHubSource(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
     </div>
   </div>;
 }
@@ -2261,8 +2286,8 @@ function ConnectionHealth({ state }: { state: Connection["health_state"] }) {
   return <span className={`connection-health ${state}`}><Icon />{titleCase(state)}</span>;
 }
 
-function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onCollectGcp, onPrepareGitHub, onCollectGitHub, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onCollectGcp: () => void; onPrepareGitHub: () => void; onCollectGitHub: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
-  if (connection.provider === "azure") return <AzureConnectionDetail connection={connection} busy={busy} launch={azureLaunch} completionCode={azureCompletionCode} onCompletionCode={onAzureCompletionCode} onPrepare={onPrepareAzure} onComplete={onCompleteAzure} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
+function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, onCollectAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onCollectGcp, onPrepareGitHub, onCollectGitHub, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; onCollectAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onCollectGcp: () => void; onPrepareGitHub: () => void; onCollectGitHub: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+  if (connection.provider === "azure") return <AzureConnectionDetail connection={connection} busy={busy} launch={azureLaunch} completionCode={azureCompletionCode} onCompletionCode={onAzureCompletionCode} onPrepare={onPrepareAzure} onComplete={onCompleteAzure} onCollect={onCollectAzure} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   if (connection.provider === "gcp") return <GcpConnectionDetail connection={connection} busy={busy} launch={gcpLaunch} completionCode={gcpCompletionCode} onCompletionCode={onGcpCompletionCode} onPrepare={onPrepareGcp} onComplete={onCompleteGcp} onCollect={onCollectGcp} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   if (connection.provider === "github") return <GitHubConnectionDetail connection={connection} busy={busy} onPrepare={onPrepareGitHub} onCollect={onCollectGitHub} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   const validation = connection.last_validation;
@@ -2297,13 +2322,15 @@ function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, 
   </section>;
 }
 
-function AzureConnectionDetail({ connection, busy, launch, completionCode, onCompletionCode, onPrepare, onComplete, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; launch?: AzureSetupLaunch; completionCode: string; onCompletionCode: (value: string) => void; onPrepare: () => void; onComplete: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+function AzureConnectionDetail({ connection, busy, launch, completionCode, onCompletionCode, onPrepare, onComplete, onCollect, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; launch?: AzureSetupLaunch; completionCode: string; onCompletionCode: (value: string) => void; onPrepare: () => void; onComplete: () => void; onCollect: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
   const validation = connection.last_validation;
   const subscriptions = connection.configuration.subscriptions ?? [];
   const setupComplete = subscriptions.length > 0;
   const preparing = busy === `launch:${connection.id}`;
   const completing = busy === `complete:${connection.id}`;
   const validating = connection.validation_state === "running" || busy === `validate:${connection.id}` || completing;
+  const collecting = connection.deployment_collection_state === "running" || busy === `collect-azure:${connection.id}`;
+  const collection = connection.last_deployment_collection && "subscription_count" in connection.last_deployment_collection ? connection.last_deployment_collection : null;
   const credential = connection.credential_reference.type === "azure_multitenant_app" ? connection.credential_reference : null;
   const permissions = [...new Set(connection.coverage_plan.flatMap((item) => item.permissions))].sort();
   return <section className="panel connection-detail">
@@ -2312,6 +2339,7 @@ function AzureConnectionDetail({ connection, busy, launch, completionCode, onCom
       <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Tenant, application ID, scopes, and subscription-selection boundary are recorded. Entra directory access is not included.</small></div></div>
       <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Add Denali to the tenant and select subscriptions</strong><small>Microsoft Entra first creates a tenant-local enterprise application—the identity Azure can assign a role to. This grants no subscription or Microsoft Graph access. Cloud Shell then enumerates enabled subscriptions and assigns Reader only to those you select; every resource location inside them remains in scope.</small>{!launch && <button className="primary-action" disabled={preparing || !connection.setup_capabilities.azure_cloud_shell} onClick={onPrepare}><ExternalLink />{preparing ? "Preparing Azure setup…" : setupComplete ? "Prepare Azure setup again" : "Prepare Azure setup"}</button>}{launch && <div className="azure-setup-actions"><div className="connection-launch-actions"><a className="primary-action" href={launch.consent_url} target="_blank" rel="noreferrer"><ExternalLink />1. Add Denali to tenant</a><a className="secondary-action" href={launch.cloud_shell_url} target="_blank" rel="noreferrer"><ExternalLink />2. Open Cloud Shell</a><a className="secondary-action" href={launch.script_url} download><Download />Download script</a></div><small className="azure-consent-guidance">Required only once per Entra tenant. This Microsoft-hosted step opens in a new tab and creates—or confirms an existing—Denali enterprise application. It requests no Graph permissions and grants no subscription access; Cloud Shell grants Reader separately.</small><label className="azure-command"><span>3. Run in Cloud Shell</span><textarea readOnly value={launch.setup_command} /><button type="button" onClick={() => void navigator.clipboard.writeText(launch.setup_command)}>Copy command</button><small>The command downloads the same reviewable script shown by Download script. Its URL expires at {formatTime(launch.expires_at)}.</small></label><label className="azure-completion"><span>4. Paste the completion code printed by the script</span><textarea value={completionCode} onChange={(event) => onCompletionCode(event.target.value)} placeholder="DENALI_SETUP_COMPLETE=…" /><button className="primary-action" type="button" disabled={completing || !completionCode.trim()} onClick={onComplete}>{completing ? "Waiting for Azure access propagation…" : "Complete setup and validate"}</button><small>New Azure role assignments can take several minutes to propagate. Denali retries the declared checks before recording a partial result.</small></label></div>}{!connection.setup_capabilities.azure_cloud_shell && <small className="launch-unavailable">Cloud Shell setup requires Denali’s multi-tenant Azure application and private onboarding-script publisher.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{subscriptions.length} selected subscription{subscriptions.length === 1 ? "" : "s"}</strong>{subscriptions.map((subscription) => <code key={subscription.id}>{subscription.name} · {subscription.id}</code>)}</div>}</div></div>
       <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every selected subscription</strong><small>Denali binds the customer tenant and each exact subscription first, then validates every declared subscription-wide plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating Azure…" : validation ? "Validate again" : "Validate connection"}</button>}</div></div>
+      <div className={collection ? (collection.state === "complete" ? "complete" : "attention") : "pending"}><span>{collection?.state === "complete" ? <Check /> : "4"}</span><div><strong>4. Collect deployment identities</strong><small>Read Container Apps and Function Apps through Azure Resource Graph, retaining exact subscription, resource group, location, revision, image, and managed-identity evidence without storing app-setting values.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={collecting || validating} onClick={onCollect}><CloudCog className={collecting ? "spin" : undefined} />{collecting ? "Collecting deployments…" : collection ? "Collect deployments again" : "Collect deployments"}</button>}{collection && <small className="validation-progress-note">{collection.subscription_count - collection.failed_count - collection.partial_count} complete · {collection.partial_count} partial · {collection.failed_count} failed · finished {formatTime(collection.completed_at)}</small>}</div></div>
     </div>
     <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed subscriptions {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.subscription_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.subscription_name ?? result.subscription_id} · all resource locations</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Authorize the application, select subscriptions, and paste the Cloud Shell completion code first.</small></span></div>}</div>
     <details className="connection-permissions"><summary>Review {permissions.length || 2} declared Azure permissions</summary><div>{(permissions.length ? permissions : ["Microsoft.Resources/subscriptions/read", "Microsoft.Authorization/roleAssignments/read"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>The customer grants Azure Reader only at selected subscription scopes. This does not grant Microsoft Graph/Entra directory reads, data-plane access, secret access, prompt access, response access, or remediation.</p></details>
@@ -2327,7 +2355,7 @@ function GcpConnectionDetail({ connection, busy, launch, completionCode, onCompl
   const completing = busy === `complete:${connection.id}`;
   const validating = connection.validation_state === "running" || busy === `validate:${connection.id}` || completing;
   const collecting = connection.deployment_collection_state === "running" || busy === `collect-gcp:${connection.id}`;
-  const collection = connection.last_deployment_collection;
+  const collection = connection.last_deployment_collection && "project_count" in connection.last_deployment_collection ? connection.last_deployment_collection : null;
   const credential = connection.credential_reference.type === "gcp_service_account" ? connection.credential_reference : null;
   const permissions = [...new Set(connection.coverage_plan.flatMap((item) => item.permissions))].sort();
   return <section className="panel connection-detail">

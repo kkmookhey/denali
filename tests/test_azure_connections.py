@@ -203,6 +203,31 @@ class PropagatingAzureValidator(PassingAzureValidator):
         return validation
 
 
+class PassingAzureDeploymentCollector:
+    def collect(
+        self, *, tenant_id: str, connection: dict[str, Any], repository: Any
+    ) -> dict[str, Any]:
+        assert tenant_id == DEFAULT_LOCAL_TENANT
+        assert connection["provider"] == "azure"
+        return {
+            "connection_id": connection["id"],
+            "state": "complete",
+            "completed_at": datetime.now(UTC).isoformat(),
+            "subscription_count": len(connection["configuration"]["subscriptions"]),
+            "failed_count": 0,
+            "partial_count": 0,
+            "subscriptions": [
+                {
+                    "subscription_id": item["id"],
+                    "state": "complete",
+                    "assets": 3,
+                    "ai_workloads": 1,
+                }
+                for item in connection["configuration"]["subscriptions"]
+            ],
+        }
+
+
 def _completion_code(subscriptions: list[dict[str, str]]) -> str:
     payload = json.dumps(
         {
@@ -232,6 +257,7 @@ def test_azure_setup_enumerates_then_binds_only_selected_subscriptions() -> None
     app = create_app(
         repository=repository,
         azure_connection_validator=validator,  # type: ignore[arg-type]
+        azure_deployment_collector=PassingAzureDeploymentCollector(),  # type: ignore[arg-type]
         azure_setup_launcher=launcher,
         onboarding_validation_retry_seconds=0,
         migrate_on_start=False,
@@ -281,12 +307,21 @@ def test_azure_setup_enumerates_then_binds_only_selected_subscriptions() -> None
             json={"completion_code": f"DENALI_SETUP_COMPLETE={_completion_code(subscriptions)}"},
         )
         assert completed.status_code == 202
+
+        collection = client.post(
+            f"/v1/connections/{connection_id}/azure/collect-deployments"
+        )
+        assert collection.status_code == 202
+        refreshed = client.get(f"/v1/connections/{connection_id}").json()
+        assert refreshed["deployment_collection_state"] == "idle"
+        assert refreshed["last_deployment_collection"]["state"] == "complete"
+        assert refreshed["last_deployment_collection"]["subscription_count"] == 2
         detail = client.get(f"/v1/connections/{connection_id}").json()
         assert detail["health_state"] == "healthy"
         assert validator.calls == 2
         assert detail["configuration"]["subscriptions"] == subscriptions
-        assert len(detail["coverage_plan"]) == 5 * len(subscriptions)
-        assert len(detail["last_validation"]["results"]) == 5 * len(subscriptions)
+        assert len(detail["coverage_plan"]) == 7 * len(subscriptions)
+        assert len(detail["last_validation"]["results"]) == 7 * len(subscriptions)
         assert "setup_token" not in json.dumps(detail)
         assert (
             client.post(
@@ -347,8 +382,8 @@ def test_azure_validation_is_subscription_specific_and_all_locations() -> None:
     validation = validator.validate(connection)
     assert validation["health_state"] == "healthy"
     assert validation["credential_state"] == "passed"
-    assert len(validation["results"]) == 10
+    assert len(validation["results"]) == 14
     assert all(item["region"] == "all-locations" for item in validation["results"])
     graph_calls = [item for item in requests if "ResourceGraph" in item[1]]
-    assert len(graph_calls) == 8
+    assert len(graph_calls) == 12
     assert all(len(item[2]["json"]["subscriptions"]) == 1 for item in graph_calls)

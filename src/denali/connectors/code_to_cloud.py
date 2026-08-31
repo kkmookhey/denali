@@ -55,7 +55,20 @@ _TASK_RE = re.compile(
 )
 _TERRAFORM_RESOURCE_RE = re.compile(
     r"\bresource\s+(['\"])(?P<type>google_cloud_run_v2_service|"
-    r"google_cloudfunctions2_function)\1\s+(['\"])(?P<label>[^'\"]+)\3\s*\{"
+    r"google_cloudfunctions2_function|azurerm_container_app|"
+    r"azurerm_linux_function_app|azurerm_windows_function_app)\1\s+"
+    r"(['\"])(?P<label>[^'\"]+)\3\s*\{"
+)
+_AZURERM_PROVIDER_RE = re.compile(r"\bprovider\s+(['\"])azurerm\1\s*\{")
+_AZURE_BICEP_RESOURCE_RE = re.compile(
+    r"(?m)^\s*resource\s+(?P<symbol>[A-Za-z_][A-Za-z0-9_]*)\s+"
+    r"(['\"])(?P<type>Microsoft\.(?:App/containerApps|Web/sites))@[^'\"]+\2\s*=\s*\{"
+)
+_AZURE_RESOURCE_ID_RE = re.compile(
+    r"^/subscriptions/(?P<subscription>[0-9a-fA-F-]{36})/resourceGroups/"
+    r"(?P<resource_group>[^/]+)/providers/Microsoft\.(?P<provider>App|Web)/"
+    r"(?P<kind>containerApps|sites)/(?P<name>[^/]+)$",
+    re.IGNORECASE,
 )
 _LITERAL_PROPERTY_TEMPLATE = r"\b{key}\s*:\s*(['\"])(?P<value>[^'\"\r\n]+)\1"
 _STRING_BINDING_RE = re.compile(
@@ -99,7 +112,7 @@ _MANIFEST_EXCLUDED_DIRS = frozenset(
         "tests",
     }
 )
-_IAC_SUFFIXES = frozenset({".tf", ".yaml", ".yml"})
+_IAC_SUFFIXES = frozenset({".tf", ".yaml", ".yml", ".json", ".bicep"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +436,10 @@ def _deployment_declarations(
     suffix = Path(relative).suffix.lower()
     if suffix == ".tf":
         return _terraform_declarations(text, relative)
+    if suffix == ".json":
+        return _azure_json_declarations(text, relative)
+    if suffix == ".bicep":
+        return _azure_bicep_declarations(text, relative)
     if suffix in {".yaml", ".yml"}:
         return _cloud_run_yaml_declarations(text, relative)
     output: list[DeploymentDeclaration] = []
@@ -532,6 +549,7 @@ def _terraform_declarations(
     output: list[DeploymentDeclaration] = []
     warnings: list[str] = []
     scan_text = _strip_hcl_comments(text)
+    azure_subscription = _terraform_azure_subscription(scan_text)
     for match in _TERRAFORM_RESOURCE_RE.finditer(scan_text):
         block_start = match.end() - 1
         block_end = _balanced_object_end(scan_text, block_start)
@@ -540,45 +558,69 @@ def _terraform_declarations(
             warnings.append(f"{relative}:{line}: unbalanced Terraform resource")
             continue
         block = scan_text[block_start : block_end + 1]
-        project = _hcl_top_level_literal(block, "project")
+        resource_type = match.group("type")
         location = _hcl_top_level_literal(block, "location")
         name = _hcl_top_level_literal(block, "name")
-        if not project or not location or not name:
-            warnings.append(
-                f"{relative}:{line}: Terraform GCP project, location, and name "
-                "must all be literal"
+        if resource_type.startswith("google_"):
+            project = _hcl_top_level_literal(block, "project")
+            if not project or not location or not name:
+                warnings.append(
+                    f"{relative}:{line}: Terraform GCP project, location, and name "
+                    "must all be literal"
+                )
+                continue
+            if resource_type == "google_cloud_run_v2_service":
+                service = "cloud_run"
+                runtime_kind = "container_service"
+                name_identifier = "service_name"
+                name_basis = "literal_cloud_run_service_name"
+            else:
+                service = "cloud_functions"
+                runtime_kind = "serverless_function"
+                name_identifier = "function_name"
+                name_basis = "literal_cloud_functions_gen2_function_name"
+            identity = DeploymentIdentity(
+                provider="gcp",
+                runtime_kind=runtime_kind,
+                identifiers=(
+                    DeploymentIdentifier(
+                        "project", project, evidence_basis="literal_gcp_project_id"
+                    ),
+                    DeploymentIdentifier(
+                        "location", location, evidence_basis="literal_gcp_location"
+                    ),
+                    DeploymentIdentifier(name_identifier, name, evidence_basis=name_basis),
+                ),
             )
-            continue
-        resource_type = match.group("type")
-        if resource_type == "google_cloud_run_v2_service":
-            service = "cloud_run"
-            runtime_kind = "container_service"
-            name_identifier = "service_name"
-            name_basis = "literal_cloud_run_service_name"
         else:
-            service = "cloud_functions"
-            runtime_kind = "serverless_function"
-            name_identifier = "function_name"
-            name_basis = "literal_cloud_functions_gen2_function_name"
+            resource_group = _hcl_top_level_literal(block, "resource_group_name")
+            if not azure_subscription or not resource_group or not location or not name:
+                warnings.append(
+                    f"{relative}:{line}: Terraform Azure provider subscription_id and "
+                    "resource resource_group_name, location, and name must all be literal"
+                )
+                continue
+            is_container = resource_type == "azurerm_container_app"
+            service = "azure_container_apps" if is_container else "azure_functions"
+            runtime_kind = "container_service" if is_container else "serverless_function"
+            name_identifier = "container_app_name" if is_container else "function_app_name"
+            name_basis = (
+                "literal_azure_container_app_name"
+                if is_container
+                else "literal_azure_function_app_name"
+            )
+            identity = _azure_deployment_identity(
+                subscription_id=azure_subscription,
+                resource_group=resource_group,
+                location=location,
+                name=name,
+                runtime_kind=runtime_kind,
+                name_identifier=name_identifier,
+                name_basis=name_basis,
+            )
         output.append(
             DeploymentDeclaration(
-                identity=DeploymentIdentity(
-                    provider="gcp",
-                    runtime_kind=runtime_kind,
-                    identifiers=(
-                        DeploymentIdentifier(
-                            "project", project, evidence_basis="literal_gcp_project_id"
-                        ),
-                        DeploymentIdentifier(
-                            "location", location, evidence_basis="literal_gcp_location"
-                        ),
-                        DeploymentIdentifier(
-                            name_identifier,
-                            name,
-                            evidence_basis=name_basis,
-                        ),
-                    ),
-                ),
+                identity=identity,
                 framework="terraform",
                 service=service,
                 construct_id=f"{resource_type}.{match.group('label')}",
@@ -588,6 +630,258 @@ def _terraform_declarations(
             )
         )
     return output, warnings
+
+
+def _terraform_azure_subscription(text: str) -> str | None:
+    subscriptions: list[str] = []
+    for match in _AZURERM_PROVIDER_RE.finditer(text):
+        block_start = match.end() - 1
+        block_end = _balanced_object_end(text, block_start)
+        if block_end is None:
+            continue
+        block = text[block_start : block_end + 1]
+        if _hcl_top_level_literal(block, "alias") is not None:
+            continue
+        subscription = _hcl_top_level_literal(block, "subscription_id")
+        if subscription and _valid_azure_uuid(subscription):
+            subscriptions.append(subscription.lower())
+    return subscriptions[0] if len(set(subscriptions)) == 1 else None
+
+
+def _azure_json_declarations(
+    text: str, relative: str
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return [], []
+    if not isinstance(payload, dict):
+        return [], []
+
+    direct_id = payload.get("id")
+    if isinstance(direct_id, str):
+        declaration = _azure_resource_id_declaration(
+            direct_id,
+            location=payload.get("location"),
+            relative=relative,
+            framework="azure_resource_json",
+            line=1,
+        )
+        return ([declaration], []) if declaration is not None else ([], [])
+
+    resources = payload.get("resources")
+    if not isinstance(resources, list):
+        return [], []
+    metadata = payload.get("metadata")
+    denali = metadata.get("denali") if isinstance(metadata, dict) else None
+    subscription = denali.get("subscriptionId") if isinstance(denali, dict) else None
+    resource_group = denali.get("resourceGroup") if isinstance(denali, dict) else None
+    output: list[DeploymentDeclaration] = []
+    warnings: list[str] = []
+    for index, resource in enumerate(resources):
+        if not isinstance(resource, dict):
+            continue
+        resource_type = str(resource.get("type", "")).lower()
+        if resource_type not in {
+            "microsoft.app/containerapps",
+            "microsoft.web/sites",
+        }:
+            continue
+        name = resource.get("name")
+        location = resource.get("location")
+        if not all(
+            isinstance(item, str) and item
+            for item in (subscription, resource_group, name, location)
+        ) or not _valid_azure_uuid(str(subscription)):
+            warnings.append(
+                f"{relative}:1: ARM Azure metadata subscriptionId/resourceGroup and "
+                f"resource {index} name/location must all be literal"
+            )
+            continue
+        output.append(
+            _azure_declaration(
+                subscription_id=str(subscription),
+                resource_group=str(resource_group),
+                location=str(location),
+                name=str(name),
+                resource_type=resource_type,
+                framework="arm_template",
+                construct_id=f"{resource.get('type')}/{name}",
+                relative=relative,
+                line=1,
+            )
+        )
+    return output, warnings
+
+
+def _azure_resource_id_declaration(
+    resource_id: str,
+    *,
+    location: Any,
+    relative: str,
+    framework: str,
+    line: int,
+) -> DeploymentDeclaration | None:
+    match = _AZURE_RESOURCE_ID_RE.fullmatch(resource_id)
+    if match is None or not isinstance(location, str) or not location:
+        return None
+    resource_type = (
+        "microsoft.app/containerapps"
+        if match.group("kind").lower() == "containerapps"
+        else "microsoft.web/sites"
+    )
+    return _azure_declaration(
+        subscription_id=match.group("subscription"),
+        resource_group=match.group("resource_group"),
+        location=location,
+        name=match.group("name"),
+        resource_type=resource_type,
+        framework=framework,
+        construct_id=resource_id,
+        relative=relative,
+        line=line,
+    )
+
+
+def _azure_bicep_declarations(
+    text: str, relative: str
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    subscription_match = re.search(
+        r"(?m)^\s*metadata\s+denaliSubscriptionId\s*=\s*(['\"])(?P<value>[^'\"]+)\1\s*$",
+        text,
+    )
+    resource_group_match = re.search(
+        r"(?m)^\s*metadata\s+denaliResourceGroup\s*=\s*(['\"])(?P<value>[^'\"]+)\1\s*$",
+        text,
+    )
+    subscription = subscription_match.group("value") if subscription_match else None
+    resource_group = resource_group_match.group("value") if resource_group_match else None
+    output: list[DeploymentDeclaration] = []
+    warnings: list[str] = []
+    for match in _AZURE_BICEP_RESOURCE_RE.finditer(text):
+        line = _line(text, match.start())
+        block_start = match.end() - 1
+        block_end = _balanced_object_end(text, block_start)
+        if block_end is None:
+            warnings.append(f"{relative}:{line}: unbalanced Bicep resource")
+            continue
+        block = text[block_start : block_end + 1]
+        name = _literal_property(block, "name")
+        location = _literal_property(block, "location")
+        if (
+            not subscription
+            or not _valid_azure_uuid(subscription)
+            or not resource_group
+            or not name
+            or not location
+        ):
+            warnings.append(
+                f"{relative}:{line}: Bicep Denali subscription/resource-group metadata "
+                "and resource name/location must all be literal"
+            )
+            continue
+        output.append(
+            _azure_declaration(
+                subscription_id=subscription,
+                resource_group=resource_group,
+                location=location,
+                name=name,
+                resource_type=match.group("type").lower(),
+                framework="bicep",
+                construct_id=match.group("symbol"),
+                relative=relative,
+                line=line,
+            )
+        )
+    return output, warnings
+
+
+def _azure_declaration(
+    *,
+    subscription_id: str,
+    resource_group: str,
+    location: str,
+    name: str,
+    resource_type: str,
+    framework: str,
+    construct_id: str,
+    relative: str,
+    line: int,
+) -> DeploymentDeclaration:
+    is_container = resource_type.lower() == "microsoft.app/containerapps"
+    service = "azure_container_apps" if is_container else "azure_functions"
+    runtime_kind = "container_service" if is_container else "serverless_function"
+    name_identifier = "container_app_name" if is_container else "function_app_name"
+    name_basis = (
+        "literal_azure_container_app_name"
+        if is_container
+        else "literal_azure_function_app_name"
+    )
+    return DeploymentDeclaration(
+        identity=_azure_deployment_identity(
+            subscription_id=subscription_id,
+            resource_group=resource_group,
+            location=location,
+            name=name,
+            runtime_kind=runtime_kind,
+            name_identifier=name_identifier,
+            name_basis=name_basis,
+        ),
+        framework=framework,
+        service=service,
+        construct_id=construct_id,
+        deployment_name=name,
+        path=relative,
+        line=line,
+    )
+
+
+def _azure_deployment_identity(
+    *,
+    subscription_id: str,
+    resource_group: str,
+    location: str,
+    name: str,
+    runtime_kind: str,
+    name_identifier: str,
+    name_basis: str,
+) -> DeploymentIdentity:
+    return DeploymentIdentity(
+        provider="azure",
+        runtime_kind=runtime_kind,
+        identifiers=(
+            DeploymentIdentifier(
+                "subscription_id",
+                subscription_id.lower(),
+                evidence_basis="literal_azure_subscription_id",
+            ),
+            DeploymentIdentifier(
+                "resource_group",
+                resource_group.lower(),
+                evidence_basis="literal_azure_resource_group",
+            ),
+            DeploymentIdentifier(
+                "location",
+                location.lower().replace(" ", ""),
+                evidence_basis="literal_azure_location",
+            ),
+            DeploymentIdentifier(
+                name_identifier,
+                name.lower(),
+                evidence_basis=name_basis,
+            ),
+        ),
+    )
+
+
+def _valid_azure_uuid(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+            r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+            value,
+        )
+    )
 
 
 def _cloud_run_yaml_declarations(

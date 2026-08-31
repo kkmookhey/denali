@@ -267,6 +267,113 @@ spec:
     assert declaration.identity.values("project_number") == ("123456789012",)
 
 
+def test_discovers_literal_azure_terraform_declarations() -> None:
+    source = '''
+provider "azurerm" {
+  features {}
+  subscription_id = "8cd2b4cc-c789-466d-a8f7-8f51fb20985d"
+}
+
+resource "azurerm_container_app" "agent" {
+  name                = "denali-ai"
+  resource_group_name = "Denali-Test"
+  location            = "West US 2"
+}
+
+resource "azurerm_linux_function_app" "worker" {
+  name                = "denali-worker"
+  resource_group_name = "Denali-Test"
+  location            = "West US 2"
+}
+'''
+
+    declarations, warnings = _deployment_declarations(source, "infra/main.tf")
+
+    assert warnings == []
+    assert [item.service for item in declarations] == [
+        "azure_container_apps",
+        "azure_functions",
+    ]
+    assert declarations[0].identity.provider == "azure"
+    assert declarations[0].identity.runtime_kind == "container_service"
+    assert declarations[0].identity.match_basis() == [
+        "literal_azure_subscription_id",
+        "literal_azure_resource_group",
+        "literal_azure_location",
+        "literal_azure_container_app_name",
+    ]
+    assert declarations[1].identity.runtime_kind == "serverless_function"
+
+
+def test_discovers_exact_azure_resource_export_json() -> None:
+    source = (
+        "{\n"
+        '  "id": "/subscriptions/8cd2b4cc-c789-466d-a8f7-8f51fb20985d/'
+        "resourceGroups/Denali-Test/providers/Microsoft.App/containerApps/denali-ai\",\n"
+        '  "name": "denali-ai",\n'
+        '  "type": "Microsoft.App/containerApps",\n'
+        '  "location": "West US 2"\n'
+        "}\n"
+    )
+
+    declarations, warnings = _deployment_declarations(
+        source, "deploy/container-app.resource.json"
+    )
+
+    assert warnings == []
+    assert len(declarations) == 1
+    declaration = declarations[0]
+    assert declaration.framework == "azure_resource_json"
+    assert declaration.service == "azure_container_apps"
+    assert declaration.identity.match_basis() == [
+        "literal_azure_subscription_id",
+        "literal_azure_resource_group",
+        "literal_azure_location",
+        "literal_azure_container_app_name",
+    ]
+
+
+def test_discovers_literal_azure_bicep_declarations() -> None:
+    source = '''
+metadata denaliSubscriptionId = '8cd2b4cc-c789-466d-a8f7-8f51fb20985d'
+metadata denaliResourceGroup = 'Denali-Test'
+
+resource app 'Microsoft.App/containerApps@2025-02-02-preview' = {
+  name: 'denali-ai'
+  location: 'westus2'
+}
+'''
+
+    declarations, warnings = _deployment_declarations(source, "infra/main.bicep")
+
+    assert warnings == []
+    assert len(declarations) == 1
+    assert declarations[0].framework == "bicep"
+    assert declarations[0].deployment_name == "denali-ai"
+
+
+def test_dynamic_azure_terraform_scope_is_visible_but_not_correlated() -> None:
+    source = '''
+provider "azurerm" {
+  features {}
+  subscription_id = var.subscription_id
+}
+resource "azurerm_container_app" "agent" {
+  name                = "denali-ai"
+  resource_group_name = "Denali-Test"
+  location            = "West US 2"
+}
+'''
+
+    declarations, warnings = _deployment_declarations(source, "infra/main.tf")
+
+    assert declarations == []
+    assert warnings == [
+        "infra/main.tf:6: Terraform Azure provider subscription_id and resource "
+        "resource_group_name, location, and name must all be literal"
+    ]
+
+
 def test_cloud_run_yaml_matches_target_with_project_number(tmp_path: Path) -> None:
     (tmp_path / "service.yaml").write_text(
         '''

@@ -12,10 +12,12 @@ AZURE_CLOUD_PUBLIC = "AzureCloud"
 AZURE_SCOPE_AI_SERVICES = "azure.ai_services"
 AZURE_SCOPE_AI_PLATFORM = "azure.ai_platform"
 AZURE_SCOPE_AI_ACTIVITY = "azure.ai_activity"
+AZURE_SCOPE_CODE_TO_CLOUD = "azure.code_to_cloud"
 AZURE_SCOPES = (
     AZURE_SCOPE_AI_SERVICES,
     AZURE_SCOPE_AI_PLATFORM,
     AZURE_SCOPE_AI_ACTIVITY,
+    AZURE_SCOPE_CODE_TO_CLOUD,
 )
 AZURE_READER_ROLE_DEFINITION_ID = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
 AZURE_MANAGEMENT_SCOPE = "https://management.azure.com/.default"
@@ -71,6 +73,26 @@ _SCOPE_METADATA = {
             "label": "Azure AI management activity",
             "permission": "Microsoft.Insights/eventtypes/values/read",
             "query": None,
+        },
+    ),
+    AZURE_SCOPE_CODE_TO_CLOUD: (
+        {
+            "plane": "azure_container_apps_inventory",
+            "label": "Azure Container Apps deployment inventory",
+            "permission": "Microsoft.ResourceGraph/resources/read",
+            "query": (
+                "Resources | where type =~ 'microsoft.app/containerapps' "
+                "| project id | take 1"
+            ),
+        },
+        {
+            "plane": "azure_function_apps_inventory",
+            "label": "Azure Function Apps deployment inventory",
+            "permission": "Microsoft.ResourceGraph/resources/read",
+            "query": (
+                "Resources | where type =~ 'microsoft.web/sites' "
+                "| where kind contains 'functionapp' | project id | take 1"
+            ),
         },
     ),
 }
@@ -370,6 +392,22 @@ def _default_credential(customer_tenant_id: str) -> AzureTokenCredential:
         client_id=client_id,
         client_secret=client_secret,
     )
+
+
+def authorized_azure_request(customer_tenant_id: str) -> AzureRequest:
+    """Create an Azure Management request callable without exposing bearer tokens."""
+
+    credential = _default_credential(customer_tenant_id)
+
+    def request(method: str, url: str, **kwargs: Any) -> AzureHttpResponse:
+        headers = dict(kwargs.pop("headers", {}))
+        headers["Authorization"] = (
+            f"Bearer {credential.get_token(AZURE_MANAGEMENT_SCOPE).token}"
+        )
+        headers.setdefault("Content-Type", "application/json")
+        return _httpx_request(method, url, headers=headers, **kwargs)
+
+    return request
 
 
 def _httpx_request(method: str, url: str, **kwargs: Any) -> AzureHttpResponse:
