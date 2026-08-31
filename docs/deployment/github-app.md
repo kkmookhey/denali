@@ -59,16 +59,20 @@ Registration result with the App ID and Client ID:
 
 ![Created app with App ID and Client ID](images/github-app/07-app-created.png)
 
-## Remaining manual steps
+## Credentials
 
-On the app's settings page (`https://github.com/organizations/transilienceai/settings/apps/transilience-denali`):
+Both credentials were generated on 2026-08-30 on the app's settings page
+(`https://github.com/organizations/transilienceai/settings/apps/transilience-denali`):
 
-1. Generate a client secret under **Client secrets** and store it in the team secret
-   manager. It is shown only once.
-2. Generate a private key under **Private keys**. GitHub downloads a `.pem` file; store
-   it in the secret manager and place it on the API host outside the repository.
+- **Client secret** — generated under **Client secrets** (`*****bd277930`). GitHub shows
+  the full value only once, at generation time; it lives in the team secret manager.
+- **Private key** — generated under **Private keys**, fingerprint
+  `SHA256:Ysxinmx5uaCNl4AMXI3teiUeYDZhuJDFpJlWKbVZ0uc=`. GitHub downloads the `.pem`
+  file at generation time; it is stored in the secret manager and placed on the API host
+  outside the repository.
 
-Never commit either value.
+Never commit either value. To rotate, generate a new secret/key on the same page, roll
+the deployment, then delete the old one.
 
 ## API configuration
 
