@@ -47,6 +47,7 @@ Denali presents the following product surfaces in the web application and API:
 - Provider-neutral runtime activity plus deterministic, evidence-linked runtime detections.
 - Source coverage that keeps complete, partial, failed, unsupported, and unknown states
   visible.
+- Stable application routes with direct deep links and browser Back/Forward navigation.
 - Connection lifecycle and access validation for AWS, Azure, Google Cloud, and GitHub,
   including explicit scope selection and disable-before-delete safeguards.
 
@@ -199,8 +200,8 @@ Documented planned or deferred capabilities are not shipped:
   existing repository and code-to-cloud evidence paths.
 - GitHub installation/repository lifecycle reconciliation and GitHub Enterprise Server.
 - Slack and Jira onboarding after GitHub acceptance.
-- Application-wide typography, browser-history navigation, and clearer elapsed-time context
-  during bounded cloud-IAM propagation waits.
+- Application-wide typography and clearer elapsed-time context during bounded cloud-IAM
+  propagation waits.
 - Durable job and lease coordination for onboarding validation across API restarts or
   multiple replicas.
 
