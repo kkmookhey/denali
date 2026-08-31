@@ -94,6 +94,15 @@ _SCOPE_METADATA = {
                 "| where kind contains 'functionapp' | project id | take 1"
             ),
         },
+        {
+            "plane": "azure_aks_cluster_inventory",
+            "label": "Azure Kubernetes Service cluster inventory",
+            "permission": "Microsoft.ResourceGraph/resources/read",
+            "query": (
+                "Resources | where type =~ 'microsoft.containerservice/managedclusters' "
+                "| project id | take 1"
+            ),
+        },
     ),
 }
 

@@ -84,12 +84,13 @@ _SCOPE_METADATA: dict[str, tuple[dict[str, Any], ...]] = {
     GCP_SCOPE_CODE_TO_CLOUD: (
         {
             "plane": "gcp_deployment_inventory",
-            "label": "Cloud Run and Cloud Run functions deployment inventory",
+            "label": "Cloud Run, Cloud Run functions, and GKE deployment inventory",
             "permission": "cloudasset.assets.listResource",
             "validation_method": "list_assets_resource",
             "asset_types": [
                 "run.googleapis.com/Service",
                 "cloudfunctions.googleapis.com/Function",
+                "container.googleapis.com/Cluster",
             ],
         },
     ),

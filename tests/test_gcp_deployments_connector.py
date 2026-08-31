@@ -5,6 +5,7 @@ from denali.connectors.gcp_deployments import (
     CLOUD_FUNCTION_INVENTORY_PLANE,
     CLOUD_RUN_ASSET_TYPE,
     CLOUD_RUN_INVENTORY_PLANE,
+    GKE_CLUSTER_ASSET_TYPE,
     GcpCloudAssetRestClient,
     GcpConnectionDeploymentCollector,
     GcpDeploymentConnector,
@@ -117,6 +118,28 @@ def run_asset_v1() -> dict[str, Any]:
     }
 
 
+def gke_cluster() -> dict[str, Any]:
+    name = "model-cluster"
+    return {
+        "name": (
+            f"//container.googleapis.com/projects/{PROJECT}/locations/"
+            f"us-central1/clusters/{name}"
+        ),
+        "assetType": GKE_CLUSTER_ASSET_TYPE,
+        "ancestors": ["projects/123456789012"],
+        "resource": {
+            "data": {
+                "name": f"projects/{PROJECT}/locations/us-central1/clusters/{name}",
+                "id": "cluster-uid-1",
+                "status": "RUNNING",
+                "currentMasterVersion": "1.34.1-gke.1",
+                "createTime": "2026-08-31T12:00:00Z",
+                "endpoint": "10.0.0.1",
+            }
+        },
+    }
+
+
 class FakeAssetClient:
     def __init__(self, records: dict[str, tuple[dict[str, Any], ...]]):
         self.records = records
@@ -135,6 +158,7 @@ def test_collects_bounded_gcp_deployments_without_environment_values() -> None:
                 run_asset(name="ordinary-service", ai=False),
             ),
             CLOUD_FUNCTION_ASSET_TYPE: (function_asset(),),
+            GKE_CLUSTER_ASSET_TYPE: (gke_cluster(),),
         }
     )
 
@@ -144,6 +168,7 @@ def test_collects_bounded_gcp_deployments_without_environment_values() -> None:
     assert client.calls == [
         (PROJECT, CLOUD_RUN_ASSET_TYPE),
         (PROJECT, CLOUD_FUNCTION_ASSET_TYPE),
+        (PROJECT, GKE_CLUSTER_ASSET_TYPE),
     ]
     workloads = [item for item in batch.assets if item.asset.kind is AssetKind.AI_WORKLOAD]
     cloud_resources = [
@@ -157,6 +182,7 @@ def test_collects_bounded_gcp_deployments_without_environment_values() -> None:
         "denali-ai",
         "ordinary-service",
         "denali-function",
+        "model-cluster",
     }
     run_workload = next(item for item in workloads if item.display_name == "denali-ai")
     assert run_workload.attributes["deployment_identifiers"] == {

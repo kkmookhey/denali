@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted for implementation. Automated connector, API, PostgreSQL, and production-web
-verification pass on 2026-08-31. Live provider acceptance remains pending.
+Accepted and live-provider verified on 2026-08-31. Automated connector, API, PostgreSQL,
+production-web, exact account/Region validation, and eight-plane collection verification
+pass. See the [live acceptance record](../product/aws-code-to-cloud-live-acceptance-2026-08-31.md).
 
 ## Decision
 
@@ -71,8 +72,9 @@ values produce a visible analysis warning and no deployment relationship.
 
 - Existing AWS connections created without `aws.code_to_cloud` cannot collect this inventory;
   the UI explains that a new scoped plan is required.
-- EKS correlation in this step proves only repository-to-cluster intent. Namespace, workload
-  UID, revision, service account, and image-digest correlation remains roadmap step 5.
+- EKS correlation in this step proves only repository-to-cluster intent. The shared
+  Kubernetes workload contract is defined separately in
+  [ADR 0027](0027-shared-kubernetes-code-to-cloud.md).
 - Artifact identity and source-revision attestation remain separate from an exact deployment
   identity match.
 - A successful empty plane proves only that the bounded list operation completed.

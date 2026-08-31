@@ -18,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from denali.connectors.repository import MAX_SOURCE_BYTES, RepositoryConnector, _source_files
 from denali.connectors.repository_posture import _balanced_object_end, _line
 from denali.domain import (
@@ -116,6 +118,10 @@ _MANIFEST_EXCLUDED_DIRS = frozenset(
     }
 )
 _IAC_SUFFIXES = frozenset({".tf", ".yaml", ".yml", ".json", ".bicep"})
+_KUBERNETES_WORKLOAD_KINDS = frozenset(
+    {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"}
+)
+_KUBERNETES_DIGEST_IMAGE_RE = re.compile(r"^.+@sha256:(?P<digest>[0-9a-fA-F]{64})$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,7 +454,11 @@ def _deployment_declarations(
     if suffix in {".yaml", ".yml"}:
         gcp, gcp_warnings = _cloud_run_yaml_declarations(text, relative)
         aws, aws_warnings = _aws_sam_yaml_declarations(text, relative)
-        return [*gcp, *aws], [*gcp_warnings, *aws_warnings]
+        kubernetes, kubernetes_warnings = _kubernetes_yaml_declarations(text, relative)
+        return (
+            [*gcp, *aws, *kubernetes],
+            [*gcp_warnings, *aws_warnings, *kubernetes_warnings],
+        )
     output: list[DeploymentDeclaration] = []
     warnings: list[str] = []
     scan_text = _strip_js_comments(text)
@@ -1195,6 +1205,233 @@ def _aws_sam_yaml_declarations(
         relative=relative,
         framework="sam_cloudformation",
     )
+
+
+def _kubernetes_yaml_declarations(
+    text: str, relative: str
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    """Read opt-in Kubernetes manifests without evaluating templates or substitutions."""
+
+    if "denali.ai/workload" not in text:
+        return [], []
+    try:
+        documents = list(yaml.safe_load_all(text))
+    except yaml.YAMLError:
+        return [], [f"{relative}:1: opted-in Kubernetes YAML could not be parsed safely"]
+
+    output: list[DeploymentDeclaration] = []
+    warnings: list[str] = []
+    for index, document in enumerate(documents):
+        if not isinstance(document, dict) or document.get("kind") not in (
+            _KUBERNETES_WORKLOAD_KINDS
+        ):
+            continue
+        metadata = document.get("metadata")
+        annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+        if not isinstance(annotations, dict) or str(
+            annotations.get("denali.ai/workload", "")
+        ).lower() != "true":
+            continue
+        locator = f"{relative}:document-{index + 1}"
+        try:
+            output.append(
+                _kubernetes_declaration(document, annotations, relative=relative)
+            )
+        except ValueError as error:
+            warnings.append(f"{locator}: {error}")
+    return output, warnings
+
+
+def _kubernetes_declaration(
+    document: dict[str, Any],
+    annotations: dict[str, Any],
+    *,
+    relative: str,
+) -> DeploymentDeclaration:
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be literal")
+    kind = str(document["kind"])
+    name = _manifest_literal(metadata.get("name"), "metadata.name")
+    namespace = _manifest_literal(metadata.get("namespace") or "default", "metadata.namespace")
+    service_account, images = _kubernetes_pod_identity(document)
+    if not images:
+        raise ValueError("pod template must contain at least one literal image")
+    image_digests: list[str] = []
+    for image in images:
+        match = _KUBERNETES_DIGEST_IMAGE_RE.fullmatch(image)
+        if match is None:
+            raise ValueError("every container image must be pinned by a sha256 digest")
+        image_digests.append(f"sha256:{match.group('digest').lower()}")
+
+    provider = _manifest_literal(annotations.get("denali.ai/provider"), "provider").lower()
+    cluster_name = _manifest_literal(
+        annotations.get("denali.ai/cluster-name"), "cluster-name"
+    )
+    identifiers: list[DeploymentIdentifier]
+    if provider == "aws":
+        account_id = _manifest_literal(
+            annotations.get("denali.ai/account-id"), "account-id"
+        )
+        region = _manifest_literal(annotations.get("denali.ai/region"), "region")
+        if re.fullmatch(r"[0-9]{12}", account_id) is None:
+            raise ValueError("AWS account-id must contain exactly 12 digits")
+        identifiers = [
+            DeploymentIdentifier(
+                "account_id", account_id, evidence_basis="literal_kubernetes_account_id"
+            ),
+            DeploymentIdentifier("region", region, evidence_basis="literal_kubernetes_region"),
+            DeploymentIdentifier(
+                "cluster_name",
+                cluster_name,
+                evidence_basis="literal_kubernetes_cluster_name",
+            ),
+        ]
+    elif provider == "gcp":
+        project = annotations.get("denali.ai/project-id")
+        project_number = annotations.get("denali.ai/project-number")
+        if bool(project) == bool(project_number):
+            raise ValueError("GCP requires exactly one project-id or project-number")
+        location = _manifest_literal(
+            annotations.get("denali.ai/location"), "location"
+        )
+        project_name = "project" if project else "project_number"
+        project_value = _manifest_literal(project or project_number, project_name)
+        identifiers = [
+            DeploymentIdentifier(
+                project_name,
+                project_value,
+                evidence_basis=f"literal_kubernetes_{project_name}",
+            ),
+            DeploymentIdentifier(
+                "location", location, evidence_basis="literal_kubernetes_location"
+            ),
+            DeploymentIdentifier(
+                "cluster_name",
+                cluster_name,
+                evidence_basis="literal_kubernetes_cluster_name",
+            ),
+        ]
+    elif provider == "azure":
+        subscription_id = _manifest_literal(
+            annotations.get("denali.ai/subscription-id"), "subscription-id"
+        )
+        if not _valid_azure_uuid(subscription_id):
+            raise ValueError("Azure subscription-id must be a UUID")
+        resource_group = _manifest_literal(
+            annotations.get("denali.ai/resource-group"), "resource-group"
+        )
+        location = _manifest_literal(
+            annotations.get("denali.ai/location"), "location"
+        )
+        identifiers = [
+            DeploymentIdentifier(
+                "subscription_id",
+                subscription_id.lower(),
+                evidence_basis="literal_kubernetes_subscription_id",
+            ),
+            DeploymentIdentifier(
+                "resource_group",
+                resource_group.lower(),
+                evidence_basis="literal_kubernetes_resource_group",
+            ),
+            DeploymentIdentifier(
+                "location",
+                location.lower().replace(" ", ""),
+                evidence_basis="literal_kubernetes_location",
+            ),
+            DeploymentIdentifier(
+                "cluster_name",
+                cluster_name.lower(),
+                evidence_basis="literal_kubernetes_cluster_name",
+            ),
+        ]
+    else:
+        raise ValueError("provider must be aws, gcp, or azure")
+
+    identifiers.extend(
+        (
+            DeploymentIdentifier(
+                "namespace", namespace, evidence_basis="literal_kubernetes_namespace"
+            ),
+            DeploymentIdentifier(
+                "workload_kind", kind.lower(), evidence_basis="literal_kubernetes_kind"
+            ),
+            DeploymentIdentifier(
+                "workload_name", name, evidence_basis="literal_kubernetes_name"
+            ),
+            DeploymentIdentifier(
+                "service_account",
+                service_account,
+                evidence_basis="literal_kubernetes_service_account",
+            ),
+        )
+    )
+    identifiers.extend(
+        DeploymentIdentifier(
+            "image_digest", digest, evidence_basis="literal_kubernetes_image_digest"
+        )
+        for digest in sorted(set(image_digests))
+    )
+    for annotation, identifier in (
+        ("denali.ai/workload-uid", "workload_uid"),
+        ("denali.ai/workload-revision", "workload_revision"),
+    ):
+        value = annotations.get(annotation)
+        if value is not None:
+            identifiers.append(
+                DeploymentIdentifier(
+                    identifier,
+                    _manifest_literal(value, annotation.removeprefix("denali.ai/")),
+                    evidence_basis=f"literal_kubernetes_{identifier}",
+                )
+            )
+    return DeploymentDeclaration(
+        identity=DeploymentIdentity(provider, "kubernetes_workload", tuple(identifiers)),
+        framework="kubernetes_manifest",
+        service="kubernetes",
+        construct_id=(
+            f"{document.get('apiVersion', 'unknown')}:{kind}/{namespace}/{name}"
+        ),
+        deployment_name=f"{namespace}/{kind.lower()}/{name}",
+        path=relative,
+        line=1,
+    )
+
+
+def _kubernetes_pod_identity(document: dict[str, Any]) -> tuple[str, list[str]]:
+    spec = document.get("spec")
+    if not isinstance(spec, dict):
+        raise ValueError("spec must be literal")
+    if document["kind"] == "CronJob":
+        job_template = spec.get("jobTemplate")
+        job_spec = job_template.get("spec") if isinstance(job_template, dict) else None
+        template = job_spec.get("template") if isinstance(job_spec, dict) else None
+    else:
+        template = spec.get("template")
+    pod_spec = template.get("spec") if isinstance(template, dict) else None
+    if not isinstance(pod_spec, dict):
+        raise ValueError("pod template spec must be literal")
+    service_account = _manifest_literal(
+        pod_spec.get("serviceAccountName") or "default", "serviceAccountName"
+    )
+    containers = [
+        container
+        for field in ("initContainers", "containers")
+        for container in pod_spec.get(field, [])
+        if isinstance(container, dict)
+    ]
+    images = [
+        _manifest_literal(container.get("image"), "container image")
+        for container in containers
+    ]
+    return service_account, images
+
+
+def _manifest_literal(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value or "${" in value or "{{" in value:
+        raise ValueError(f"{field} must be a literal string")
+    return value
 
 
 def _yaml_top_level_literal(text: str, key: str) -> str | None:

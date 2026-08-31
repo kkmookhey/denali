@@ -321,8 +321,8 @@ def test_azure_setup_enumerates_then_binds_only_selected_subscriptions() -> None
         assert detail["health_state"] == "healthy"
         assert validator.calls == 2
         assert detail["configuration"]["subscriptions"] == subscriptions
-        assert len(detail["coverage_plan"]) == 7 * len(subscriptions)
-        assert len(detail["last_validation"]["results"]) == 7 * len(subscriptions)
+        assert len(detail["coverage_plan"]) == 8 * len(subscriptions)
+        assert len(detail["last_validation"]["results"]) == 8 * len(subscriptions)
         assert "setup_token" not in json.dumps(detail)
         assert (
             client.post(
@@ -391,8 +391,8 @@ def test_azure_validation_is_subscription_specific_and_all_locations() -> None:
     validation = validator.validate(connection)
     assert validation["health_state"] == "healthy"
     assert validation["credential_state"] == "passed"
-    assert len(validation["results"]) == 14
+    assert len(validation["results"]) == 16
     assert all(item["region"] == "all-locations" for item in validation["results"])
     graph_calls = [item for item in requests if "ResourceGraph" in item[1]]
-    assert len(graph_calls) == 12
+    assert len(graph_calls) == 14
     assert all(len(item[2]["json"]["subscriptions"]) == 1 for item in graph_calls)

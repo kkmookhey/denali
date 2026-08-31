@@ -12,6 +12,7 @@ license = {text = "Apache-2.0"}
 dependencies = [
   "httpx>=0.27",
   "psycopg[binary]>=3.2",
+  "PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -34,6 +35,7 @@ denali-activity-import = "denali.connectors.activity_json:import_main"
 denali-aws-runtime = "denali.connectors.aws_bedrock_activity:scan_main"
 denali-gcp-vertex-runtime = "denali.connectors.gcp_vertex_activity:scan_main"
 denali-gcp-deployments-scan = "denali.connectors.gcp_deployments:scan_main"
+denali-kubernetes-import = "denali.connectors.kubernetes:import_main"
 denali-entra-scan = "denali.connectors.entra_ai:scan_main"
 
 [project.optional-dependencies]

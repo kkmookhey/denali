@@ -1,4 +1,4 @@
-"""Bounded Azure Container Apps and Function Apps deployment inventory."""
+"""Bounded Azure Container Apps, Function Apps, and AKS deployment inventory."""
 
 from __future__ import annotations
 
@@ -32,10 +32,13 @@ CONNECTOR_ID = "denali.azure_deployments"
 CAPABILITIES = ConnectorCapabilities(inventory=True, relationships=True)
 CONTAINER_APP_RESOURCE_TYPE = "microsoft.app/containerapps"
 FUNCTION_APP_RESOURCE_TYPE = "microsoft.web/sites"
+AKS_CLUSTER_RESOURCE_TYPE = "microsoft.containerservice/managedclusters"
 CONTAINER_APP_INVENTORY_PLANE = "azure_container_apps_inventory"
 CONTAINER_APP_RELATIONSHIP_PLANE = "azure_container_apps_relationships"
 FUNCTION_APP_INVENTORY_PLANE = "azure_function_apps_inventory"
 FUNCTION_APP_RELATIONSHIP_PLANE = "azure_function_apps_relationships"
+AKS_CLUSTER_INVENTORY_PLANE = "azure_aks_cluster_inventory"
+AKS_CLUSTER_RELATIONSHIP_PLANE = "azure_aks_cluster_relationships"
 MAX_RESOURCES_PER_TYPE = 10_000
 MAX_PAGES_PER_TYPE = 100
 PAGE_SIZE = 1_000
@@ -43,8 +46,9 @@ PAGE_SIZE = 1_000
 _MODEL_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*(?:MODEL|DEPLOYMENT)_ID$")
 _RESOURCE_ID_RE = re.compile(
     r"^/subscriptions/(?P<subscription>[0-9a-f-]{36})/resourceGroups/"
-    r"(?P<resource_group>[^/]+)/providers/(?P<provider>Microsoft\.(?:App|Web))/"
-    r"(?P<kind>containerApps|sites)/(?P<name>[^/]+)$",
+    r"(?P<resource_group>[^/]+)/providers/"
+    r"(?P<provider>Microsoft\.(?:App|Web|ContainerService))/"
+    r"(?P<kind>containerApps|sites|managedClusters)/(?P<name>[^/]+)$",
     re.IGNORECASE,
 )
 
@@ -72,7 +76,11 @@ class AzureResourceGraphRestClient:
     def list_resources(
         self, *, subscription_id: str, resource_type: str
     ) -> tuple[dict[str, Any], ...]:
-        if resource_type not in {CONTAINER_APP_RESOURCE_TYPE, FUNCTION_APP_RESOURCE_TYPE}:
+        if resource_type not in {
+            CONTAINER_APP_RESOURCE_TYPE,
+            FUNCTION_APP_RESOURCE_TYPE,
+            AKS_CLUSTER_RESOURCE_TYPE,
+        }:
             raise ValueError("unsupported Azure deployment resource type")
         kind_filter = (
             " | where kind contains 'functionapp'"
@@ -254,6 +262,11 @@ class AzureDeploymentConnector:
                 FUNCTION_APP_INVENTORY_PLANE,
                 FUNCTION_APP_RELATIONSHIP_PLANE,
             ),
+            (
+                AKS_CLUSTER_RESOURCE_TYPE,
+                AKS_CLUSTER_INVENTORY_PLANE,
+                AKS_CLUSTER_RELATIONSHIP_PLANE,
+            ),
         ):
             warnings: list[str] = []
             try:
@@ -377,7 +390,11 @@ def _parse_resource(
     match = _RESOURCE_ID_RE.fullmatch(resource_id)
     if match is None or match.group("subscription").lower() != subscription_id:
         raise ValueError("resource ID escaped the selected subscription")
-    expected_kind = "containerapps" if resource_type == CONTAINER_APP_RESOURCE_TYPE else "sites"
+    expected_kind = {
+        CONTAINER_APP_RESOURCE_TYPE: "containerapps",
+        FUNCTION_APP_RESOURCE_TYPE: "sites",
+        AKS_CLUSTER_RESOURCE_TYPE: "managedclusters",
+    }[resource_type]
     if match.group("kind").lower() != expected_kind:
         raise ValueError("resource ID kind did not match the requested boundary")
     if str(raw.get("subscriptionId", "")).lower() != subscription_id:
@@ -404,6 +421,8 @@ def _parse_resource(
         classification.append("explicit_ai_workload_tag")
     if model_keys:
         classification.append("model_configuration_key")
+    if resource_type == AKS_CLUSTER_RESOURCE_TYPE:
+        classification = []
 
     containers = _containers(properties) if resource_type == CONTAINER_APP_RESOURCE_TYPE else []
     images = [
@@ -424,6 +443,9 @@ def _parse_resource(
         if resource_type == CONTAINER_APP_RESOURCE_TYPE
         else properties.get("defaultHostName")
     )
+    if resource_type == AKS_CLUSTER_RESOURCE_TYPE:
+        revision = properties.get("currentKubernetesVersion")
+        endpoint = properties.get("fqdn")
     return {
         "natural_key": resource_id.lower(),
         "name": name,
@@ -431,16 +453,16 @@ def _parse_resource(
         "resource_group": resource_group.lower(),
         "subscription_id": subscription_id,
         "resource_type": resource_type,
-        "service": (
-            "azure_container_apps"
-            if resource_type == CONTAINER_APP_RESOURCE_TYPE
-            else "azure_functions"
-        ),
-        "runtime_kind": (
-            "container_service"
-            if resource_type == CONTAINER_APP_RESOURCE_TYPE
-            else "serverless_function"
-        ),
+        "service": {
+            CONTAINER_APP_RESOURCE_TYPE: "azure_container_apps",
+            FUNCTION_APP_RESOURCE_TYPE: "azure_functions",
+            AKS_CLUSTER_RESOURCE_TYPE: "aks",
+        }[resource_type],
+        "runtime_kind": {
+            CONTAINER_APP_RESOURCE_TYPE: "container_service",
+            FUNCTION_APP_RESOURCE_TYPE: "serverless_function",
+            AKS_CLUSTER_RESOURCE_TYPE: "kubernetes_cluster",
+        }[resource_type],
         "resource_uid": properties.get("resourceGuid") or properties.get("environmentId"),
         "state": properties.get("provisioningState") or properties.get("state"),
         "revision": revision if isinstance(revision, str) else None,

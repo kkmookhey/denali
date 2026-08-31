@@ -1910,13 +1910,14 @@ const AZURE_CONNECTION_SCOPES = [
   { id: "azure.ai_services", label: "Azure AI services", detail: "AI service accounts and Azure AI Search" },
   { id: "azure.ai_platform", label: "Azure AI platform", detail: "Machine Learning workspaces and Bot Service" },
   { id: "azure.ai_activity", label: "Azure AI management activity", detail: "Subscription Activity Log metadata; no prompts or responses" },
-  { id: "azure.code_to_cloud", label: "Code-to-cloud deployments", detail: "Container Apps and Function Apps identities, revisions, images, and managed identities" },
+  { id: "azure.code_to_cloud", label: "Code-to-cloud deployments", detail: "Container Apps, Function Apps, and AKS cluster identities, revisions, images, and managed identities" },
 ];
 
 const GCP_CONNECTION_SCOPES = [
   { id: "gcp.vertex_ai", label: "Vertex AI", detail: "Runtime, model, dataset, pipeline, and notebook resources" },
   { id: "gcp.agent_builder", label: "Agent Builder and Dialogflow", detail: "Discovery Engine and conversational agent resources" },
   { id: "gcp.ai_activity", label: "Google Cloud AI management activity", detail: "Cloud Audit Log metadata; no prompts or responses" },
+  { id: "gcp.code_to_cloud", label: "Code-to-cloud deployments", detail: "Cloud Run, Cloud Run functions, and GKE cluster identities, revisions, images, and service accounts" },
 ];
 
 const GITHUB_CONNECTION_SCOPES = [

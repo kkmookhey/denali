@@ -1,6 +1,7 @@
 from typing import Any
 
 from denali.connectors.azure_deployments import (
+    AKS_CLUSTER_RESOURCE_TYPE,
     CONTAINER_APP_INVENTORY_PLANE,
     CONTAINER_APP_RESOURCE_TYPE,
     FUNCTION_APP_INVENTORY_PLANE,
@@ -82,6 +83,27 @@ def function_app() -> dict[str, Any]:
     }
 
 
+def aks_cluster() -> dict[str, Any]:
+    name = "model-cluster"
+    return {
+        "id": (
+            f"/subscriptions/{SUBSCRIPTION}/resourceGroups/Denali-Test/providers/"
+            f"Microsoft.ContainerService/managedClusters/{name}"
+        ),
+        "name": name,
+        "type": AKS_CLUSTER_RESOURCE_TYPE,
+        "location": "West US 2",
+        "resourceGroup": "Denali-Test",
+        "subscriptionId": SUBSCRIPTION,
+        "tags": {"denali_ai_workload": "true"},
+        "properties": {
+            "provisioningState": "Succeeded",
+            "fqdn": "model-cluster.example.test",
+            "currentKubernetesVersion": "1.34.1",
+        },
+    }
+
+
 class FakeResourceClient:
     def __init__(self, records: dict[str, tuple[dict[str, Any], ...]]):
         self.records = records
@@ -102,6 +124,7 @@ def test_collects_bounded_azure_deployments_without_configuration_values() -> No
                 container_app(name="ordinary", ai=False),
             ),
             FUNCTION_APP_RESOURCE_TYPE: (function_app(),),
+            AKS_CLUSTER_RESOURCE_TYPE: (aks_cluster(),),
         }
     )
 
@@ -114,6 +137,7 @@ def test_collects_bounded_azure_deployments_without_configuration_values() -> No
     assert client.calls == [
         (SUBSCRIPTION, CONTAINER_APP_RESOURCE_TYPE),
         (SUBSCRIPTION, FUNCTION_APP_RESOURCE_TYPE),
+        (SUBSCRIPTION, AKS_CLUSTER_RESOURCE_TYPE),
     ]
     workloads = [item for item in batch.assets if item.asset.kind is AssetKind.AI_WORKLOAD]
     cloud_resources = [
@@ -127,6 +151,7 @@ def test_collects_bounded_azure_deployments_without_configuration_values() -> No
         "denali-ai",
         "ordinary",
         "denali-function",
+        "model-cluster",
     }
     app = next(item for item in workloads if item.display_name == "denali-ai")
     assert app.attributes["deployment_identifiers"] == {

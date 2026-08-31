@@ -24,14 +24,19 @@ context, exact identity requirements, and visible proven, ambiguous, and unmatch
    private, scale-to-zero Azure OpenAI-capable fixture passed live control-plane, reporting,
    and connected-browser acceptance on 2026-08-31 and was then torn down; see
    [the acceptance record](azure-code-to-cloud-live-acceptance-2026-08-31.md).
-4. **Broaden AWS coverage — implementation complete; live acceptance pending.** Terraform,
+4. **Broaden AWS coverage — complete.** Terraform,
    SAM, and CloudFormation declarations now join exact account/Region/name identities to
    independently observed Lambda, ECS task-family, EKS cluster, and SageMaker endpoint
    inventory. Each service has its own validation, inventory, and relationship plane; see
-   [the AWS decision record](../architecture/0026-aws-deployment-code-to-cloud.md).
-5. **Shared Kubernetes correlation.** Correlate EKS, AKS, and GKE workloads through one
-   Kubernetes identity layer using exact cluster, namespace, workload UID, revision, service
-   account, and image-digest evidence.
+   A live selected-Region role validation and all eight collection planes passed on
+   2026-08-31; see [the acceptance record](aws-code-to-cloud-live-acceptance-2026-08-31.md)
+   and [the AWS decision record](../architecture/0026-aws-deployment-code-to-cloud.md).
+5. **Shared Kubernetes correlation — implementation complete; live cluster acceptance
+   pending.** EKS, AKS, and GKE workloads now share one bounded snapshot importer and exact
+   provider-cluster, namespace, kind, name, service-account, UID/revision, and image-digest
+   evidence contract. GKE and AKS cluster resources are independently observed alongside the
+   existing EKS inventory. See
+   [the Kubernetes decision record](../architecture/0027-shared-kubernetes-code-to-cloud.md).
 
 ## Acceptance rules for every step
 

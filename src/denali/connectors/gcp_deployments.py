@@ -1,4 +1,4 @@
-"""Bounded Google Cloud Run and Cloud Run functions deployment inventory."""
+"""Bounded Cloud Run, Cloud Run functions, and GKE deployment inventory."""
 
 from __future__ import annotations
 
@@ -34,10 +34,13 @@ CONNECTOR_ID = "denali.gcp_deployments"
 CAPABILITIES = ConnectorCapabilities(inventory=True, relationships=True)
 CLOUD_RUN_ASSET_TYPE = "run.googleapis.com/Service"
 CLOUD_FUNCTION_ASSET_TYPE = "cloudfunctions.googleapis.com/Function"
+GKE_CLUSTER_ASSET_TYPE = "container.googleapis.com/Cluster"
 CLOUD_RUN_INVENTORY_PLANE = "gcp_cloud_run_inventory"
 CLOUD_RUN_RELATIONSHIP_PLANE = "gcp_cloud_run_relationships"
 CLOUD_FUNCTION_INVENTORY_PLANE = "gcp_cloud_functions_gen2_inventory"
 CLOUD_FUNCTION_RELATIONSHIP_PLANE = "gcp_cloud_functions_gen2_relationships"
+GKE_CLUSTER_INVENTORY_PLANE = "gcp_gke_cluster_inventory"
+GKE_CLUSTER_RELATIONSHIP_PLANE = "gcp_gke_cluster_relationships"
 MAX_ASSETS_PER_TYPE = 10_000
 MAX_PAGES_PER_TYPE = 100
 PAGE_SIZE = 1_000
@@ -51,6 +54,10 @@ _RESOURCE_NAMES = {
     CLOUD_FUNCTION_ASSET_TYPE: re.compile(
         r"^//cloudfunctions\.googleapis\.com/projects/(?P<project>[^/]+)/locations/"
         r"(?P<location>[^/]+)/functions/(?P<name>[^/]+)$"
+    ),
+    GKE_CLUSTER_ASSET_TYPE: re.compile(
+        r"^//container\.googleapis\.com/projects/(?P<project>[^/]+)/locations/"
+        r"(?P<location>[^/]+)/clusters/(?P<name>[^/]+)$"
     ),
 }
 
@@ -246,6 +253,11 @@ class GcpDeploymentConnector:
                 CLOUD_FUNCTION_INVENTORY_PLANE,
                 CLOUD_FUNCTION_RELATIONSHIP_PLANE,
             ),
+            (
+                GKE_CLUSTER_ASSET_TYPE,
+                GKE_CLUSTER_INVENTORY_PLANE,
+                GKE_CLUSTER_RELATIONSHIP_PLANE,
+            ),
         ):
             warnings: list[str] = []
             try:
@@ -395,6 +407,26 @@ def _parse_asset(
 
     if asset_type == CLOUD_FUNCTION_ASSET_TYPE and data.get("environment") != "GEN_2":
         return None
+    if asset_type == GKE_CLUSTER_ASSET_TYPE:
+        return {
+            "natural_key": natural_key,
+            "name": match.group("name"),
+            "location": match.group("location"),
+            "project_id": project_id,
+            "project_number": observed_project_number,
+            "asset_type": asset_type,
+            "service": "gke",
+            "runtime_kind": "kubernetes_cluster",
+            "resource_uid": data.get("id") or data.get("selfLink"),
+            "state": data.get("status"),
+            "update_time": data.get("createTime"),
+            "revision": data.get("currentMasterVersion"),
+            "service_account": None,
+            "endpoint": data.get("endpoint"),
+            "images": [],
+            "model_configuration_keys": [],
+            "classification": [],
+        }
     labels = data.get("labels") if isinstance(data.get("labels"), dict) else {}
     model_keys = _model_configuration_keys(data, asset_type)
     classification = []
@@ -551,7 +583,7 @@ def _model_configuration_keys(data: dict[str, Any], asset_type: str) -> list[str
             for item in container.get("env", [])
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         }
-    else:
+    elif asset_type == CLOUD_FUNCTION_ASSET_TYPE:
         service_config = data.get("serviceConfig")
         environment = (
             service_config.get("environmentVariables", {})
@@ -559,6 +591,8 @@ def _model_configuration_keys(data: dict[str, Any], asset_type: str) -> list[str
             else {}
         )
         keys = set(environment) if isinstance(environment, dict) else set()
+    else:
+        keys = set()
     return sorted(item for item in keys if isinstance(item, str) and _MODEL_KEY_RE.fullmatch(item))
 
 

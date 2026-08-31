@@ -30,7 +30,8 @@ Status terms in this README are deliberately independent:
 | Self-service Google Cloud connection | **Shipped** | **Locally accepted** against three live projects, with a unique keyless principal and all declared project/plane validations passing |
 | Self-service GitHub connection | **Shipped** | **Locally accepted** through the organization-owned GitHub App against 18 exact repositories, with all 54 repository/plane validations passing |
 | GCP and Azure code-to-cloud correlation | **Shipped** | **Locally accepted** against independently observed, private scale-to-zero fixtures with exact source identity, PostgreSQL reporting, and browser evidence |
-| AWS Lambda, ECS, EKS, and SageMaker code-to-cloud correlation | **Shipped** | Automated connector, API, PostgreSQL, and production-web gates pass; live provider acceptance remains pending |
+| AWS Lambda, ECS, EKS, and SageMaker code-to-cloud correlation | **Shipped** | **Locally accepted** against exact live account/Region validation and eight independent deployment collection planes |
+| Shared EKS, GKE, and AKS workload correlation | **Shipped** | Exact cluster/workload/service-account/image-digest implementation and local gates pass; live cluster acceptance remains pending |
 | GitHub source-to-cloud correlation | **Shipped** | Automated connector, API, PostgreSQL, and production-web gates pass; live GitHub collection and browser acceptance remain pending |
 
 These connection statuses describe onboarding and access validation. They do **not** mean
@@ -59,11 +60,11 @@ Implemented collection and import paths include:
 
 | Source | Current path |
 | --- | --- |
-| Source repositories | Local or GitHub App-backed static Python, TypeScript, JavaScript, Terraform, SAM/CloudFormation YAML and JSON, Cloud Run YAML, ARM JSON, and Bicep analysis; bounded repository posture; exact-identifier code-to-cloud correlation |
+| Source repositories | Local or GitHub App-backed static Python, TypeScript, JavaScript, Terraform, SAM/CloudFormation YAML and JSON, Cloud Run YAML, Kubernetes YAML, ARM JSON, and Bicep analysis; bounded repository posture; exact-identifier code-to-cloud correlation |
 | MCP Streamable HTTP | Initialization and paginated `tools/list` observation without tool invocation |
 | AWS | Bedrock Agents Classic, AgentCore, bounded Lambda/ECS/EKS/SageMaker deployment inventory, CloudFormation-stack inventory and posture, and Bedrock management activity from CloudTrail Event History |
-| Google Cloud | Cloud Run and Cloud Run functions Gen2 deployment inventory through Cloud Asset RESOURCE snapshots; Vertex AI audit activity from Cloud Logging |
-| Microsoft Azure | Container Apps and Function Apps deployment inventory through Azure Resource Graph with exact Azure code-to-cloud identity; Entra activity remains a separate connector |
+| Google Cloud | Cloud Run, Cloud Run functions Gen2, and GKE cluster inventory through Cloud Asset RESOURCE snapshots; Vertex AI audit activity from Cloud Logging |
+| Microsoft Azure | Container Apps, Function Apps, and AKS cluster inventory through Azure Resource Graph with exact Azure code-to-cloud identity; Entra activity remains a separate connector |
 | Microsoft Entra | AI application, permission, sign-in, and application-management collection through a separate Microsoft Graph connector |
 | External findings and scanners | OCSF findings, Syft SBOMs, and Grype vulnerability reports |
 | Runtime exports | AWS Bedrock CloudTrail, Google Cloud Vertex AI, Google Workspace Gemini, and Microsoft Entra AI sign-in JSON |
@@ -141,7 +142,7 @@ export DENALI_DSN=postgresql://denali:denali-local@127.0.0.1:55450/denali
 The installed entrypoints include `denali-repo-scan`, `denali-mcp-observe`,
 `denali-agentcore-scan`, `denali-aws-scan`, `denali-aws-stack-scan`,
 `denali-aws-stack-posture`, `denali-repository-posture`, `denali-code-to-cloud`,
-`denali-ocsf-import`, `denali-syft-import`, `denali-grype-import`,
+`denali-kubernetes-import`, `denali-ocsf-import`, `denali-syft-import`, `denali-grype-import`,
 `denali-activity-import`, `denali-aws-runtime`, `denali-gcp-vertex-runtime`,
 `denali-gcp-deployments-scan`, and
 `denali-entra-scan`. Use each command's `--help` output for its exact scope and inputs.
@@ -185,6 +186,7 @@ Start with the product and evidence boundaries, then follow only the slice being
   [GCP code to cloud](docs/architecture/0024-gcp-code-to-cloud.md),
   [Azure code to cloud](docs/architecture/0025-azure-code-to-cloud.md),
   [AWS deployment code to cloud](docs/architecture/0026-aws-deployment-code-to-cloud.md),
+  [shared Kubernetes code to cloud](docs/architecture/0027-shared-kubernetes-code-to-cloud.md),
   [static artifact inclusion](docs/architecture/0011-static-artifact-inclusion.md), and
   [deployment artifact provenance](docs/architecture/0012-deployment-artifact-provenance.md)
 - [Provider-neutral runtime activity](docs/architecture/0015-provider-neutral-runtime-activity.md),
