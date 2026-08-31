@@ -57,6 +57,7 @@ import type {
   GitHubConnectionCreate,
   CodeToCloudDeployment,
   Connection,
+  ConnectionValidationResult,
   Coverage,
   Finding,
   FindingDetail,
@@ -2223,6 +2224,42 @@ function GitHubConnectionDetail({ connection, busy, onPrepare, onValidate, onDis
   const validating = connection.validation_state === "running" || busy === `validate:${connection.id}`;
   const credential = connection.credential_reference.type === "github_app_installation" ? connection.credential_reference : null;
   const permissions = [...new Set(connection.coverage_plan.flatMap((item) => item.permissions))].sort();
+  const [validationFilter, setValidationFilter] = useState<"attention" | "all" | "passed">("attention");
+  useEffect(() => setValidationFilter("attention"), [connection.id, validation?.completed_at]);
+  const recordedResults = validation?.results ?? [];
+  const recordedByRepository = recordedResults.reduce((grouped, result) => {
+    if (result.repository_id === undefined) return grouped;
+    grouped.set(result.repository_id, [...(grouped.get(result.repository_id) ?? []), result]);
+    return grouped;
+  }, new Map<number, ConnectionValidationResult[]>());
+  const repositoryIds = new Set(repositories.map((repository) => repository.id));
+  const repositoryGroups = repositories.map((repository) => {
+    const recorded = recordedByRepository.get(repository.id) ?? [];
+    const declared = connection.coverage_plan.filter((item) => item.repository_id === repository.id);
+    const missing = declared
+      .filter((item) => !recorded.some((result) => result.plane === item.plane))
+      .map<ConnectionValidationResult>((item) => ({
+        scope: item.scope,
+        plane: item.plane,
+        label: item.label,
+        region: item.region,
+        state: "unknown",
+        detail: "No validation result was recorded for this declared plane.",
+        repository_id: repository.id,
+        repository_full_name: repository.full_name,
+      }));
+    const results = [...recorded, ...missing].sort((left, right) => validationStateRank(left.state) - validationStateRank(right.state) || left.label.localeCompare(right.label));
+    const attention = results.filter((result) => result.state === "failed" || result.state === "unknown").length;
+    const passed = results.filter((result) => result.state === "passed").length;
+    return { repository, results, attention, passed };
+  }).sort((left, right) => Number(right.attention > 0) - Number(left.attention > 0) || left.repository.full_name.localeCompare(right.repository.full_name));
+  const unboundResults = recordedResults.filter((result) => result.repository_id === undefined || !repositoryIds.has(result.repository_id));
+  const attentionRepositories = repositoryGroups.filter((group) => group.attention > 0).length;
+  const passingRepositories = repositoryGroups.filter((group) => group.results.length > 0 && group.attention === 0).length;
+  const totalPassed = repositoryGroups.reduce((total, group) => total + group.passed, 0);
+  const totalAttention = repositoryGroups.reduce((total, group) => total + group.attention, 0) + unboundResults.length;
+  const effectiveFilter = validationFilter === "attention" && attentionRepositories === 0 && unboundResults.length === 0 ? "all" : validationFilter;
+  const visibleGroups = repositoryGroups.filter((group) => effectiveFilter === "all" || (effectiveFilter === "attention" ? group.attention > 0 : group.attention === 0));
   return <section className="panel connection-detail">
     <div className="connection-detail-head"><div><span>GITHUB</span><h3>{connection.display_name}</h3><code>{connection.configuration.account_login ? `${connection.configuration.account_type ?? "Account"} ${connection.configuration.account_login}` : credential ? `GitHub App ${credential.app_slug}` : "GitHub App"}</code></div><ConnectionHealth state={connection.health_state} /></div>
     <div className="setup-progress">
@@ -2230,10 +2267,18 @@ function GitHubConnectionDetail({ connection, busy, onPrepare, onValidate, onDis
       <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Install the App and select repositories</strong><small>GitHub shows the App’s exact read permissions and lets you choose repositories. After installation, Denali briefly verifies that the signed-in GitHub user can access that exact installation, records immutable repository IDs, and immediately discards the user token.</small><button className="primary-action" disabled={preparing || !connection.setup_capabilities.github_app} onClick={onPrepare}><ExternalLink />{preparing ? "Opening GitHub…" : setupComplete ? "Reconfigure GitHub App" : "Install / configure GitHub App"}</button>{!connection.setup_capabilities.github_app && <small className="launch-unavailable">GitHub onboarding requires Denali’s configured GitHub App and private signing key.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{repositories.length} exact repositor{repositories.length === 1 ? "y" : "ies"}</strong>{repositories.map((repository) => <code key={repository.id}>{repository.full_name} · ID {repository.id}{repository.private ? " · private" : " · public"}</code>)}{connection.configuration.installation_repository_selection === "all" && <small>GitHub’s installation is set to all repositories, but Denali’s stored coverage remains this exact list. Newly created repositories are not claimed until you reconfigure and verify again.</small>}</div>}</div></div>
       <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every exact repository</strong><small>Denali mints a separate short-lived installation token for one recorded repository at a time, rebinds its immutable identity, and tests each declared read plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating GitHub…" : validation ? "Validate again" : "Validate connection"}</button>}{validating && <small className="validation-progress-note">Validation continues in the background. This page refreshes automatically when every repository is complete.</small>}</div></div>
     </div>
-    <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed GitHub account ID {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.repository_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.repository_full_name ?? result.repository_id} · exact repository</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Install the GitHub App and finish repository selection first.</small></span></div>}</div>
+    <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed GitHub account ID {validation.account_id_observed ?? "not established"}</small></div><div className="github-validation-overview"><div><small>Exact repositories</small><strong>{repositories.length}</strong><span>{attentionRepositories > 0 ? `${attentionRepositories} need attention` : unboundResults.length > 0 ? `${unboundResults.length} unbound result${unboundResults.length === 1 ? "" : "s"}` : "All repository boundaries checked"}</span></div><div><small>Independent plane checks</small><strong>{repositoryGroups.reduce((total, group) => total + group.results.length, 0)}</strong><span>Metadata · Contents · Actions</span></div><div className="passed"><small>Passed</small><strong>{totalPassed}</strong><span>Successful read checks</span></div><div className={totalAttention > 0 ? "attention" : "passed"}><small>Failed or unknown</small><strong>{totalAttention}</strong><span>{totalAttention > 0 ? "Expanded below" : "No unresolved checks"}</span></div></div><div className="github-validation-toolbar"><div><strong>Repository results</strong><small>Failures and unknowns are listed first. Passing repositories stay compact until expanded.</small></div><div role="group" aria-label="Filter repository validation results"><button type="button" className={effectiveFilter === "attention" ? "active" : ""} disabled={attentionRepositories === 0 && unboundResults.length === 0} onClick={() => setValidationFilter("attention")}>Needs attention <span>{attentionRepositories + (unboundResults.length > 0 ? 1 : 0)}</span></button><button type="button" className={effectiveFilter === "all" ? "active" : ""} onClick={() => setValidationFilter("all")}>All <span>{repositoryGroups.length + (unboundResults.length > 0 ? 1 : 0)}</span></button><button type="button" className={effectiveFilter === "passed" ? "active" : ""} disabled={passingRepositories === 0} onClick={() => setValidationFilter("passed")}>Passing <span>{passingRepositories}</span></button></div></div>{effectiveFilter !== "passed" && unboundResults.length > 0 && <details className="github-repository-validation attention" open><summary><span className="github-repository-state"><CircleAlert /></span><span><strong>Unbound validation results</strong><small>These results do not match a repository in the recorded exact boundary.</small></span><span className="github-plane-statuses" /><span className="github-repository-counts"><b>{unboundResults.length} unknown</b></span></summary><div className="github-plane-results">{unboundResults.map((result, index) => <GitHubValidationResult key={`${result.repository_id ?? "unbound"}:${result.plane}:${index}`} result={result} />)}</div></details>}<div className="github-repository-validations">{visibleGroups.map((group) => <details className={`github-repository-validation ${group.attention > 0 ? "attention" : "passed"}`} key={group.repository.id} open={group.attention > 0}><summary><span className="github-repository-state">{group.attention > 0 ? <CircleAlert /> : <CircleCheck />}</span><span><strong>{group.repository.full_name}</strong><small><code>Repository ID {group.repository.id}</code><code>Node ID {group.repository.node_id}</code></small></span><span className="github-plane-statuses">{group.results.map((result) => <i className={result.state} key={result.plane} title={`${result.label}: ${titleCase(result.state)}`}>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}<em>{result.label.replace("Repository ", "")}</em></i>)}</span><span className="github-repository-counts"><b className={group.attention > 0 ? "attention" : "passed"}>{group.attention > 0 ? `${group.attention} need attention` : `${group.passed} passed`}</b><small>{group.attention > 0 ? "Details expanded" : "Details collapsed"}</small></span></summary><div className="github-plane-results">{group.results.map((result) => <GitHubValidationResult key={`${group.repository.id}:${result.plane}`} result={result} />)}</div></details>)}</div>{visibleGroups.length === 0 && <div className="connection-unknown"><CircleHelp /><span><strong>No repositories match this filter</strong><small>Choose another result filter to inspect the recorded repository boundary.</small></span></div>}</> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Install the GitHub App and finish repository selection first.</small></span></div>}</div>
     <details className="connection-permissions"><summary>Review {permissions.length || 3} declared GitHub permissions</summary><div>{(permissions.length ? permissions : ["metadata:read", "contents:read", "actions:read"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>This slice cannot write source, dispatch workflows, read Actions secrets, administer repositories, receive webhooks, or access repositories outside the recorded immutable IDs. Branch-protection posture is not claimed.</p></details>
     <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes Denali’s connection configuration and validation history only; uninstall the GitHub App separately in GitHub. Previously collected evidence remains.</span>{credential?.installation_id && <code>Installation ID {credential.installation_id}</code>}{connection.configuration.installer && <code>Verified installer {connection.configuration.installer.login} · user ID {connection.configuration.installer.id}</code>}</div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
   </section>;
+}
+
+function validationStateRank(state: ConnectionValidationResult["state"]) {
+  return state === "failed" ? 0 : state === "unknown" ? 1 : state === "not_applicable" ? 2 : 3;
+}
+
+function GitHubValidationResult({ result }: { result: ConnectionValidationResult }) {
+  return <div className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{titleCase(result.state)} · {titleCase(result.plane)}</small><p>{result.detail}</p></div></div>;
 }
 
 function Sources({ coverage }: { coverage: Coverage[] }) {
