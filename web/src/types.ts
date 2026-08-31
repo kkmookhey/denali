@@ -146,7 +146,7 @@ export type Connection = {
   source_collection_state?: "idle" | "running";
   last_source_collection?: GitHubSourceCollection | null;
   deployment_collection_state?: "idle" | "running";
-  last_deployment_collection?: GcpDeploymentCollection | AzureDeploymentCollection | null;
+  last_deployment_collection?: GcpDeploymentCollection | AzureDeploymentCollection | AwsDeploymentCollection | null;
   setup_capabilities: {
     cloudformation_quick_create: boolean;
     azure_cloud_shell: boolean;
@@ -265,6 +265,22 @@ export type AzureDeploymentCollection = {
   partial_count: number;
   subscriptions: Array<{
     subscription_id: string;
+    state: "complete" | "partial" | "failed";
+    assets?: number;
+    ai_workloads?: number;
+  }>;
+  detail?: string;
+};
+
+export type AwsDeploymentCollection = {
+  connection_id: string;
+  state: "complete" | "partial" | "failed";
+  completed_at: string;
+  region_count: number;
+  failed_count: number;
+  partial_count: number;
+  regions: Array<{
+    region: string;
     state: "complete" | "partial" | "failed";
     assets?: number;
     ai_workloads?: number;

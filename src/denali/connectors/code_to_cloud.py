@@ -56,10 +56,13 @@ _TASK_RE = re.compile(
 _TERRAFORM_RESOURCE_RE = re.compile(
     r"\bresource\s+(['\"])(?P<type>google_cloud_run_v2_service|"
     r"google_cloudfunctions2_function|azurerm_container_app|"
-    r"azurerm_linux_function_app|azurerm_windows_function_app)\1\s+"
+    r"azurerm_linux_function_app|azurerm_windows_function_app|"
+    r"aws_lambda_function|aws_ecs_task_definition|aws_eks_cluster|"
+    r"aws_sagemaker_endpoint)\1\s+"
     r"(['\"])(?P<label>[^'\"]+)\3\s*\{"
 )
 _AZURERM_PROVIDER_RE = re.compile(r"\bprovider\s+(['\"])azurerm\1\s*\{")
+_AWS_PROVIDER_RE = re.compile(r"\bprovider\s+(['\"])aws\1\s*\{")
 _AZURE_BICEP_RESOURCE_RE = re.compile(
     r"(?m)^\s*resource\s+(?P<symbol>[A-Za-z_][A-Za-z0-9_]*)\s+"
     r"(['\"])(?P<type>Microsoft\.(?:App/containerApps|Web/sites))@[^'\"]+\2\s*=\s*\{"
@@ -437,11 +440,15 @@ def _deployment_declarations(
     if suffix == ".tf":
         return _terraform_declarations(text, relative)
     if suffix == ".json":
-        return _azure_json_declarations(text, relative)
+        azure, azure_warnings = _azure_json_declarations(text, relative)
+        aws, aws_warnings = _aws_cloudformation_json_declarations(text, relative)
+        return [*azure, *aws], [*azure_warnings, *aws_warnings]
     if suffix == ".bicep":
         return _azure_bicep_declarations(text, relative)
     if suffix in {".yaml", ".yml"}:
-        return _cloud_run_yaml_declarations(text, relative)
+        gcp, gcp_warnings = _cloud_run_yaml_declarations(text, relative)
+        aws, aws_warnings = _aws_sam_yaml_declarations(text, relative)
+        return [*gcp, *aws], [*gcp_warnings, *aws_warnings]
     output: list[DeploymentDeclaration] = []
     warnings: list[str] = []
     scan_text = _strip_js_comments(text)
@@ -550,6 +557,7 @@ def _terraform_declarations(
     warnings: list[str] = []
     scan_text = _strip_hcl_comments(text)
     azure_subscription = _terraform_azure_subscription(scan_text)
+    aws_scope = _terraform_aws_scope(scan_text)
     for match in _TERRAFORM_RESOURCE_RE.finditer(scan_text):
         block_start = match.end() - 1
         block_end = _balanced_object_end(scan_text, block_start)
@@ -592,7 +600,7 @@ def _terraform_declarations(
                     DeploymentIdentifier(name_identifier, name, evidence_basis=name_basis),
                 ),
             )
-        else:
+        elif resource_type.startswith("azurerm_"):
             resource_group = _hcl_top_level_literal(block, "resource_group_name")
             if not azure_subscription or not resource_group or not location or not name:
                 warnings.append(
@@ -617,6 +625,33 @@ def _terraform_declarations(
                 runtime_kind=runtime_kind,
                 name_identifier=name_identifier,
                 name_basis=name_basis,
+            )
+        else:
+            account_id, region = aws_scope if aws_scope else (None, None)
+            field = "family" if resource_type == "aws_ecs_task_definition" else "name"
+            if resource_type == "aws_lambda_function":
+                field = "function_name"
+            deployment_name = _hcl_top_level_literal(block, field)
+            if not account_id or not region or not deployment_name:
+                warnings.append(
+                    f"{relative}:{line}: Terraform AWS provider region and single "
+                    f"allowed_account_ids value plus resource {field} must all be literal"
+                )
+                continue
+            service, runtime_kind, identifier_name = {
+                "aws_lambda_function": ("lambda", "serverless_function", "function_name"),
+                "aws_ecs_task_definition": ("ecs", "container_task", "task_family"),
+                "aws_eks_cluster": ("eks", "kubernetes_cluster", "cluster_name"),
+                "aws_sagemaker_endpoint": ("sagemaker", "model_endpoint", "endpoint_name"),
+            }[resource_type]
+            name = deployment_name
+            identity = _aws_deployment_identity(
+                account_id=account_id,
+                region=region,
+                runtime_kind=runtime_kind,
+                identifier_name=identifier_name,
+                identifier_value=deployment_name,
+                identifier_basis=f"literal_aws_{identifier_name}",
             )
         output.append(
             DeploymentDeclaration(
@@ -646,6 +681,156 @@ def _terraform_azure_subscription(text: str) -> str | None:
         if subscription and _valid_azure_uuid(subscription):
             subscriptions.append(subscription.lower())
     return subscriptions[0] if len(set(subscriptions)) == 1 else None
+
+
+def _terraform_aws_scope(text: str) -> tuple[str, str] | None:
+    scopes: list[tuple[str, str]] = []
+    for match in _AWS_PROVIDER_RE.finditer(text):
+        block_start = match.end() - 1
+        block_end = _balanced_object_end(text, block_start)
+        if block_end is None:
+            continue
+        block = text[block_start : block_end + 1]
+        if _hcl_top_level_literal(block, "alias") is not None:
+            continue
+        region = _hcl_top_level_literal(block, "region")
+        accounts = _hcl_top_level_string_list(block, "allowed_account_ids")
+        if region and len(accounts) == 1 and re.fullmatch(r"[0-9]{12}", accounts[0]):
+            scopes.append((accounts[0], region))
+    return scopes[0] if len(set(scopes)) == 1 else None
+
+
+def _hcl_top_level_string_list(block: str, key: str) -> tuple[str, ...]:
+    pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=\s*\[(?P<value>[^\]]*)\]")
+    for match in pattern.finditer(block):
+        if _hcl_brace_depth(block, match.start()) != 1:
+            continue
+        raw = match.group("value")
+        values = re.findall(r"(['\"])(?P<value>[^'\"\r\n]+)\1", raw)
+        residue = re.sub(r"(['\"])[^'\"\r\n]+\1", "", raw).replace(",", "").strip()
+        if not residue:
+            return tuple(value for _, value in values if "${" not in value)
+    return ()
+
+
+def _aws_deployment_identity(
+    *,
+    account_id: str,
+    region: str,
+    runtime_kind: str,
+    identifier_name: str,
+    identifier_value: str,
+    identifier_basis: str,
+) -> DeploymentIdentity:
+    return DeploymentIdentity(
+        provider="aws",
+        runtime_kind=runtime_kind,
+        identifiers=(
+            DeploymentIdentifier(
+                "account_id", account_id, evidence_basis="literal_aws_account_id"
+            ),
+            DeploymentIdentifier(
+                "region", region, evidence_basis="literal_aws_region"
+            ),
+            DeploymentIdentifier(
+                identifier_name,
+                identifier_value,
+                evidence_basis=identifier_basis,
+            ),
+        ),
+    )
+
+
+def _aws_cloudformation_json_declarations(
+    text: str, relative: str
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return [], []
+    if not isinstance(payload, dict) or not isinstance(payload.get("Resources"), dict):
+        return [], []
+    metadata = payload.get("Metadata")
+    denali = metadata.get("Denali") if isinstance(metadata, dict) else None
+    account_id = denali.get("AccountId") if isinstance(denali, dict) else None
+    region = denali.get("Region") if isinstance(denali, dict) else None
+    return _aws_template_resources(
+        payload["Resources"],
+        account_id=account_id,
+        region=region,
+        relative=relative,
+        framework="sam_cloudformation",
+    )
+
+
+def _aws_template_resources(
+    resources: dict[str, Any],
+    *,
+    account_id: Any,
+    region: Any,
+    relative: str,
+    framework: str,
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    output: list[DeploymentDeclaration] = []
+    warnings: list[str] = []
+    supported = {
+        "AWS::Serverless::Function": (
+            "lambda",
+            "serverless_function",
+            "FunctionName",
+            "function_name",
+        ),
+        "AWS::Lambda::Function": ("lambda", "serverless_function", "FunctionName", "function_name"),
+        "AWS::ECS::TaskDefinition": ("ecs", "container_task", "Family", "task_family"),
+        "AWS::EKS::Cluster": ("eks", "kubernetes_cluster", "Name", "cluster_name"),
+        "AWS::SageMaker::Endpoint": (
+            "sagemaker",
+            "model_endpoint",
+            "EndpointName",
+            "endpoint_name",
+        ),
+    }
+    for logical_id, resource in resources.items():
+        if not isinstance(logical_id, str) or not isinstance(resource, dict):
+            continue
+        resource_type = resource.get("Type")
+        if resource_type not in supported:
+            continue
+        service, runtime_kind, property_name, identifier_name = supported[resource_type]
+        properties = resource.get("Properties")
+        name = properties.get(property_name) if isinstance(properties, dict) else None
+        if (
+            not isinstance(account_id, str)
+            or re.fullmatch(r"[0-9]{12}", account_id) is None
+            or not isinstance(region, str)
+            or not region
+            or not isinstance(name, str)
+            or not name
+        ):
+            warnings.append(
+                f"{relative}:1: SAM/CloudFormation Metadata.Denali AccountId/Region and "
+                f"{logical_id} {property_name} must all be literal"
+            )
+            continue
+        output.append(
+            DeploymentDeclaration(
+                identity=_aws_deployment_identity(
+                    account_id=account_id,
+                    region=region,
+                    runtime_kind=runtime_kind,
+                    identifier_name=identifier_name,
+                    identifier_value=name,
+                    identifier_basis=f"literal_aws_{identifier_name}",
+                ),
+                framework=framework,
+                service=service,
+                construct_id=logical_id,
+                deployment_name=name,
+                path=relative,
+                line=1,
+            )
+        )
+    return output, warnings
 
 
 def _azure_json_declarations(
@@ -950,6 +1135,66 @@ def _cloud_run_yaml_declarations(
             )
         )
     return output, warnings
+
+
+def _aws_sam_yaml_declarations(
+    text: str, relative: str
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    metadata = _yaml_top_level_block(text, "Metadata")
+    resources_block = _yaml_top_level_block(text, "Resources")
+    if resources_block is None:
+        return [], []
+    denali = _yaml_direct_block(metadata, "Denali") if metadata is not None else None
+    account_id = _yaml_direct_literal(denali, "AccountId") if denali is not None else None
+    region = _yaml_direct_literal(denali, "Region") if denali is not None else None
+    indent = _yaml_direct_indent(resources_block)
+    if indent is None:
+        return [], []
+    matches = list(
+        re.finditer(
+            rf"(?m)^ {{{indent}}}(?P<logical>[A-Za-z0-9]+):\s*(?:#.*)?$",
+            resources_block,
+        )
+    )
+    resources: dict[str, Any] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(resources_block)
+        resource_block = resources_block[match.end() : end]
+        resource_type = _yaml_direct_literal(resource_block, "Type")
+        properties = _yaml_direct_block(resource_block, "Properties")
+        if resource_type is None:
+            continue
+        property_values: dict[str, str] = {}
+        if properties is not None:
+            for key in ("FunctionName", "Family", "Name", "EndpointName"):
+                value = _yaml_direct_literal(properties, key)
+                if value is not None:
+                    property_values[key] = value
+        resources[match.group("logical")] = {
+            "Type": resource_type,
+            "Properties": property_values,
+        }
+    if not any(
+        isinstance(item, dict)
+        and str(item.get("Type", "")).startswith(
+            (
+                "AWS::Serverless::",
+                "AWS::Lambda::",
+                "AWS::ECS::",
+                "AWS::EKS::",
+                "AWS::SageMaker::",
+            )
+        )
+        for item in resources.values()
+    ):
+        return [], []
+    return _aws_template_resources(
+        resources,
+        account_id=account_id,
+        region=region,
+        relative=relative,
+        framework="sam_cloudformation",
+    )
 
 
 def _yaml_top_level_literal(text: str, key: str) -> str | None:

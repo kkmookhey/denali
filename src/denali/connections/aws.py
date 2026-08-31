@@ -12,6 +12,7 @@ AWS_SCOPE_BEDROCK_AGENTS = "aws.bedrock_agents"
 AWS_SCOPE_AGENTCORE = "aws.agentcore"
 AWS_SCOPE_BEDROCK_ACTIVITY = "aws.bedrock_activity"
 AWS_SCOPE_BEDROCK_LOGGING = "aws.bedrock_logging"
+AWS_SCOPE_CODE_TO_CLOUD = "aws.code_to_cloud"
 AWS_SCOPE_REGION_COVERAGE = "aws.region_coverage"
 AWS_COVERAGE_AUTOMATIC = "automatic"
 AWS_COVERAGE_SELECTED = "selected"
@@ -70,6 +71,7 @@ AWS_SCOPES = (
     AWS_SCOPE_AGENTCORE,
     AWS_SCOPE_BEDROCK_ACTIVITY,
     AWS_SCOPE_BEDROCK_LOGGING,
+    AWS_SCOPE_CODE_TO_CLOUD,
 )
 
 _SCOPE_METADATA = {
@@ -138,6 +140,48 @@ _SCOPE_METADATA = {
                 "label": "Bedrock invocation logging configuration",
                 "plane": "bedrock_invocation_logging",
                 "permissions": ("bedrock:GetModelInvocationLoggingConfiguration",),
+            },
+        ),
+    },
+    AWS_SCOPE_CODE_TO_CLOUD: {
+        "planes": (
+            {
+                "label": "AWS Lambda deployment inventory",
+                "plane": "aws_lambda_deployments",
+                "permissions": (
+                    "lambda:ListFunctions",
+                    "lambda:GetFunctionConfiguration",
+                    "lambda:ListTags",
+                ),
+            },
+            {
+                "label": "Amazon ECS task definition inventory",
+                "plane": "aws_ecs_deployments",
+                "permissions": (
+                    "ecs:ListTaskDefinitionFamilies",
+                    "ecs:DescribeTaskDefinition",
+                    "ecs:ListTagsForResource",
+                ),
+            },
+            {
+                "label": "Amazon EKS cluster inventory",
+                "plane": "aws_eks_deployments",
+                "permissions": (
+                    "eks:ListClusters",
+                    "eks:DescribeCluster",
+                    "eks:ListTagsForResource",
+                ),
+            },
+            {
+                "label": "Amazon SageMaker endpoint inventory",
+                "plane": "aws_sagemaker_deployments",
+                "permissions": (
+                    "sagemaker:ListEndpoints",
+                    "sagemaker:DescribeEndpoint",
+                    "sagemaker:DescribeEndpointConfig",
+                    "sagemaker:DescribeModel",
+                    "sagemaker:ListTags",
+                ),
             },
         ),
     },
@@ -548,6 +592,10 @@ class AwsConnectionValidator:
             "agentcore_memories": "bedrock-agentcore-control",
             "bedrock_management_activity": "cloudtrail",
             "bedrock_invocation_logging": "bedrock",
+            "aws_lambda_deployments": "lambda",
+            "aws_ecs_deployments": "ecs",
+            "aws_eks_deployments": "eks",
+            "aws_sagemaker_deployments": "sagemaker",
         }
         get_available_regions = getattr(session, "get_available_regions", None)
         if not callable(get_available_regions):
@@ -592,6 +640,16 @@ class AwsConnectionValidator:
         elif plane == "bedrock_invocation_logging":
             client = _regional_client(session, "bedrock", region)
             client.get_model_invocation_logging_configuration()
+        elif plane == "aws_lambda_deployments":
+            _regional_client(session, "lambda", region).list_functions(MaxItems=1)
+        elif plane == "aws_ecs_deployments":
+            _regional_client(session, "ecs", region).list_task_definition_families(
+                status="ACTIVE", maxResults=1
+            )
+        elif plane == "aws_eks_deployments":
+            _regional_client(session, "eks", region).list_clusters(maxResults=1)
+        elif plane == "aws_sagemaker_deployments":
+            _regional_client(session, "sagemaker", region).list_endpoints(MaxResults=1)
         else:  # Creation validation should make this unreachable.
             raise ValueError("unsupported_scope")
 

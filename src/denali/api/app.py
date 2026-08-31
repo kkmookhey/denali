@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from denali.connections import (
     AWS_COVERAGE_AUTOMATIC,
     AWS_COVERAGE_SELECTED,
+    AWS_SCOPE_CODE_TO_CLOUD,
     AWS_SCOPES,
     AZURE_CLOUD_PUBLIC,
     AZURE_SCOPE_CODE_TO_CLOUD,
@@ -48,6 +49,7 @@ from denali.connections import (
 )
 from denali.connections.aws import render_cloudformation
 from denali.connections.gcp import valid_gcp_project_id
+from denali.connectors.aws_deployments import AwsConnectionDeploymentCollector
 from denali.connectors.azure_deployments import AzureConnectionDeploymentCollector
 from denali.connectors.gcp_deployments import GcpConnectionDeploymentCollector
 from denali.connectors.github_repository import GitHubRepositoryCollector
@@ -377,6 +379,7 @@ def create_app(
     gcp_principal_provisioner: GcpConnectionPrincipalProvisioner | None = None,
     gcp_setup_launcher: GcpSetupScriptLauncher | None = None,
     azure_deployment_collector: AzureConnectionDeploymentCollector | None = None,
+    aws_deployment_collector: AwsConnectionDeploymentCollector | None = None,
     gcp_deployment_collector: GcpConnectionDeploymentCollector | None = None,
     github_app_client: GitHubAppClient | None = None,
     github_connection_validator: GitHubConnectionValidator | None = None,
@@ -436,6 +439,9 @@ def create_app(
         app.state.azure_deployment_collector = (
             azure_deployment_collector or AzureConnectionDeploymentCollector()
         )
+        app.state.aws_deployment_collector = (
+            aws_deployment_collector or AwsConnectionDeploymentCollector()
+        )
         app.state.gcp_deployment_collector = (
             gcp_deployment_collector or GcpConnectionDeploymentCollector()
         )
@@ -463,6 +469,9 @@ def create_app(
         app.state.active_azure_deployment_collections = set()
         app.state.azure_deployment_collection_results = {}
         app.state.azure_deployment_collection_lock = Lock()
+        app.state.active_aws_deployment_collections = set()
+        app.state.aws_deployment_collection_results = {}
+        app.state.aws_deployment_collection_lock = Lock()
         yield
 
     app = FastAPI(
@@ -620,6 +629,51 @@ def create_app(
             finally:
                 with collection_lock:
                     request.app.state.gcp_deployment_collection_results[
+                        connection_key
+                    ] = result
+                    active_collections.discard(connection_key)
+
+        background_tasks.add_task(run_collection)
+        return {"status": "started", "connection_id": connection_id}
+
+    def queue_aws_deployment_collection(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        repo: InventoryReader,
+        current_tenant: str,
+        target: dict[str, Any],
+    ) -> dict[str, str]:
+        connection_id = str(target["id"])
+        connection_key = (current_tenant, connection_id)
+        collector = request.app.state.aws_deployment_collector
+        collection_lock = request.app.state.aws_deployment_collection_lock
+        active_collections = request.app.state.active_aws_deployment_collections
+        with collection_lock:
+            if connection_key in active_collections:
+                return {"status": "already_running", "connection_id": connection_id}
+            active_collections.add(connection_key)
+
+        def run_collection() -> None:
+            try:
+                result = collector.collect(
+                    tenant_id=current_tenant,
+                    connection=target,
+                    repository=repo,
+                )
+            except Exception:
+                result = {
+                    "connection_id": connection_id,
+                    "state": "failed",
+                    "completed_at": datetime.now(UTC).isoformat(),
+                    "region_count": 0,
+                    "failed_count": 0,
+                    "partial_count": 0,
+                    "regions": [],
+                    "detail": "aws_deployment_collection_failed",
+                }
+            finally:
+                with collection_lock:
+                    request.app.state.aws_deployment_collection_results[
                         connection_key
                     ] = result
                     active_collections.discard(connection_key)
@@ -1453,6 +1507,30 @@ def create_app(
         )
 
     @app.post(
+        "/v1/connections/{connection_id}/aws/collect-deployments",
+        status_code=202,
+    )
+    def collect_aws_deployments(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        connection_id: UUID,
+    ) -> dict[str, str]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "aws":
+            raise HTTPException(status_code=404, detail="AWS connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot collect")
+        if AWS_SCOPE_CODE_TO_CLOUD not in target["declared_scopes"]:
+            raise HTTPException(
+                status_code=409,
+                detail="AWS code-to-cloud scope is not declared",
+            )
+        return queue_aws_deployment_collection(
+            request, background_tasks, repo, current_tenant, target
+        )
+
+    @app.post(
         "/v1/connections/{connection_id}/azure/collect-deployments",
         status_code=202,
     )
@@ -1536,6 +1614,15 @@ def create_app(
                     status_code=409,
                     detail=(
                         "wait for the active Azure deployment collection to finish "
+                        "before disabling"
+                    ),
+                )
+        with request.app.state.aws_deployment_collection_lock:
+            if connection_key in request.app.state.active_aws_deployment_collections:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "wait for the active AWS deployment collection to finish "
                         "before disabling"
                     ),
                 )
@@ -1868,6 +1955,16 @@ def _with_validation_state(
             "running" if azure_collecting else "idle"
         )
         result["last_deployment_collection"] = azure_collection_result
+    with request.app.state.aws_deployment_collection_lock:
+        aws_collecting = connection_key in request.app.state.active_aws_deployment_collections
+        aws_collection_result = request.app.state.aws_deployment_collection_results.get(
+            connection_key
+        )
+    if result["provider"] == "aws":
+        result["deployment_collection_state"] = (
+            "running" if aws_collecting else "idle"
+        )
+        result["last_deployment_collection"] = aws_collection_result
     result["setup_capabilities"] = {
         "cloudformation_quick_create": (
             result["provider"] == "aws"

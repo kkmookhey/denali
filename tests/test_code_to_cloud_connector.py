@@ -184,6 +184,172 @@ resource "google_cloud_run_v2_service" "agent" {
     ]
 
 
+def test_discovers_literal_aws_terraform_declarations() -> None:
+    source = '''
+provider "aws" {
+  region              = "us-east-1"
+  allowed_account_ids = ["123456789012"]
+}
+
+resource "aws_lambda_function" "agent" {
+  function_name = "denali-agent"
+}
+
+resource "aws_ecs_task_definition" "worker" {
+  family = "denali-worker"
+}
+
+resource "aws_eks_cluster" "models" {
+  name = "denali-models"
+}
+
+resource "aws_sagemaker_endpoint" "model" {
+  name = "denali-endpoint"
+}
+'''
+
+    declarations, warnings = _deployment_declarations(source, "infra/aws.tf")
+
+    assert warnings == []
+    assert [item.service for item in declarations] == [
+        "lambda",
+        "ecs",
+        "eks",
+        "sagemaker",
+    ]
+    assert [item.identity.runtime_kind for item in declarations] == [
+        "serverless_function",
+        "container_task",
+        "kubernetes_cluster",
+        "model_endpoint",
+    ]
+    assert declarations[1].identity.match_basis() == [
+        "literal_aws_account_id",
+        "literal_aws_region",
+        "literal_aws_task_family",
+    ]
+
+
+def test_aws_terraform_requires_literal_account_region_boundary() -> None:
+    source = '''
+provider "aws" {
+  region = var.region
+}
+resource "aws_lambda_function" "agent" {
+  function_name = "denali-agent"
+}
+'''
+
+    declarations, warnings = _deployment_declarations(source, "infra/aws.tf")
+
+    assert declarations == []
+    assert "single allowed_account_ids" in warnings[0]
+
+
+def test_discovers_sam_function_with_denali_boundary_metadata() -> None:
+    source = '''
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Metadata:
+  Denali:
+    AccountId: '123456789012'
+    Region: us-east-1
+Resources:
+  AgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: denali-agent
+      Handler: app.handler
+'''
+
+    declarations, warnings = _deployment_declarations(source, "template.yaml")
+
+    assert warnings == []
+    assert len(declarations) == 1
+    declaration = declarations[0]
+    assert declaration.framework == "sam_cloudformation"
+    assert declaration.service == "lambda"
+    assert declaration.identity.values("account_id") == ("123456789012",)
+    assert declaration.identity.values("region") == ("us-east-1",)
+    assert declaration.identity.values("function_name") == ("denali-agent",)
+
+
+def test_exact_aws_terraform_and_sam_identities_create_deployment_edges(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "main.tf").write_text(
+        '''
+provider "aws" {
+  region              = "us-east-1"
+  allowed_account_ids = ["123456789012"]
+}
+resource "aws_eks_cluster" "models" {
+  name = "denali-models"
+}
+'''
+    )
+    (tmp_path / "template.yaml").write_text(
+        '''
+Metadata:
+  Denali:
+    AccountId: '123456789012'
+    Region: us-east-1
+Resources:
+  Agent:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: denali-agent
+'''
+    )
+    targets = (
+        DeploymentTarget(
+            natural_key="arn:aws:eks:us-east-1:123456789012:cluster/denali-models",
+            display_name="denali-models",
+            service="eks",
+            identity=DeploymentIdentity(
+                provider="aws",
+                runtime_kind="kubernetes_cluster",
+                identifiers=(
+                    DeploymentIdentifier("account_id", "123456789012"),
+                    DeploymentIdentifier("region", "us-east-1"),
+                    DeploymentIdentifier("cluster_name", "denali-models"),
+                ),
+            ),
+            evidence_locator="aws://eks/us-east-1/denali-models",
+            evidence_payload={},
+        ),
+        DeploymentTarget(
+            natural_key="arn:aws:lambda:us-east-1:123456789012:function:denali-agent",
+            display_name="denali-agent",
+            service="lambda",
+            identity=DeploymentIdentity(
+                provider="aws",
+                runtime_kind="serverless_function",
+                identifiers=(
+                    DeploymentIdentifier("account_id", "123456789012"),
+                    DeploymentIdentifier("region", "us-east-1"),
+                    DeploymentIdentifier("function_name", "denali-agent"),
+                ),
+            ),
+            evidence_locator="aws://lambda/us-east-1/denali-agent",
+            evidence_payload={},
+        ),
+    )
+
+    batch = CodeToCloudConnector(
+        tmp_path,
+        repository_name="github.com/example/aws-agent",
+        targets=targets,
+    ).collect()
+
+    assert len(batch.relationships) == 2
+    assert {item.attributes["deployment_framework"] for item in batch.relationships} == {
+        "terraform",
+        "sam_cloudformation",
+    }
+    assert all(item.attributes["provider"] == "aws" for item in batch.relationships)
+
+
 def test_exact_gcp_scope_and_service_create_deployed_by_edge(tmp_path: Path) -> None:
     (tmp_path / "main.tf").write_text(
         '''

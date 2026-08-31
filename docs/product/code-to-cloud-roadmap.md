@@ -24,8 +24,11 @@ context, exact identity requirements, and visible proven, ambiguous, and unmatch
    private, scale-to-zero Azure OpenAI-capable fixture passed live control-plane, reporting,
    and connected-browser acceptance on 2026-08-31 and was then torn down; see
    [the acceptance record](azure-code-to-cloud-live-acceptance-2026-08-31.md).
-4. **Broaden AWS coverage.** Add Terraform and SAM declarations, followed by EKS and SageMaker,
-   while keeping each service behind its own explicit identifier and coverage contract.
+4. **Broaden AWS coverage — implementation complete; live acceptance pending.** Terraform,
+   SAM, and CloudFormation declarations now join exact account/Region/name identities to
+   independently observed Lambda, ECS task-family, EKS cluster, and SageMaker endpoint
+   inventory. Each service has its own validation, inventory, and relationship plane; see
+   [the AWS decision record](../architecture/0026-aws-deployment-code-to-cloud.md).
 5. **Shared Kubernetes correlation.** Correlate EKS, AKS, and GKE workloads through one
    Kubernetes identity layer using exact cluster, namespace, workload UID, revision, service
    account, and image-digest evidence.

@@ -14,6 +14,7 @@ from denali.connections import (
     AWS_SCOPE_BEDROCK_ACTIVITY,
     AWS_SCOPE_BEDROCK_AGENTS,
     AWS_SCOPE_BEDROCK_LOGGING,
+    AWS_SCOPE_CODE_TO_CLOUD,
     AwsCloudFormationLauncher,
     AwsConnectionValidator,
     aws_coverage_plan,
@@ -149,6 +150,69 @@ class EventuallyPassingValidator(PassingValidator):
         }
 
 
+class PassingAwsDeploymentCollector:
+    def collect(
+        self, *, tenant_id: str, connection: dict[str, Any], repository: Any
+    ) -> dict[str, Any]:
+        assert tenant_id == DEFAULT_LOCAL_TENANT
+        assert connection["declared_scopes"] == [AWS_SCOPE_CODE_TO_CLOUD]
+        return {
+            "connection_id": str(connection["id"]),
+            "state": "complete",
+            "completed_at": datetime.now(UTC).isoformat(),
+            "region_count": 1,
+            "failed_count": 0,
+            "partial_count": 0,
+            "regions": [{"region": "us-east-1", "state": "complete", "assets": 4}],
+        }
+
+
+def test_aws_connection_collects_deployments_only_for_declared_scope() -> None:
+    repository = ConnectionRepositoryStub()
+    app = create_app(
+        repository=repository,
+        connection_validator=PassingValidator(),  # type: ignore[arg-type]
+        aws_deployment_collector=PassingAwsDeploymentCollector(),  # type: ignore[arg-type]
+        migrate_on_start=False,
+    )
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/connections",
+            json={
+                "provider": "aws",
+                "display_name": "AWS deployments",
+                "account_id": "123456789012",
+                "coverage_mode": "selected",
+                "regions": ["us-east-1"],
+                "declared_scopes": [AWS_SCOPE_CODE_TO_CLOUD],
+            },
+        ).json()
+        response = client.post(
+            f"/v1/connections/{created['id']}/aws/collect-deployments"
+        )
+        assert response.status_code == 202
+        detail = client.get(f"/v1/connections/{created['id']}").json()
+        assert detail["deployment_collection_state"] == "idle"
+        assert detail["last_deployment_collection"]["region_count"] == 1
+
+        other = client.post(
+            "/v1/connections",
+            json={
+                "provider": "aws",
+                "display_name": "No deployment scope",
+                "account_id": "210987654321",
+                "coverage_mode": "selected",
+                "regions": ["us-east-1"],
+                "declared_scopes": [AWS_SCOPE_BEDROCK_LOGGING],
+            },
+        ).json()
+        blocked = client.post(
+            f"/v1/connections/{other['id']}/aws/collect-deployments"
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"] == "AWS code-to-cloud scope is not declared"
+
+
 def test_aws_connection_api_never_returns_external_id_and_requires_safe_delete() -> None:
     repository = ConnectionRepositoryStub()
     app = create_app(
@@ -178,7 +242,7 @@ def test_aws_connection_api_never_returns_external_id_and_requires_safe_delete()
         assert created["configuration"]["coverage_mode"] == "automatic"
         assert created["configuration"]["regions"] == []
         assert created["setup_capabilities"]["cloudformation_quick_create"] is False
-        assert len(created["coverage_plan"]) == 9
+        assert len(created["coverage_plan"]) == 13
 
         listed = client.get("/v1/connections").json()["items"]
         assert listed == [created]
@@ -191,6 +255,10 @@ def test_aws_connection_api_never_returns_external_id_and_requires_safe_delete()
         assert "NoEcho: true" in template_response.text
         assert "sts:AssumeRole" in template_response.text
         assert "ec2:DescribeRegions" in template_response.text
+        assert "lambda:ListFunctions" in template_response.text
+        assert "ecs:ListTaskDefinitionFamilies" in template_response.text
+        assert "eks:ListClusters" in template_response.text
+        assert "sagemaker:ListEndpoints" in template_response.text
         assert "iam:Create" not in template_response.text
 
         launch_response = client.post(
@@ -444,6 +512,7 @@ def test_aws_validation_is_per_plane_and_reduces_sdk_errors() -> None:
         AWS_SCOPE_AGENTCORE,
         AWS_SCOPE_BEDROCK_ACTIVITY,
         AWS_SCOPE_BEDROCK_LOGGING,
+        AWS_SCOPE_CODE_TO_CLOUD,
     ]
     connection = {
         "id": "11111111-1111-4111-8111-111111111111",
@@ -477,6 +546,10 @@ def test_aws_validation_is_per_plane_and_reduces_sdk_errors() -> None:
     assert "bedrock-agentcore-control.list_memories" in calls
     assert "cloudtrail.lookup_events" in calls
     assert "bedrock.get_model_invocation_logging_configuration" in calls
+    assert "lambda.list_functions" in calls
+    assert "ecs.list_task_definition_families" in calls
+    assert "eks.list_clusters" in calls
+    assert "sagemaker.list_endpoints" in calls
     assert "ec2.describe_regions" in calls
 
 
