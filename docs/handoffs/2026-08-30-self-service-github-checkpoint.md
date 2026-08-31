@@ -84,20 +84,47 @@ The organization-owned `transilience-denali` GitHub App was registered under
 - “Request user authorization (OAuth) during installation” disabled; Denali performs the
   explicit verification flow after the setup return
 
-The local API was configured without printing either credential. The private key fingerprint
-matched the registration evidence. The human customer simulation installed the App, completed
-the explicit OAuth ownership check, returned to Denali, and produced a healthy connection for
-18 exact repositories. The provider and evidence contract is accepted. One final visual UX
-check remains after the stale-spinner fix: hard-refresh Connections and confirm the completed
-validation grid replaces the progress state without another manual refresh. Hosted deployment
-also requires replacing the localhost Homepage, Setup, and OAuth callback URLs and loading both
+The local API was configured without printing either GitHub credential. The private key
+fingerprint matched the registration evidence. The human customer simulation installed the
+App, completed the explicit OAuth ownership check, returned to Denali, and produced a healthy
+connection for 18 exact repositories. The provider and evidence contract is accepted. The
+post-fix human visual check also passed: after refresh, the stale progress state was replaced
+by the green summary and the 54 successful repository/plane results. Hosted deployment still
+requires replacing the localhost Homepage, Setup, and OAuth callback URLs and loading both
 credentials from the production secret manager.
+
+The accepted screenshot exposed one non-blocking presentation problem, not an evidence
+failure: 18 repositories multiplied by three planes creates 54 equally prominent cards and a
+very long page. The next UX slice should keep every plane result inspectable while presenting
+an aggregate summary first, expanding failures and unknowns by default, and grouping or
+collapsing successful results by repository. It must not hide partial or failed coverage.
+
+## Next-session starting state
+
+1. Rotate or delete the Google OAuth client secret whose malformed local `.env` line was
+   inadvertently printed during this session, then update the ignored `.env`. The GitHub
+   client secret and PEM were not exposed. Re-run `docker compose config --quiet` without
+   printing values.
+2. Fix validation-result density for large GitHub installations. Prefer repository-level
+   grouping with a three-plane summary, failure/unknown-first filtering, and collapsed passing
+   details. Preserve exact repository IDs and every independent plane result in the detail UI.
+3. Troubleshoot the in-app browser attachment/runtime so authenticated visual acceptance can
+   be automated in later provider flows.
+4. Increase typography on the newer product pages.
+5. Add browser-history routing so Back navigates inside Denali rather than leaving the app.
+6. Improve elapsed-time and retry visibility during bounded cloud IAM propagation waits.
+7. Only after those product-quality items, choose the next bounded evidence slice. Candidates
+   already deferred are GitHub source collection and exact code-to-cloud correlation,
+   separately permissioned GitHub branch-protection posture, then Slack or Jira onboarding.
 
 ## Deferred work retained
 
 - Increase typography on the newer product pages.
 - Add application browser-history routing so Back navigates within Denali.
 - Improve elapsed-time and retry visibility during cloud IAM propagation waits.
+- Group or collapse large passing validation-result sets without suppressing failures,
+  unknowns, exact scopes, or independent plane evidence.
+- Repair the in-app browser attachment/runtime used for authenticated visual acceptance.
 - Add GitHub branch-protection posture only as a separate explicitly permissioned plane.
 - Add repository source collection and code-to-cloud correlation after onboarding acceptance.
 - Start Slack or Jira onboarding only after this GitHub slice is accepted.
