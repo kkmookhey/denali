@@ -18,9 +18,12 @@ context, exact identity requirements, and visible proven, ambiguous, and unmatch
    image, revision, and service-account evidence are implemented. A private, scale-to-zero
    Vertex AI fixture passed the live control-plane correlation acceptance on 2026-08-31; see
    [the acceptance record](gcp-code-to-cloud-live-acceptance-2026-08-31.md).
-3. **Azure Container Apps and Azure Functions.** Add bounded independent workload inventory,
-   Terraform/Bicep/ARM declarations, and exact subscription/resource-group/resource/revision,
-   image, and managed-identity evidence. Validate with a small AI-powered test deployment.
+3. **Azure Container Apps and Azure Functions — complete.** Bounded independent Resource
+   Graph inventory, Terraform/Bicep/ARM declarations, and exact subscription/resource-group/
+   resource identity with revision, image, and managed-identity context are implemented. A
+   private, scale-to-zero Azure OpenAI-capable fixture passed live control-plane, reporting,
+   and connected-browser acceptance on 2026-08-31 and was then torn down; see
+   [the acceptance record](azure-code-to-cloud-live-acceptance-2026-08-31.md).
 4. **Broaden AWS coverage.** Add Terraform and SAM declarations, followed by EKS and SageMaker,
    while keeping each service behind its own explicit identifier and coverage contract.
 5. **Shared Kubernetes correlation.** Correlate EKS, AKS, and GKE workloads through one

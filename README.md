@@ -29,6 +29,7 @@ Status terms in this README are deliberately independent:
 | Self-service Microsoft Azure connection | **Shipped** | **Pending live acceptance**. Live subscription setup and healthy validation succeeded after RBAC propagation, but the final connected-browser, unselected-subscription, partial-state, disable, and delete pass remains open |
 | Self-service Google Cloud connection | **Shipped** | **Locally accepted** against three live projects, with a unique keyless principal and all declared project/plane validations passing |
 | Self-service GitHub connection | **Shipped** | **Locally accepted** through the organization-owned GitHub App against 18 exact repositories, with all 54 repository/plane validations passing |
+| GCP and Azure code-to-cloud correlation | **Shipped** | **Locally accepted** against independently observed, private scale-to-zero fixtures with exact source identity, PostgreSQL reporting, and browser evidence |
 | GitHub source-to-cloud correlation | **Shipped** | Automated connector, API, PostgreSQL, and production-web gates pass; live GitHub collection and browser acceptance remain pending |
 
 These connection statuses describe onboarding and access validation. They do **not** mean
@@ -57,10 +58,11 @@ Implemented collection and import paths include:
 
 | Source | Current path |
 | --- | --- |
-| Source repositories | Local or GitHub App-backed static Python, TypeScript, JavaScript, Terraform, and Cloud Run YAML analysis; bounded repository posture; exact-identifier code-to-cloud correlation |
+| Source repositories | Local or GitHub App-backed static Python, TypeScript, JavaScript, Terraform, Cloud Run YAML, ARM JSON, and Bicep analysis; bounded repository posture; exact-identifier code-to-cloud correlation |
 | MCP Streamable HTTP | Initialization and paginated `tools/list` observation without tool invocation |
 | AWS | Bedrock Agents Classic, AgentCore, bounded CloudFormation-stack inventory and posture, and Bedrock management activity from CloudTrail Event History |
 | Google Cloud | Cloud Run and Cloud Run functions Gen2 deployment inventory through Cloud Asset RESOURCE snapshots; Vertex AI audit activity from Cloud Logging |
+| Microsoft Azure | Container Apps and Function Apps deployment inventory through Azure Resource Graph with exact Azure code-to-cloud identity; Entra activity remains a separate connector |
 | Microsoft Entra | AI application, permission, sign-in, and application-management collection through a separate Microsoft Graph connector |
 | External findings and scanners | OCSF findings, Syft SBOMs, and Grype vulnerability reports |
 | Runtime exports | AWS Bedrock CloudTrail, Google Cloud Vertex AI, Google Workspace Gemini, and Microsoft Entra AI sign-in JSON |
@@ -180,6 +182,7 @@ Start with the product and evidence boundaries, then follow only the slice being
 - [Evidence-led code to cloud](docs/architecture/0010-evidence-led-code-to-cloud.md),
   [provider-neutral deployment identity](docs/architecture/0023-provider-neutral-deployment-identity.md),
   [GCP code to cloud](docs/architecture/0024-gcp-code-to-cloud.md),
+  [Azure code to cloud](docs/architecture/0025-azure-code-to-cloud.md),
   [static artifact inclusion](docs/architecture/0011-static-artifact-inclusion.md), and
   [deployment artifact provenance](docs/architecture/0012-deployment-artifact-provenance.md)
 - [Provider-neutral runtime activity](docs/architecture/0015-provider-neutral-runtime-activity.md),

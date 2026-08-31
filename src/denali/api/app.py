@@ -28,6 +28,7 @@ from denali.connections import (
     AWS_COVERAGE_SELECTED,
     AWS_SCOPES,
     AZURE_CLOUD_PUBLIC,
+    AZURE_SCOPE_CODE_TO_CLOUD,
     AZURE_SCOPES,
     GCP_SCOPES,
     GITHUB_SCOPES,
@@ -1466,6 +1467,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="Azure connection not found")
         if target["lifecycle_state"] != "active":
             raise HTTPException(status_code=409, detail="disabled connections cannot collect")
+        if AZURE_SCOPE_CODE_TO_CLOUD not in target["declared_scopes"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Azure code-to-cloud scope is not declared",
+            )
         if not target["configuration"].get("subscriptions"):
             raise HTTPException(
                 status_code=409,

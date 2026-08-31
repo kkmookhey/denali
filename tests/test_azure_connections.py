@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from denali.api.app import DEFAULT_LOCAL_TENANT, create_app
 from denali.connections import (
+    AZURE_SCOPE_CODE_TO_CLOUD,
     AZURE_SCOPES,
     AzureConnectionValidator,
     AzureSetupScriptLauncher,
@@ -330,6 +331,14 @@ def test_azure_setup_enumerates_then_binds_only_selected_subscriptions() -> None
             ).status_code
             == 409
         )
+        repository.targets[connection_id]["declared_scopes"] = [
+            scope for scope in AZURE_SCOPES if scope != AZURE_SCOPE_CODE_TO_CLOUD
+        ]
+        missing_scope = client.post(
+            f"/v1/connections/{connection_id}/azure/collect-deployments"
+        )
+        assert missing_scope.status_code == 409
+        assert missing_scope.json()["detail"] == "Azure code-to-cloud scope is not declared"
 
 
 class FakeToken:
