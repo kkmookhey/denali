@@ -88,6 +88,36 @@ type IssueDetailTab = "overview" | "path" | "evidence";
 type VulnerabilityDetailTab = "overview" | "evidence" | "sources";
 type DetectionDetailTab = "overview" | "evidence";
 
+const PAGE_PATHS: Record<Page, string> = {
+  dashboard: "/",
+  connections: "/connections",
+  inventory: "/inventory",
+  shadowAi: "/shadow-ai",
+  findings: "/posture-findings",
+  vulnerabilities: "/vulnerabilities",
+  issues: "/issues",
+  codeToCloud: "/code-to-cloud",
+  runtime: "/runtime-activity",
+  detections: "/detections",
+  sources: "/sources",
+};
+
+const PATH_PAGES = new Map(Object.entries(PAGE_PATHS).map(([page, path]) => [path, page as Page]));
+
+function pageFromPath(pathname: string): Page {
+  const normalized = pathname.replace(/\/+$/, "") || "/";
+  return PATH_PAGES.get(normalized) ?? "dashboard";
+}
+
+function hasConnectionReturn(query: URLSearchParams) {
+  return query.has("github_setup") || (query.has("state") && (query.has("admin_consent") || query.has("error")));
+}
+
+function pageFromLocation(): Page {
+  const query = new URLSearchParams(window.location.search);
+  return hasConnectionReturn(query) ? "connections" : pageFromPath(window.location.pathname);
+}
+
 const KIND_META: Record<string, { label: string; plural: string; icon: LucideIcon; color: string }> = {
   ai_agent: { label: "AI agent", plural: "AI agents", icon: Bot, color: "coral" },
   ai_application: { label: "AI application", plural: "AI applications", icon: AppWindow, color: "blue" },
@@ -178,12 +208,7 @@ function readGitHubSetupReturn(): GitHubSetupReturn | null {
 function App() {
   const [azureConsentReturn] = useState(readAzureConsentReturn);
   const [githubSetupReturn] = useState(readGitHubSetupReturn);
-  const [page, setPage] = useState<Page>(() => {
-    const query = new URLSearchParams(window.location.search);
-    return query.has("github_setup") || (query.has("state") && (query.has("admin_consent") || query.has("error")))
-      ? "connections"
-      : "dashboard";
-  });
+  const [page, setPage] = useState<Page>(pageFromLocation);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [coverage, setCoverage] = useState<Coverage[]>([]);
@@ -212,6 +237,29 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [inventoryKind, setInventoryKind] = useState("all");
+
+  useEffect(() => {
+    const initialPage = pageFromLocation();
+    const initialUrl = new URL(window.location.href);
+    const canonicalPath = PAGE_PATHS[initialPage];
+    if (window.location.pathname !== canonicalPath || window.history.state?.page !== initialPage) {
+      window.history.replaceState(
+        { ...window.history.state, page: initialPage },
+        "",
+        `${canonicalPath}${initialUrl.search}${initialUrl.hash}`,
+      );
+    }
+
+    const handlePopState = () => {
+      const next = pageFromPath(window.location.pathname);
+      if (next === "inventory") setInventoryKind("all");
+      setPage(next);
+      setSidebarOpen(false);
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
 
   const loadAll = useCallback(async () => {
     setError(null);
@@ -317,10 +365,14 @@ function App() {
   useEffect(() => {
     if (!azureConsentReturn && !githubSetupReturn) return;
     const returnUrl = new URL(window.location.href);
-    ["admin_consent", "tenant", "state", "error", "error_description", "github_setup", "connection_id"].forEach((key) =>
+    ["admin_consent", "tenant", "state", "error", "error_description", "github_setup", "connection_id", "detail"].forEach((key) =>
       returnUrl.searchParams.delete(key),
     );
-    window.history.replaceState({}, "", `${returnUrl.pathname}${returnUrl.search}${returnUrl.hash}`);
+    window.history.replaceState(
+      { ...window.history.state, page: "connections" },
+      "",
+      `${PAGE_PATHS.connections}${returnUrl.search}${returnUrl.hash}`,
+    );
   }, [azureConsentReturn, githubSetupReturn]);
 
   async function toggleActivityFixtures() {
@@ -341,12 +393,14 @@ function App() {
 
   function navigate(next: Page) {
     if (next === "inventory") setInventoryKind("all");
+    if (next !== page) window.history.pushState({ page: next }, "", PAGE_PATHS[next]);
     setPage(next);
     setSidebarOpen(false);
   }
 
   function openInventory(kind = "all") {
     setInventoryKind(kind);
+    if (page !== "inventory") window.history.pushState({ page: "inventory" }, "", PAGE_PATHS.inventory);
     setPage("inventory");
     setSidebarOpen(false);
   }
