@@ -28,7 +28,7 @@ Status terms in this README are deliberately independent:
 | Self-service AWS connection | **Shipped** | **Locally accepted** against a live AWS account, including Quick Create, exact account binding, enabled-Region discovery, and independent plane validation |
 | Self-service Microsoft Azure connection | **Shipped** | **Pending live acceptance**. Live subscription setup and healthy validation succeeded after RBAC propagation, but the final connected-browser, unselected-subscription, partial-state, disable, and delete pass remains open |
 | Self-service Google Cloud connection | **Shipped** | **Locally accepted** against three live projects, with a unique keyless principal and all declared project/plane validations passing |
-| Self-service GitHub connection | **Shipped** | **Pending live acceptance**. Local tests and builds pass, but the operator GitHub App has not been configured and the human installation flow has not run end to end |
+| Self-service GitHub connection | **Shipped** | **Locally accepted** through the organization-owned GitHub App against 18 exact repositories, with all 54 repository/plane validations passing |
 
 These connection statuses describe onboarding and access validation. They do **not** mean
 that provider collection ran or that inventory, findings, or a security verdict exist.
@@ -154,6 +154,7 @@ and evidence limits are documented here:
 - [ADR 0019 — Azure multi-tenant application and selected subscriptions](docs/architecture/0019-self-service-azure-connections.md)
 - [ADR 0020 — GCP keyless principal and selected projects](docs/architecture/0020-self-service-gcp-connections.md)
 - [ADR 0021 — GitHub App and exact repository boundaries](docs/architecture/0021-self-service-github-connections.md)
+- [GitHub App registration and operator configuration](docs/deployment/github-app.md)
 
 The latest acceptance records are the
 [AWS](docs/handoffs/2026-08-29-self-service-aws-checkpoint.md),
@@ -189,8 +190,6 @@ Pending acceptance is not the same as planned implementation:
 
 - Azure needs the remaining human browser, unselected-scope, partial-state, disable, and
   delete acceptance checks.
-- GitHub needs operator App configuration and a human end-to-end installation, repository
-  selection, callback, and validation pass.
 
 Documented planned or deferred capabilities are not shipped:
 

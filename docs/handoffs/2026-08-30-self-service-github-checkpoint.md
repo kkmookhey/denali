@@ -34,31 +34,48 @@ The accepted security and evidence contract is in
 - Web Docker image build: passed.
 - `git diff --check`: passed.
 - Live local API and web health checks: passed through `http://127.0.0.1:3080/api/healthz`.
+- Live GitHub customer simulation: passed for the `kkmookhey` installation.
+- Exact repository binding: 18 repository IDs and node IDs recorded; the installation's
+  `all` selection was resolved to this explicit snapshot and does not silently expand scope.
+- Live evidence planes: 54 of 54 passed — Metadata, Contents/default revision, and Actions
+  workflow inventory for each of the 18 exact repositories.
+- OAuth evidence boundary: the installation was rebound to the signed-in GitHub user, and
+  the temporary user token and PKCE verifier were discarded after setup.
+- Callback progress UX: fixed a stale loading state found during acceptance. The web app now
+  polls connection state every two seconds while any background validation is running and
+  automatically renders the completed result.
 
-The direct `docker compose build` wrapper remains blocked by a pre-existing malformed `.env`
-file. Its contents were not read, printed, or rewritten. The exact Dockerfiles were built
-directly instead.
+The local `.env` initially contained two legacy Google OAuth labels in a space-delimited form
+that Docker Compose could not parse. Their labels were normalized to valid ignored dotenv keys
+without changing their values. This local file is not part of the GitHub connection record.
 
 One non-blocking Starlette `TestClient`/httpx deprecation warning remains.
 
 ## Live local runtime
 
-- `denali-api-github-live` serves port `8088` on `denali_default` with network alias `api`.
+- `denali-api-github-e2e` serves port `8088` on `denali_default` with network alias `api`.
   It preserves the previous read-only AWS profile mount and Google ADC mount.
+- The ignored, mode-`0600` GitHub App PEM is mounted read-only at
+  `/run/secrets/denali-github-app.pem`; the ignored, mode-`0600` local `.env` supplies the
+  client secret. Neither credential is stored in the database or image.
 - `denali-web-github-live` serves port `3080` on `denali_default`.
-- Prior containers `denali-api-gcp-live`, `denali-api-1`, and `denali-web-1` are stopped and
-  retained for immediate rollback; they were not deleted.
-- The API currently has no GitHub App configuration, so the UI correctly reports GitHub setup
-  as unavailable until the operator registration below is completed.
+- The pre-polling web container is stopped as `denali-web-github-prepoll` for rollback.
+- Prior API containers `denali-api-github-live`, `denali-api-gcp-live`, and `denali-api-1`
+  remain stopped for rollback; they were not deleted.
+- GitHub App registration evidence and the local operator configuration are recorded in
+  `docs/deployment/github-app.md`. PR #1 was reviewed and merged after removing the recorded
+  client-secret suffix and clarifying how the PEM and OAuth client secret are used.
 
-The in-app browser runtime had no attached browser, so authenticated visual interaction could
-not be automated. Human visual and end-to-end GitHub acceptance remain required.
+The in-app browser runtime had no attached browser, so the authenticated GitHub screens were
+operated by the human tester. Denali's persisted result and all 54 read-only validation calls
+were then independently checked through the local API.
 
-## Human operator step required
+## Human acceptance completed
 
-Create an organization-owned GitHub App under `transilienceai` with:
+The organization-owned `transilience-denali` GitHub App was registered under
+`transilienceai` with:
 
-- Homepage URL: `https://github.com/transilienceai/denali`
+- Homepage URL: `http://127.0.0.1:3080`
 - Setup URL: `http://127.0.0.1:8088/v1/connections/github/setup/callback`
 - OAuth callback URL: `http://127.0.0.1:8088/v1/connections/github/oauth/callback`
 - Repository permissions: Metadata read, Contents read, Actions read
@@ -67,19 +84,14 @@ Create an organization-owned GitHub App under `transilienceai` with:
 - “Request user authorization (OAuth) during installation” disabled; Denali performs the
   explicit verification flow after the setup return
 
-Generate one client secret and one PEM private key. Do not paste either into chat, commit it,
-or store it in the connection database. The API needs the App ID, client ID, client secret,
-slug, callback URL, and the path of a read-only mounted PEM. Recreate the current API container
-with those operator settings while retaining the AWS and Google mounts.
-
-Then perform the human customer simulation:
-
-1. Refresh Connections and add a GitHub connection plan.
-2. Select **Install / configure GitHub App**.
-3. Review the three read permissions in GitHub and select one or more repositories.
-4. Complete the brief installer-verification return.
-5. Confirm Denali names the exact repositories, the temporary user token is not exposed, and
-   every repository/plane validation result is visible independently.
+The local API was configured without printing either credential. The private key fingerprint
+matched the registration evidence. The human customer simulation installed the App, completed
+the explicit OAuth ownership check, returned to Denali, and produced a healthy connection for
+18 exact repositories. The provider and evidence contract is accepted. One final visual UX
+check remains after the stale-spinner fix: hard-refresh Connections and confirm the completed
+validation grid replaces the progress state without another manual refresh. Hosted deployment
+also requires replacing the localhost Homepage, Setup, and OAuth callback URLs and loading both
+credentials from the production secret manager.
 
 ## Deferred work retained
 

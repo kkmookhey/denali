@@ -281,6 +281,38 @@ function App() {
     void loadAll();
   }, [loadAll]);
 
+  const hasRunningConnection = connections.some(
+    (connection) => connection.validation_state === "running",
+  );
+
+  useEffect(() => {
+    if (!hasRunningConnection) return;
+    let cancelled = false;
+    let requestInFlight = false;
+
+    const refreshConnections = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const result = await api.connections();
+        if (!cancelled) setConnections(result.items);
+      } catch (cause) {
+        if (!cancelled) {
+          setError(cause instanceof Error ? cause.message : "Unable to refresh connection validation");
+        }
+      } finally {
+        requestInFlight = false;
+      }
+    };
+
+    void refreshConnections();
+    const timer = window.setInterval(() => void refreshConnections(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [hasRunningConnection]);
+
   useEffect(() => {
     if (!azureConsentReturn && !githubSetupReturn) return;
     const returnUrl = new URL(window.location.href);
@@ -2196,7 +2228,7 @@ function GitHubConnectionDetail({ connection, busy, onPrepare, onValidate, onDis
     <div className="setup-progress">
       <div className="complete"><span><Check /></span><div><strong>1. Connection plan created</strong><small>Denali’s GitHub App, declared read planes, and an initially empty repository boundary are recorded. No personal access token is requested or stored.</small></div></div>
       <div className={setupComplete ? "complete" : "current"}><span>{setupComplete ? <Check /> : "2"}</span><div><strong>2. Install the App and select repositories</strong><small>GitHub shows the App’s exact read permissions and lets you choose repositories. After installation, Denali briefly verifies that the signed-in GitHub user can access that exact installation, records immutable repository IDs, and immediately discards the user token.</small><button className="primary-action" disabled={preparing || !connection.setup_capabilities.github_app} onClick={onPrepare}><ExternalLink />{preparing ? "Opening GitHub…" : setupComplete ? "Reconfigure GitHub App" : "Install / configure GitHub App"}</button>{!connection.setup_capabilities.github_app && <small className="launch-unavailable">GitHub onboarding requires Denali’s configured GitHub App and private signing key.</small>}{setupComplete && <div className="azure-subscriptions"><strong>{repositories.length} exact repositor{repositories.length === 1 ? "y" : "ies"}</strong>{repositories.map((repository) => <code key={repository.id}>{repository.full_name} · ID {repository.id}{repository.private ? " · private" : " · public"}</code>)}{connection.configuration.installation_repository_selection === "all" && <small>GitHub’s installation is set to all repositories, but Denali’s stored coverage remains this exact list. Newly created repositories are not claimed until you reconfigure and verify again.</small>}</div>}</div></div>
-      <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every exact repository</strong><small>Denali mints a separate short-lived installation token for one recorded repository at a time, rebinds its immutable identity, and tests each declared read plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating GitHub…" : validation ? "Validate again" : "Validate connection"}</button>}</div></div>
+      <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every exact repository</strong><small>Denali mints a separate short-lived installation token for one recorded repository at a time, rebinds its immutable identity, and tests each declared read plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating GitHub…" : validation ? "Validate again" : "Validate connection"}</button>}{validating && <small className="validation-progress-note">Validation continues in the background. This page refreshes automatically when every repository is complete.</small>}</div></div>
     </div>
     <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed GitHub account ID {validation.account_id_observed ?? "not established"}</small></div><div className="validation-grid">{validation.results.map((result) => <div key={`${result.repository_id}:${result.plane}`} className={result.state}><span>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}</span><div><strong>{result.label}</strong><small>{result.repository_full_name ?? result.repository_id} · exact repository</small><p>{result.detail}</p></div></div>)}</div></> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Install the GitHub App and finish repository selection first.</small></span></div>}</div>
     <details className="connection-permissions"><summary>Review {permissions.length || 3} declared GitHub permissions</summary><div>{(permissions.length ? permissions : ["metadata:read", "contents:read", "actions:read"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>This slice cannot write source, dispatch workflows, read Actions secrets, administer repositories, receive webhooks, or access repositories outside the recorded immutable IDs. Branch-protection posture is not claimed.</p></details>
