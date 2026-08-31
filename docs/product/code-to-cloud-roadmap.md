@@ -13,9 +13,11 @@ context, exact identity requirements, and visible proven, ambiguous, and unmatch
    runtime-kind, scoped identifier, comparison, evidence, and disposition contracts. Adapt
    the existing AWS CDK Lambda/ECS implementation without weakening or changing its accepted
    joins.
-2. **Google Cloud Run and Cloud Functions Gen2 — implementation complete; live acceptance pending.** Add bounded independent workload inventory,
-   Terraform and deployment-YAML declarations, and exact project/location/resource/revision,
-   image, and service-account evidence. Validate with a small AI-powered test deployment.
+2. **Google Cloud Run and Cloud Functions Gen2 — complete.** Bounded independent workload
+   inventory, Terraform and deployment-YAML declarations, and exact project/location/resource,
+   image, revision, and service-account evidence are implemented. A private, scale-to-zero
+   Vertex AI fixture passed the live control-plane correlation acceptance on 2026-08-31; see
+   [the acceptance record](gcp-code-to-cloud-live-acceptance-2026-08-31.md).
 3. **Azure Container Apps and Azure Functions.** Add bounded independent workload inventory,
    Terraform/Bicep/ARM declarations, and exact subscription/resource-group/resource/revision,
    image, and managed-identity evidence. Validate with a small AI-powered test deployment.

@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted for Cloud Run services and Cloud Run functions Gen2; live-project acceptance is
-pending.
+Accepted for Cloud Run services and Cloud Run functions Gen2. Live-project control-plane
+acceptance passed on 2026-08-31 using an independently observed Cloud Run service and an exact
+exported-YAML identity join.
 
 ## Decision
 
