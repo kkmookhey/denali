@@ -34,6 +34,7 @@ from denali.connections.azure_onboarding import (
 from denali.connections.gcp import (
     GCP_SCOPE_AGENT_BUILDER,
     GCP_SCOPE_AI_ACTIVITY,
+    GCP_SCOPE_CODE_TO_CLOUD,
     GCP_SCOPE_VERTEX_AI,
     GCP_SCOPES,
     GcpConnectionValidator,
@@ -78,6 +79,7 @@ __all__ = [
     "GCP_ONBOARDING_SCRIPT_VERSION",
     "GCP_SCOPE_AGENT_BUILDER",
     "GCP_SCOPE_AI_ACTIVITY",
+    "GCP_SCOPE_CODE_TO_CLOUD",
     "GCP_SCOPE_VERTEX_AI",
     "GCP_SCOPES",
     "GcpConnectionPrincipalProvisioner",

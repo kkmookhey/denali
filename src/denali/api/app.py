@@ -47,6 +47,7 @@ from denali.connections import (
 )
 from denali.connections.aws import render_cloudformation
 from denali.connections.gcp import valid_gcp_project_id
+from denali.connectors.gcp_deployments import GcpConnectionDeploymentCollector
 from denali.connectors.github_repository import GitHubRepositoryCollector
 from denali.domain import FindingBatch, InventoryBatch
 from denali.store.db import migrate
@@ -373,6 +374,7 @@ def create_app(
     azure_setup_launcher: AzureSetupScriptLauncher | None = None,
     gcp_principal_provisioner: GcpConnectionPrincipalProvisioner | None = None,
     gcp_setup_launcher: GcpSetupScriptLauncher | None = None,
+    gcp_deployment_collector: GcpConnectionDeploymentCollector | None = None,
     github_app_client: GitHubAppClient | None = None,
     github_connection_validator: GitHubConnectionValidator | None = None,
     github_repository_collector: GitHubRepositoryCollector | None = None,
@@ -428,6 +430,9 @@ def create_app(
         app.state.azure_setup_launcher = configured_azure_launcher
         app.state.gcp_principal_provisioner = configured_gcp_provisioner
         app.state.gcp_setup_launcher = configured_gcp_launcher
+        app.state.gcp_deployment_collector = (
+            gcp_deployment_collector or GcpConnectionDeploymentCollector()
+        )
         app.state.github_app_client = configured_github_app
         app.state.github_connection_validator = github_connection_validator or (
             GitHubConnectionValidator(configured_github_app)
@@ -446,6 +451,9 @@ def create_app(
         app.state.active_github_collections = set()
         app.state.github_collection_results = {}
         app.state.github_collection_lock = Lock()
+        app.state.active_gcp_deployment_collections = set()
+        app.state.gcp_deployment_collection_results = {}
+        app.state.gcp_deployment_collection_lock = Lock()
         yield
 
     app = FastAPI(
@@ -560,6 +568,51 @@ def create_app(
             finally:
                 with collection_lock:
                     request.app.state.github_collection_results[connection_key] = result
+                    active_collections.discard(connection_key)
+
+        background_tasks.add_task(run_collection)
+        return {"status": "started", "connection_id": connection_id}
+
+    def queue_gcp_deployment_collection(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        repo: InventoryReader,
+        current_tenant: str,
+        target: dict[str, Any],
+    ) -> dict[str, str]:
+        connection_id = str(target["id"])
+        connection_key = (current_tenant, connection_id)
+        collector = request.app.state.gcp_deployment_collector
+        collection_lock = request.app.state.gcp_deployment_collection_lock
+        active_collections = request.app.state.active_gcp_deployment_collections
+        with collection_lock:
+            if connection_key in active_collections:
+                return {"status": "already_running", "connection_id": connection_id}
+            active_collections.add(connection_key)
+
+        def run_collection() -> None:
+            try:
+                result = collector.collect(
+                    tenant_id=current_tenant,
+                    connection=target,
+                    repository=repo,
+                )
+            except Exception:
+                result = {
+                    "connection_id": connection_id,
+                    "state": "failed",
+                    "completed_at": datetime.now(UTC).isoformat(),
+                    "project_count": 0,
+                    "failed_count": 0,
+                    "partial_count": 0,
+                    "projects": [],
+                    "detail": "gcp_deployment_collection_failed",
+                }
+            finally:
+                with collection_lock:
+                    request.app.state.gcp_deployment_collection_results[
+                        connection_key
+                    ] = result
                     active_collections.discard(connection_key)
 
         background_tasks.add_task(run_collection)
@@ -1345,6 +1398,30 @@ def create_app(
             request, background_tasks, repo, current_tenant, target
         )
 
+    @app.post(
+        "/v1/connections/{connection_id}/gcp/collect-deployments",
+        status_code=202,
+    )
+    def collect_gcp_deployments(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        connection_id: UUID,
+    ) -> dict[str, str]:
+        repo, current_tenant = _context(request)
+        target = repo.get_connection_validation_target(current_tenant, str(connection_id))
+        if target is None or target["provider"] != "gcp":
+            raise HTTPException(status_code=404, detail="Google Cloud connection not found")
+        if target["lifecycle_state"] != "active":
+            raise HTTPException(status_code=409, detail="disabled connections cannot collect")
+        if not target["configuration"].get("projects"):
+            raise HTTPException(
+                status_code=409,
+                detail="complete Google Cloud project selection before collecting deployments",
+            )
+        return queue_gcp_deployment_collection(
+            request, background_tasks, repo, current_tenant, target
+        )
+
     @app.post("/v1/connections/{connection_id}/disable")
     def disable_connection(request: Request, connection_id: UUID) -> dict[str, Any]:
         repo, current_tenant = _context(request)
@@ -1360,6 +1437,15 @@ def create_app(
                 raise HTTPException(
                     status_code=409,
                     detail="wait for the active source collection to finish before disabling",
+                )
+        with request.app.state.gcp_deployment_collection_lock:
+            if connection_key in request.app.state.active_gcp_deployment_collections:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "wait for the active GCP deployment collection to finish "
+                        "before disabling"
+                    ),
                 )
         row = repo.disable_connection(current_tenant, str(connection_id))
         if row is None:
@@ -1669,6 +1755,15 @@ def _with_validation_state(
         collection_result = request.app.state.github_collection_results.get(connection_key)
     result["source_collection_state"] = "running" if collecting else "idle"
     result["last_source_collection"] = collection_result
+    with request.app.state.gcp_deployment_collection_lock:
+        gcp_collecting = (
+            connection_key in request.app.state.active_gcp_deployment_collections
+        )
+        gcp_collection_result = request.app.state.gcp_deployment_collection_results.get(
+            connection_key
+        )
+    result["deployment_collection_state"] = "running" if gcp_collecting else "idle"
+    result["last_deployment_collection"] = gcp_collection_result
     result["setup_capabilities"] = {
         "cloudformation_quick_create": (
             result["provider"] == "aws"

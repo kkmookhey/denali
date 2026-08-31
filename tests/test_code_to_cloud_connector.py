@@ -7,7 +7,13 @@ from denali.connectors.code_to_cloud import (
     _local_imports,
     _local_module_graph,
 )
-from denali.domain import AssertionType, CoverageState, RelationshipKind
+from denali.domain import (
+    AssertionType,
+    CoverageState,
+    DeploymentIdentifier,
+    DeploymentIdentity,
+    RelationshipKind,
+)
 
 SOURCE = """
 const fn = new nodejs.NodejsFunction(this, 'AgentFn', {
@@ -36,7 +42,23 @@ def target(
         natural_key=natural_key,
         display_name=display_name,
         service=service,
-        logical_id=logical_id,
+        identity=DeploymentIdentity(
+            provider="aws",
+            runtime_kind=(
+                "serverless_function" if service == "lambda" else "container_task"
+            ),
+            identifiers=(
+                DeploymentIdentifier("cloudformation_logical_id", logical_id),
+                *(
+                    (DeploymentIdentifier("function_name", display_name),)
+                    if service == "lambda"
+                    else tuple(
+                        DeploymentIdentifier("container_name", item)
+                        for item in containers
+                    )
+                ),
+            ),
+        ),
         evidence_locator=f"aws://fixture/{natural_key}",
         evidence_payload={
             "container_names": list(containers),
@@ -103,6 +125,191 @@ def test_discovers_literal_lambda_and_ecs_declarations() -> None:
     assert declarations[0].entry == "src/handler.ts"
     assert declarations[1].build_context == "."
     assert declarations[1].build_file == "src/worker/Dockerfile"
+
+
+def test_discovers_literal_gcp_terraform_declarations() -> None:
+    source = '''
+resource "google_cloud_run_v2_service" "agent" {
+  project  = "denali-test"
+  location = "us-central1"
+  name     = "denali-ai"
+
+  template {
+    containers {
+      image = "us-central1-docker.pkg.dev/denali-test/apps/agent:latest"
+    }
+  }
+}
+
+resource "google_cloudfunctions2_function" "worker" {
+  project  = "denali-test"
+  location = "us-central1"
+  name     = "denali-worker"
+}
+'''
+
+    declarations, warnings = _deployment_declarations(source, "infra/main.tf")
+
+    assert warnings == []
+    assert [item.service for item in declarations] == [
+        "cloud_run",
+        "cloud_functions",
+    ]
+    assert [item.identity.provider for item in declarations] == ["gcp", "gcp"]
+    assert declarations[0].identity.runtime_kind == "container_service"
+    assert declarations[0].identity.match_basis() == [
+        "literal_gcp_project_id",
+        "literal_gcp_location",
+        "literal_cloud_run_service_name",
+    ]
+    assert declarations[1].construct_id == (
+        "google_cloudfunctions2_function.worker"
+    )
+
+
+def test_dynamic_gcp_terraform_scope_is_visible_but_not_correlated() -> None:
+    source = '''
+resource "google_cloud_run_v2_service" "agent" {
+  project  = var.project_id
+  location = "us-central1"
+  name     = "denali-ai"
+}
+'''
+
+    declarations, warnings = _deployment_declarations(source, "infra/main.tf")
+
+    assert declarations == []
+    assert warnings == [
+        "infra/main.tf:2: Terraform GCP project, location, and name must all be literal"
+    ]
+
+
+def test_exact_gcp_scope_and_service_create_deployed_by_edge(tmp_path: Path) -> None:
+    (tmp_path / "main.tf").write_text(
+        '''
+resource "google_cloud_run_v2_service" "agent" {
+  project  = "denali-test"
+  location = "us-central1"
+  name     = "denali-ai"
+}
+'''
+    )
+    target = DeploymentTarget(
+        natural_key=(
+            "//run.googleapis.com/projects/denali-test/locations/"
+            "us-central1/services/denali-ai"
+        ),
+        display_name="denali-ai",
+        service="cloud_run",
+        identity=DeploymentIdentity(
+            provider="gcp",
+            runtime_kind="container_service",
+            identifiers=(
+                DeploymentIdentifier("project", "denali-test"),
+                DeploymentIdentifier("location", "us-central1"),
+                DeploymentIdentifier("service_name", "denali-ai"),
+                DeploymentIdentifier("revision", "denali-ai-00001-abc"),
+            ),
+        ),
+        evidence_locator="gcp://cloudasset/run/denali-ai",
+        evidence_payload={
+            "deployment_artifact": {
+                "kind": "container_image",
+                "image": "us-central1-docker.pkg.dev/denali-test/apps/agent@sha256:abc",
+            }
+        },
+    )
+
+    batch = CodeToCloudConnector(
+        tmp_path,
+        repository_name="github.com/example/gcp-agent",
+        targets=(target,),
+    ).collect()
+
+    assert {item.state for item in batch.coverage} == {CoverageState.COMPLETE}
+    assert len(batch.relationships) == 1
+    relationship = batch.relationships[0]
+    assert relationship.source.natural_key == target.natural_key
+    assert relationship.attributes["provider"] == "gcp"
+    assert relationship.attributes["runtime_kind"] == "container_service"
+    assert relationship.attributes["deployment_framework"] == "terraform"
+    assert relationship.attributes["artifact_inclusion_method"] == "not_evaluated"
+    assert relationship.attributes["artifact_identity_status"] == "not_evaluated"
+
+
+def test_cloud_run_export_yaml_uses_immutable_project_number() -> None:
+    source = '''
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: denali-ai
+  namespace: '123456789012'
+  labels:
+    cloud.googleapis.com/location: us-central1
+spec:
+  template:
+    spec:
+      containers:
+        - image: us-central1-docker.pkg.dev/denali-test/apps/agent:latest
+'''
+
+    declarations, warnings = _deployment_declarations(source, "deploy/service.yaml")
+
+    assert warnings == []
+    assert len(declarations) == 1
+    declaration = declarations[0]
+    assert declaration.framework == "cloud_run_service_yaml"
+    assert declaration.identity.match_basis() == [
+        "literal_gcp_project_number",
+        "literal_gcp_location",
+        "literal_cloud_run_service_name",
+    ]
+    assert declaration.identity.values("project_number") == ("123456789012",)
+
+
+def test_cloud_run_yaml_matches_target_with_project_number(tmp_path: Path) -> None:
+    (tmp_path / "service.yaml").write_text(
+        '''
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: denali-ai
+  namespace: '123456789012'
+  labels:
+    cloud.googleapis.com/location: us-central1
+'''
+    )
+    target = DeploymentTarget(
+        natural_key=(
+            "//run.googleapis.com/projects/denali-test/locations/"
+            "us-central1/services/denali-ai"
+        ),
+        display_name="denali-ai",
+        service="cloud_run",
+        identity=DeploymentIdentity(
+            provider="gcp",
+            runtime_kind="container_service",
+            identifiers=(
+                DeploymentIdentifier("project", "denali-test"),
+                DeploymentIdentifier("project_number", "123456789012"),
+                DeploymentIdentifier("location", "us-central1"),
+                DeploymentIdentifier("service_name", "denali-ai"),
+            ),
+        ),
+        evidence_locator="gcp://cloudasset/run/denali-ai",
+        evidence_payload={},
+    )
+
+    batch = CodeToCloudConnector(
+        tmp_path,
+        repository_name="github.com/example/gcp-agent",
+        targets=(target,),
+    ).collect()
+
+    assert len(batch.relationships) == 1
+    assert batch.relationships[0].attributes["deployment_framework"] == (
+        "cloud_run_service_yaml"
+    )
 
 
 def test_task_parser_does_not_borrow_a_later_tasks_container() -> None:
@@ -362,6 +569,9 @@ def test_ambiguous_matches_are_visible_and_not_correlated(tmp_path: Path) -> Non
     assert batch.assets[0].attributes["correlation_candidates"] == [
         {
             "status": "ambiguous",
+            "provider": "aws",
+            "runtime_kind": "serverless_function",
+            "deployment_framework": "aws_cdk",
             "service": "lambda",
             "construct_id": "AgentFn",
             "deployment_identifier": "ni-sales-agent",

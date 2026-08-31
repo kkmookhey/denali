@@ -33,6 +33,7 @@ denali-grype-import = "denali.connectors.grype_json:import_main"
 denali-activity-import = "denali.connectors.activity_json:import_main"
 denali-aws-runtime = "denali.connectors.aws_bedrock_activity:scan_main"
 denali-gcp-vertex-runtime = "denali.connectors.gcp_vertex_activity:scan_main"
+denali-gcp-deployments-scan = "denali.connectors.gcp_deployments:scan_main"
 denali-entra-scan = "denali.connectors.entra_ai:scan_main"
 
 [project.optional-dependencies]

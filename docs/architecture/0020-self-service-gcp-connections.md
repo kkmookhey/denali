@@ -49,6 +49,7 @@ location. The first declared planes are:
 - Vertex AI Agent Builder inventory: Discovery Engine assistants, data stores, and engines;
 - Dialogflow agent inventory; and
 - Google Cloud AI management activity from Cloud Logging.
+- Cloud Run and Cloud Run functions Gen2 deployment inventory for code-to-cloud correlation.
 
 The asset types are drawn from Google Cloud Asset Inventory's supported-type catalog. A
 successful validation proves only that the project-bound read entrypoint was callable at
@@ -62,7 +63,8 @@ partial access, each failed or unknown plane remains visible.
 
 ## Permission and evidence boundary
 
-`roles/cloudasset.viewer` supplies project metadata and project-wide resource search.
+`roles/cloudasset.viewer` supplies project metadata, project-wide resource search, and the
+bounded Cloud Asset RESOURCE snapshots used by the GCP code-to-cloud collector.
 `roles/logging.viewer` supplies read access to log entries. The Cloud Shell identity needs
 permission to update IAM policy on each selected project, normally Project IAM Admin, Owner,
 or an equivalent custom role.

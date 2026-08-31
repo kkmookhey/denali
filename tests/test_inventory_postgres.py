@@ -488,7 +488,7 @@ def test_gcp_setup_completion_consumes_token_and_binds_selected_projects(reposit
     )
     assert completed is not None
     assert completed["configuration"]["projects"] == projects
-    assert len(completed["coverage_plan"]) == 10
+    assert len(completed["coverage_plan"]) == 12
     completed_target = repo.get_connection_validation_target(tenant, connection_id)
     assert completed_target is not None
     assert "setup_token_sha256" not in completed_target["credential_reference"]
@@ -1007,6 +1007,69 @@ def test_consent_then_use_issue_persists_exact_detection_and_activity_evidence(
     assert detail["attributes"]["high_impact_scopes"] == ["Mail.ReadWrite"]
 
 
+def test_deployment_targets_accept_provider_neutral_identity(repository) -> None:
+    tenant, repo = repository
+    now = datetime.now(UTC)
+    workload = AssetRef(
+        AssetKind.AI_WORKLOAD,
+        "//run.googleapis.com/projects/denali-test/locations/us-central1/services/denali-ai",
+    )
+    evidence = Evidence(
+        "gcp_control_plane",
+        "gcp://run/denali-test/us-central1/denali-ai",
+        now,
+    )
+    repo.ingest(
+        tenant,
+        InventoryBatch(
+            connector_id="fixture.gcp_run",
+            connection_id="gcp:denali-test",
+            run_id="gcp-run",
+            scope_key="gcp:denali-test:us-central1",
+            collected_at=now,
+            coverage=(
+                Coverage(
+                    "gcp_run_inventory",
+                    CoverageState.COMPLETE,
+                    "gcp:denali-test:us-central1",
+                ),
+            ),
+            assets=(
+                AssetAssertion(
+                    asset=workload,
+                    coverage_plane="gcp_run_inventory",
+                    display_name="denali-ai",
+                    assertion_type=AssertionType.OBSERVED,
+                    confidence=1.0,
+                    evidence=evidence,
+                    attributes={
+                        "provider": "gcp",
+                        "service": "cloud_run",
+                        "runtime_kind": "container_service",
+                        "deployment_identifiers": {
+                            "project": ["denali-test"],
+                            "location": ["us-central1"],
+                            "service_name": ["denali-ai"],
+                        },
+                    },
+                ),
+            ),
+        ),
+    )
+
+    [target] = repo.deployment_targets(tenant)
+    assert target["natural_key"] == workload.natural_key
+    assert target["identity"] == {
+        "provider": "gcp",
+        "runtime_kind": "container_service",
+        "identifiers": [
+            {"name": "project", "value": "denali-test", "comparison": "exact"},
+            {"name": "location", "value": "us-central1", "comparison": "exact"},
+            {"name": "service_name", "value": "denali-ai", "comparison": "exact"},
+        ],
+    }
+
+
 def test_code_to_cloud_query_preserves_proven_runtime_context(repository, tmp_path: Path) -> None:
     tenant, repo = repository
     now = datetime.now(UTC)
@@ -1037,10 +1100,16 @@ def test_code_to_cloud_query_preserves_proven_runtime_context(repository, tmp_pa
                 display_name="anna-agent",
                 assertion_type=AssertionType.OBSERVED,
                 confidence=1.0,
-                evidence=evidence,
-                attributes={
-                    "service": "lambda",
-                    "logical_id": "AgentFnC1FD126F",
+                    evidence=evidence,
+                    attributes={
+                        "provider": "aws",
+                        "service": "lambda",
+                        "runtime_kind": "serverless_function",
+                        "logical_id": "AgentFnC1FD126F",
+                        "deployment_identifiers": {
+                            "cloudformation_logical_id": ["AgentFnC1FD126F"],
+                            "function_name": ["anna-agent"],
+                        },
                     "account_id": "123456789012",
                     "region": "ap-south-1",
                     "deployment_artifact": {
@@ -1088,7 +1157,9 @@ def test_code_to_cloud_query_preserves_proven_runtime_context(repository, tmp_pa
         ),
     )
     repo.ingest(tenant, observed)
-    targets = tuple(DeploymentTarget(**item) for item in repo.deployment_targets(tenant))
+    targets = tuple(
+        DeploymentTarget.from_record(item) for item in repo.deployment_targets(tenant)
+    )
     assert [item.natural_key for item in targets] == [workload.natural_key]
 
     (tmp_path / "stack.ts").write_text(

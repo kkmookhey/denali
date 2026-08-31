@@ -40,7 +40,20 @@ MAX_BLOB_FETCH_WORKERS = 8
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40,64}$")
 _BLOB_SHA = re.compile(r"^[0-9a-f]{40,64}$")
 _SOURCE_SUFFIXES = frozenset(
-    {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"}
+    {
+        ".py",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".mts",
+        ".cts",
+        ".tf",
+        ".yaml",
+        ".yml",
+    }
 )
 _EXCLUDED_PARTS = frozenset(
     {
@@ -155,7 +168,8 @@ class GitHubRepositoryCollector:
             }
 
         targets = tuple(
-            DeploymentTarget(**item) for item in repository.deployment_targets(tenant_id)
+            DeploymentTarget.from_record(item)
+            for item in repository.deployment_targets(tenant_id)
         )
         results: list[dict[str, Any]] = []
         for selected_repository in selected:

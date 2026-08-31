@@ -197,6 +197,24 @@ class PassingGcpValidator:
         }
 
 
+class PassingGcpDeploymentCollector:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    def collect(self, *, tenant_id: str, connection: dict[str, Any], repository: Any):
+        self.calls.append((tenant_id, connection["id"]))
+        now = datetime.now(UTC).isoformat()
+        return {
+            "connection_id": connection["id"],
+            "state": "complete",
+            "completed_at": now,
+            "project_count": len(connection["configuration"]["projects"]),
+            "failed_count": 0,
+            "partial_count": 0,
+            "projects": [],
+        }
+
+
 def _completion_code(projects: list[dict[str, str]]) -> str:
     payload = json.dumps(
         {
@@ -220,11 +238,13 @@ def test_gcp_setup_selects_projects_without_customer_credentials() -> None:
         token=lambda: SETUP_TOKEN,
     )
     provisioner = FakeGcpPrincipalProvisioner()
+    deployment_collector = PassingGcpDeploymentCollector()
     app = create_app(
         repository=repository,
         gcp_connection_validator=PassingGcpValidator(),  # type: ignore[arg-type]
         gcp_principal_provisioner=provisioner,  # type: ignore[arg-type]
         gcp_setup_launcher=launcher,
+        gcp_deployment_collector=deployment_collector,  # type: ignore[arg-type]
         onboarding_validation_retry_seconds=0,
         migrate_on_start=False,
     )
@@ -279,9 +299,18 @@ def test_gcp_setup_selects_projects_without_customer_credentials() -> None:
         detail = client.get(f"/v1/connections/{connection_id}").json()
         assert detail["health_state"] == "healthy"
         assert detail["configuration"]["projects"] == projects
-        assert len(detail["coverage_plan"]) == 5 * len(projects)
-        assert len(detail["last_validation"]["results"]) == 5 * len(projects)
+        assert len(detail["coverage_plan"]) == 6 * len(projects)
+        assert len(detail["last_validation"]["results"]) == 6 * len(projects)
         assert "setup_token" not in json.dumps(detail)
+        collected = client.post(
+            f"/v1/connections/{connection_id}/gcp/collect-deployments"
+        )
+        assert collected.status_code == 202
+        assert collected.json()["status"] == "started"
+        after_collection = client.get(f"/v1/connections/{connection_id}").json()
+        assert after_collection["deployment_collection_state"] == "idle"
+        assert after_collection["last_deployment_collection"]["state"] == "complete"
+        assert deployment_collector.calls == [(DEFAULT_LOCAL_TENANT, connection_id)]
         replay = client.post(
             f"/v1/connections/{connection_id}/gcp/setup/complete",
             json={"completion_code": _completion_code(projects)},
@@ -383,10 +412,14 @@ def test_gcp_validation_is_project_specific_and_all_locations() -> None:
     validation = validator.validate(connection)
     assert validation["health_state"] == "healthy"
     assert validation["credential_state"] == "passed"
-    assert len(validation["results"]) == 10
+    assert len(validation["results"]) == 12
     assert all(item["region"] == "all-locations" for item in validation["results"])
     asset_calls = [item for item in requests if "cloudasset" in item[1]]
     logging_calls = [item for item in requests if "logging" in item[1]]
-    assert len(asset_calls) == 8
+    assert len(asset_calls) == 10
     assert len(logging_calls) == 2
     assert all("projects/" in item[1] for item in asset_calls)
+    resource_calls = [
+        item for item in asset_calls if ("contentType", "RESOURCE") in item[2]["params"]
+    ]
+    assert len(resource_calls) == 2

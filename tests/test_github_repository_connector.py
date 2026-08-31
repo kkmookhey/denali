@@ -8,6 +8,7 @@ from denali.connectors.github_repository import (
     MAX_BLOB_BYTES,
     SOURCE_PLANE,
     GitHubRepositoryCollector,
+    _eligible_path,
 )
 from denali.domain import CoverageState, InventoryBatch
 
@@ -21,6 +22,12 @@ SOURCE = (
     "});\n"
 )
 HANDLER = "export const handler = async () => ({ statusCode: 200 });\n"
+
+
+def test_github_snapshot_selects_gcp_iac_inputs() -> None:
+    assert _eligible_path("infra/main.tf")
+    assert _eligible_path("deploy/service.yaml")
+    assert _eligible_path("deploy/service.yml")
 
 
 @dataclass

@@ -28,7 +28,10 @@ from denali.domain import (
     ConnectorCapabilities,
     Coverage,
     CoverageState,
+    DeploymentIdentifier,
+    DeploymentIdentity,
     Evidence,
+    IdentifierComparison,
     InventoryBatch,
     RelationshipAssertion,
     RelationshipKind,
@@ -49,6 +52,10 @@ _TASK_RE = re.compile(
     r"(?:const|let)\s+(?P<variable>[A-Za-z_$][\w$]*)\s*=\s*new\s+"
     r"(?:[A-Za-z_$][\w$]*\.)?(?:Fargate)?TaskDefinition\s*\(\s*this\s*,\s*"
     r"(?P<quote>['\"])(?P<construct>[^'\"]+)\2"
+)
+_TERRAFORM_RESOURCE_RE = re.compile(
+    r"\bresource\s+(['\"])(?P<type>google_cloud_run_v2_service|"
+    r"google_cloudfunctions2_function)\1\s+(['\"])(?P<label>[^'\"]+)\3\s*\{"
 )
 _LITERAL_PROPERTY_TEMPLATE = r"\b{key}\s*:\s*(['\"])(?P<value>[^'\"\r\n]+)\1"
 _STRING_BINDING_RE = re.compile(
@@ -80,8 +87,19 @@ _MAX_CDK_MANIFEST_BYTES = 2_000_000
 _MAX_CANDIDATE_OBSERVATIONS = 2_000
 _MAX_CANDIDATE_MATCHES = 25
 _MANIFEST_EXCLUDED_DIRS = frozenset(
-    {".git", ".venv", "node_modules", "vendor", "dist", "build"}
+    {
+        ".git",
+        ".venv",
+        "node_modules",
+        "vendor",
+        "dist",
+        "build",
+        "fixtures",
+        "test",
+        "tests",
+    }
 )
+_IAC_SUFFIXES = frozenset({".tf", ".yaml", ".yml"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,13 +107,56 @@ class DeploymentTarget:
     natural_key: str
     display_name: str
     service: str
-    logical_id: str
+    identity: DeploymentIdentity
     evidence_locator: str
     evidence_payload: dict[str, Any]
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> DeploymentTarget:
+        identity = record.get("identity")
+        if isinstance(identity, dict):
+            parsed_identity = DeploymentIdentity.from_record(identity)
+        else:
+            parsed_identity = _legacy_aws_target_identity(record)
+        return cls(
+            natural_key=str(record["natural_key"]),
+            display_name=str(record["display_name"]),
+            service=str(record["service"]),
+            identity=parsed_identity,
+            evidence_locator=str(record["evidence_locator"]),
+            evidence_payload=dict(record.get("evidence_payload") or {}),
+        )
+
+
+def _legacy_aws_target_identity(record: dict[str, Any]) -> DeploymentIdentity:
+    """Read pre-contract AWS target records during the persisted-data transition."""
+
+    service = record.get("service")
+    logical_id = record.get("logical_id")
+    payload = record.get("evidence_payload")
+    if service not in {"lambda", "ecs"} or not isinstance(logical_id, str):
+        raise ValueError("deployment target identity must be an object")
+    if service == "lambda":
+        runtime_kind = "serverless_function"
+        names = [record.get("display_name")]
+        identifier_name = "function_name"
+    else:
+        runtime_kind = "container_task"
+        names = payload.get("container_names", []) if isinstance(payload, dict) else []
+        identifier_name = "container_name"
+    identifiers = [DeploymentIdentifier("cloudformation_logical_id", logical_id)]
+    identifiers.extend(
+        DeploymentIdentifier(identifier_name, item)
+        for item in names
+        if isinstance(item, str) and item
+    )
+    return DeploymentIdentity("aws", runtime_kind, tuple(identifiers))
 
 
 @dataclass(frozen=True, slots=True)
 class DeploymentDeclaration:
+    identity: DeploymentIdentity
+    framework: str
     service: str
     construct_id: str
     deployment_name: str
@@ -160,7 +221,7 @@ class CodeToCloudConnector:
         asset_manifests, manifest_warnings = _load_cdk_asset_manifests(self.root)
         warnings.extend(manifest_warnings)
 
-        for source_file in _source_files(self.root):
+        for source_file in _deployment_source_files(self.root):
             relative = source_file.relative_to(self.root).as_posix()
             try:
                 if source_file.stat().st_size > MAX_SOURCE_BYTES:
@@ -218,6 +279,12 @@ class CodeToCloudConnector:
                 target,
                 asset_manifests,
                 repository_revision=self.revision,
+                framework=declaration.framework,
+            )
+            inclusion_method = (
+                "static_local_module_graph"
+                if declaration.framework == "aws_cdk"
+                else "not_evaluated"
             )
             evidence = Evidence(
                 source_type="code_to_cloud_correlation",
@@ -228,6 +295,9 @@ class CodeToCloudConnector:
                 observed_at=observed_at,
                 payload={
                     "repository_revision": self.revision,
+                    "provider": declaration.identity.provider,
+                    "runtime_kind": declaration.identity.runtime_kind,
+                    "deployment_framework": declaration.framework,
                     "source_path": declaration.path,
                     "source_line": declaration.line,
                     "service": declaration.service,
@@ -235,11 +305,13 @@ class CodeToCloudConnector:
                     "deployment_identifier": declaration.deployment_name,
                     "entry": artifact.entry,
                     "build_file": artifact.build_file,
-                    "artifact_inclusion_method": "static_local_module_graph",
+                    "artifact_inclusion_method": inclusion_method,
                     "reachable_source_paths": list(artifact.reachable_source_paths),
                     "artifact_import_chains": artifact.import_chains,
                     "observed_workload": target.natural_key,
-                    "observed_logical_id": target.logical_id,
+                    "observed_deployment_identifiers": target.identity.to_record()[
+                        "identifiers"
+                    ],
                     "control_plane_evidence": target.evidence_locator,
                     "match_basis": _match_basis(declaration),
                     **provenance,
@@ -256,12 +328,15 @@ class CodeToCloudConnector:
                     evidence=evidence,
                     attributes={
                         "correlation": "deterministic",
+                        "provider": declaration.identity.provider,
+                        "runtime_kind": declaration.identity.runtime_kind,
+                        "deployment_framework": declaration.framework,
                         "service": declaration.service,
                         "source_path": declaration.path,
                         "source_line": declaration.line,
                         "entry": artifact.entry,
                         "build_file": artifact.build_file,
-                        "artifact_inclusion_method": "static_local_module_graph",
+                        "artifact_inclusion_method": inclusion_method,
                         "reachable_source_paths": list(artifact.reachable_source_paths),
                         "artifact_import_chains": artifact.import_chains,
                         **provenance,
@@ -326,6 +401,9 @@ def _candidate_observation(
 
     return {
         "status": status,
+        "provider": declaration.identity.provider,
+        "runtime_kind": declaration.identity.runtime_kind,
+        "deployment_framework": declaration.framework,
         "service": declaration.service,
         "construct_id": declaration.construct_id,
         "deployment_identifier": declaration.deployment_name,
@@ -342,6 +420,11 @@ def _candidate_observation(
 def _deployment_declarations(
     text: str, relative: str
 ) -> tuple[list[DeploymentDeclaration], list[str]]:
+    suffix = Path(relative).suffix.lower()
+    if suffix == ".tf":
+        return _terraform_declarations(text, relative)
+    if suffix in {".yaml", ".yml"}:
+        return _cloud_run_yaml_declarations(text, relative)
     output: list[DeploymentDeclaration] = []
     warnings: list[str] = []
     scan_text = _strip_js_comments(text)
@@ -367,6 +450,12 @@ def _deployment_declarations(
             continue
         output.append(
             DeploymentDeclaration(
+                identity=_aws_cdk_identity(
+                    service="lambda",
+                    construct_id=match.group("construct"),
+                    deployment_name=function_name,
+                ),
+                framework="aws_cdk",
                 service="lambda",
                 construct_id=match.group("construct"),
                 deployment_name=function_name,
@@ -419,6 +508,12 @@ def _deployment_declarations(
             continue
         output.append(
             DeploymentDeclaration(
+                identity=_aws_cdk_identity(
+                    service="ecs",
+                    construct_id=match.group("construct"),
+                    deployment_name=container_name,
+                ),
+                framework="aws_cdk",
                 service="ecs",
                 construct_id=match.group("construct"),
                 deployment_name=container_name,
@@ -429,6 +524,249 @@ def _deployment_declarations(
             )
         )
     return output, warnings
+
+
+def _terraform_declarations(
+    text: str, relative: str
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    output: list[DeploymentDeclaration] = []
+    warnings: list[str] = []
+    scan_text = _strip_hcl_comments(text)
+    for match in _TERRAFORM_RESOURCE_RE.finditer(scan_text):
+        block_start = match.end() - 1
+        block_end = _balanced_object_end(scan_text, block_start)
+        line = _line(text, match.start())
+        if block_end is None:
+            warnings.append(f"{relative}:{line}: unbalanced Terraform resource")
+            continue
+        block = scan_text[block_start : block_end + 1]
+        project = _hcl_top_level_literal(block, "project")
+        location = _hcl_top_level_literal(block, "location")
+        name = _hcl_top_level_literal(block, "name")
+        if not project or not location or not name:
+            warnings.append(
+                f"{relative}:{line}: Terraform GCP project, location, and name "
+                "must all be literal"
+            )
+            continue
+        resource_type = match.group("type")
+        if resource_type == "google_cloud_run_v2_service":
+            service = "cloud_run"
+            runtime_kind = "container_service"
+            name_identifier = "service_name"
+            name_basis = "literal_cloud_run_service_name"
+        else:
+            service = "cloud_functions"
+            runtime_kind = "serverless_function"
+            name_identifier = "function_name"
+            name_basis = "literal_cloud_functions_gen2_function_name"
+        output.append(
+            DeploymentDeclaration(
+                identity=DeploymentIdentity(
+                    provider="gcp",
+                    runtime_kind=runtime_kind,
+                    identifiers=(
+                        DeploymentIdentifier(
+                            "project", project, evidence_basis="literal_gcp_project_id"
+                        ),
+                        DeploymentIdentifier(
+                            "location", location, evidence_basis="literal_gcp_location"
+                        ),
+                        DeploymentIdentifier(
+                            name_identifier,
+                            name,
+                            evidence_basis=name_basis,
+                        ),
+                    ),
+                ),
+                framework="terraform",
+                service=service,
+                construct_id=f"{resource_type}.{match.group('label')}",
+                deployment_name=name,
+                path=relative,
+                line=line,
+            )
+        )
+    return output, warnings
+
+
+def _cloud_run_yaml_declarations(
+    text: str, relative: str
+) -> tuple[list[DeploymentDeclaration], list[str]]:
+    output: list[DeploymentDeclaration] = []
+    warnings: list[str] = []
+    boundaries = [0, *(match.end() for match in re.finditer(r"(?m)^---\s*$", text)), len(text)]
+    for index, start in enumerate(boundaries[:-1]):
+        document = text[start : boundaries[index + 1]]
+        api_version = _yaml_top_level_literal(document, "apiVersion")
+        kind = _yaml_top_level_literal(document, "kind")
+        if api_version != "serving.knative.dev/v1" or kind != "Service":
+            continue
+        line = _line(text, start)
+        metadata = _yaml_top_level_block(document, "metadata")
+        if metadata is None:
+            warnings.append(f"{relative}:{line}: Cloud Run Service metadata is not literal")
+            continue
+        name = _yaml_direct_literal(metadata, "name")
+        project_number = _yaml_direct_literal(metadata, "namespace")
+        labels = _yaml_direct_block(metadata, "labels")
+        location = (
+            _yaml_direct_literal(labels, "cloud.googleapis.com/location")
+            if labels is not None
+            else None
+        )
+        if (
+            not name
+            or not project_number
+            or not project_number.isdigit()
+            or not location
+        ):
+            warnings.append(
+                f"{relative}:{line}: Cloud Run YAML project number, location, and name "
+                "must all be literal"
+            )
+            continue
+        output.append(
+            DeploymentDeclaration(
+                identity=DeploymentIdentity(
+                    provider="gcp",
+                    runtime_kind="container_service",
+                    identifiers=(
+                        DeploymentIdentifier(
+                            "project_number",
+                            project_number,
+                            evidence_basis="literal_gcp_project_number",
+                        ),
+                        DeploymentIdentifier(
+                            "location", location, evidence_basis="literal_gcp_location"
+                        ),
+                        DeploymentIdentifier(
+                            "service_name",
+                            name,
+                            evidence_basis="literal_cloud_run_service_name",
+                        ),
+                    ),
+                ),
+                framework="cloud_run_service_yaml",
+                service="cloud_run",
+                construct_id=f"serving.knative.dev/v1:Service/{name}",
+                deployment_name=name,
+                path=relative,
+                line=line,
+            )
+        )
+    return output, warnings
+
+
+def _yaml_top_level_literal(text: str, key: str) -> str | None:
+    match = re.search(rf"(?m)^{re.escape(key)}:\s*(?P<value>[^\r\n]+)$", text)
+    return _yaml_scalar(match.group("value")) if match else None
+
+
+def _yaml_top_level_block(text: str, key: str) -> str | None:
+    match = re.search(rf"(?m)^{re.escape(key)}:\s*(?:#.*)?$", text)
+    if match is None:
+        return None
+    following = text[match.end() :]
+    end = re.search(r"(?m)^\S", following)
+    return following[: end.start()] if end else following
+
+
+def _yaml_direct_literal(block: str, key: str) -> str | None:
+    indent = _yaml_direct_indent(block)
+    if indent is None:
+        return None
+    match = re.search(
+        rf"(?m)^ {{{indent}}}{re.escape(key)}:\s*(?P<value>[^\r\n]+)$",
+        block,
+    )
+    return _yaml_scalar(match.group("value")) if match else None
+
+
+def _yaml_direct_block(block: str, key: str) -> str | None:
+    indent = _yaml_direct_indent(block)
+    if indent is None:
+        return None
+    match = re.search(rf"(?m)^ {{{indent}}}{re.escape(key)}:\s*(?:#.*)?$", block)
+    if match is None:
+        return None
+    following = block[match.end() :]
+    end = re.search(rf"(?m)^ {{0,{indent}}}\S", following)
+    return following[: end.start()] if end else following
+
+
+def _yaml_direct_indent(block: str) -> int | None:
+    indents = [
+        len(match.group("indent"))
+        for match in re.finditer(r"(?m)^(?P<indent> +)\S", block)
+    ]
+    return min(indents) if indents else None
+
+
+def _yaml_scalar(raw: str) -> str | None:
+    value = re.sub(r"\s+#.*$", "", raw).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    if not value or value[0] in "[{*&!" or "${" in value:
+        return None
+    return value
+
+
+def _hcl_top_level_literal(block: str, key: str) -> str | None:
+    pattern = re.compile(
+        rf"(?m)^\s*{re.escape(key)}\s*=\s*(['\"])(?P<value>[^'\"\r\n]+)\1\s*(?:$|#|//)"
+    )
+    for match in pattern.finditer(block):
+        if _hcl_brace_depth(block, match.start()) != 1:
+            continue
+        value = match.group("value")
+        if "${" not in value:
+            return value
+    return None
+
+
+def _hcl_brace_depth(text: str, end: int) -> int:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for char in text[:end]:
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+    return depth
+
+
+def _strip_hcl_comments(text: str) -> str:
+    output = re.sub(
+        r"/\*.*?\*/",
+        lambda match: "\n" * match.group(0).count("\n"),
+        text,
+        flags=re.DOTALL,
+    )
+    return re.sub(r"(?m)(?<!:)\s*(?:#|//).*?$", "", output)
+
+
+def _deployment_source_files(root: Path) -> list[Path]:
+    files = set(_source_files(root))
+    for path in root.rglob("*"):
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and path.suffix.lower() in _IAC_SUFFIXES
+            and not any(part in _MANIFEST_EXCLUDED_DIRS for part in path.relative_to(root).parts)
+        ):
+            files.add(path)
+    return sorted(files)
 
 
 def _literal_property(text: str, key: str) -> str | None:
@@ -449,6 +787,8 @@ def _artifact_reachability(
     declaration: DeploymentDeclaration,
     source_texts: dict[str, str],
 ) -> ArtifactReachability:
+    if declaration.framework != "aws_cdk":
+        return ArtifactReachability(None, None, (), {}, ())
     warnings: list[str] = []
     project_root = _project_root(root, declaration.path)
     entry = declaration.entry
@@ -656,25 +996,43 @@ def _matching_targets(
 ) -> tuple[DeploymentTarget, ...]:
     matches: list[DeploymentTarget] = []
     for target in targets:
-        if target.service != declaration.service:
-            continue
-        logical_match = target.logical_id.startswith(declaration.construct_id)
-        if declaration.service == "lambda":
-            identifier_match = target.display_name == declaration.deployment_name
-        else:
-            names = target.evidence_payload.get("container_names", [])
-            identifier_match = (
-                declaration.deployment_name in names if isinstance(names, list) else False
-            )
-        if logical_match and identifier_match:
+        if declaration.identity.matches(target.identity):
             matches.append(target)
     return tuple(matches)
 
 
 def _match_basis(declaration: DeploymentDeclaration) -> list[str]:
-    if declaration.service == "lambda":
-        return ["cloudformation_logical_id_prefix", "literal_lambda_function_name"]
-    return ["cloudformation_logical_id_prefix", "literal_ecs_container_name"]
+    return declaration.identity.match_basis()
+
+
+def _aws_cdk_identity(
+    *, service: str, construct_id: str, deployment_name: str
+) -> DeploymentIdentity:
+    if service == "lambda":
+        runtime_kind = "serverless_function"
+        identifier_name = "function_name"
+        identifier_basis = "literal_lambda_function_name"
+    else:
+        runtime_kind = "container_task"
+        identifier_name = "container_name"
+        identifier_basis = "literal_ecs_container_name"
+    return DeploymentIdentity(
+        provider="aws",
+        runtime_kind=runtime_kind,
+        identifiers=(
+            DeploymentIdentifier(
+                name="cloudformation_logical_id",
+                value=construct_id,
+                comparison=IdentifierComparison.PREFIX,
+                evidence_basis="cloudformation_logical_id_prefix",
+            ),
+            DeploymentIdentifier(
+                name=identifier_name,
+                value=deployment_name,
+                evidence_basis=identifier_basis,
+            ),
+        ),
+    )
 
 
 def _load_cdk_asset_manifests(
@@ -716,6 +1074,7 @@ def _artifact_provenance(
     manifests: tuple[tuple[str, dict[str, Any]], ...],
     *,
     repository_revision: str,
+    framework: str,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "artifact_identity_status": "not_evaluated",
@@ -725,6 +1084,8 @@ def _artifact_provenance(
             "The deployed artifact exposes no independently verifiable VCS revision."
         ),
     }
+    if framework != "aws_cdk":
+        return result
     artifact = target.evidence_payload.get("deployment_artifact")
     if not isinstance(artifact, dict) or not manifests:
         return result
@@ -818,7 +1179,8 @@ def scan_main() -> None:
     migrate(args.dsn)
     repository = PostgresInventoryRepository(args.dsn)
     targets = tuple(
-        DeploymentTarget(**item) for item in repository.deployment_targets(args.tenant_id)
+        DeploymentTarget.from_record(item)
+        for item in repository.deployment_targets(args.tenant_id)
     )
     connector = CodeToCloudConnector(args.repository, targets=targets, repository_name=args.name)
     batch = connector.collect(connection_id=args.connection_id)

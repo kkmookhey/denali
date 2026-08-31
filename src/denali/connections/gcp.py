@@ -10,10 +10,12 @@ from typing import Any, Protocol
 GCP_SCOPE_VERTEX_AI = "gcp.vertex_ai"
 GCP_SCOPE_AGENT_BUILDER = "gcp.agent_builder"
 GCP_SCOPE_AI_ACTIVITY = "gcp.ai_activity"
+GCP_SCOPE_CODE_TO_CLOUD = "gcp.code_to_cloud"
 GCP_SCOPES = (
     GCP_SCOPE_VERTEX_AI,
     GCP_SCOPE_AGENT_BUILDER,
     GCP_SCOPE_AI_ACTIVITY,
+    GCP_SCOPE_CODE_TO_CLOUD,
 )
 GCP_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 GCP_RESOURCE_MANAGER_ENDPOINT = "https://cloudresourcemanager.googleapis.com/v3"
@@ -77,6 +79,18 @@ _SCOPE_METADATA: dict[str, tuple[dict[str, Any], ...]] = {
             "label": "Google Cloud AI management activity",
             "permission": "logging.logEntries.list",
             "asset_types": None,
+        },
+    ),
+    GCP_SCOPE_CODE_TO_CLOUD: (
+        {
+            "plane": "gcp_deployment_inventory",
+            "label": "Cloud Run and Cloud Run functions deployment inventory",
+            "permission": "cloudasset.assets.listResource",
+            "validation_method": "list_assets_resource",
+            "asset_types": [
+                "run.googleapis.com/Service",
+                "cloudfunctions.googleapis.com/Function",
+            ],
         },
     ),
 }
@@ -237,6 +251,17 @@ class GcpConnectionValidator:
                     },
                     timeout=10.0,
                 )
+            elif metadata.get("validation_method") == "list_assets_resource":
+                response = request(
+                    "GET",
+                    f"{GCP_CLOUD_ASSET_ENDPOINT}/projects/{project_id}/assets",
+                    params=[
+                        *(("assetTypes", asset_type) for asset_type in metadata["asset_types"]),
+                        ("contentType", "RESOURCE"),
+                        ("pageSize", "1"),
+                    ],
+                    timeout=10.0,
+                )
             else:
                 response = request(
                     "GET",
@@ -373,3 +398,9 @@ def _authorized_request(credential: GcpCredential) -> GcpRequest:
     except ImportError as error:  # pragma: no cover - installation contract
         raise RuntimeError("google-auth is required for Google Cloud validation") from error
     return AuthorizedSession(credential).request
+
+
+def authorized_gcp_request(principal_email: str) -> GcpRequest:
+    """Create the bounded authorized request callable for one connection principal."""
+
+    return _authorized_request(_default_credential(principal_email))

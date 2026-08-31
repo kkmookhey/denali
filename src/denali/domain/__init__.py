@@ -9,6 +9,11 @@ from denali.domain.activity import (
     ActivityOutcome,
     ActivityRecord,
 )
+from denali.domain.deployments import (
+    DeploymentIdentifier,
+    DeploymentIdentity,
+    IdentifierComparison,
+)
 from denali.domain.detections import (
     DetectionActivity,
     DetectionActivityEntity,
@@ -100,6 +105,8 @@ __all__ = [
     "DetectionAsset",
     "DetectionAssetLink",
     "DetectionSnapshot",
+    "DeploymentIdentifier",
+    "DeploymentIdentity",
     "Evidence",
     "EvaluationResult",
     "ExploitState",
@@ -109,6 +116,7 @@ __all__ = [
     "FindingState",
     "GovernanceStatus",
     "InventoryBatch",
+    "IdentifierComparison",
     "IssueCandidate",
     "IssueActivityLink",
     "IssueDetectionLink",

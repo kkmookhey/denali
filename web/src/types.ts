@@ -145,6 +145,8 @@ export type Connection = {
   validation_state?: "idle" | "running";
   source_collection_state?: "idle" | "running";
   last_source_collection?: GitHubSourceCollection | null;
+  deployment_collection_state?: "idle" | "running";
+  last_deployment_collection?: GcpDeploymentCollection | null;
   setup_capabilities: {
     cloudformation_quick_create: boolean;
     azure_cloud_shell: boolean;
@@ -234,6 +236,23 @@ export type GitHubSourceCollection = {
   failed_count: number;
   partial_count: number;
   repositories: GitHubSourceCollectionRepository[];
+  detail?: string;
+};
+
+export type GcpDeploymentCollection = {
+  connection_id: string;
+  state: "complete" | "partial" | "failed";
+  completed_at: string;
+  project_count: number;
+  failed_count: number;
+  partial_count: number;
+  projects: Array<{
+    project_id: string;
+    project_number?: string;
+    state: "complete" | "partial" | "failed";
+    assets?: number;
+    ai_workloads?: number;
+  }>;
   detail?: string;
 };
 

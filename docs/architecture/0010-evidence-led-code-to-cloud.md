@@ -9,6 +9,10 @@ Accepted.
 Denali correlates a source repository to a deployed AI workload only when independent
 code and cloud observations agree on deployment-specific identifiers.
 
+The common provider/runtime/identifier contract is defined by
+[ADR 0023](0023-provider-neutral-deployment-identity.md). This ADR retains the exact
+identifier rules for the first AWS adapter.
+
 For the first AWS CDK slice, a deployment link requires:
 
 - Lambda: a literal `functionName`, a CDK construct identifier, an exact observed

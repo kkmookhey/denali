@@ -84,6 +84,70 @@ def _connection_response(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _deployment_identity_from_attributes(
+    attributes: dict[str, Any], *, display_name: str
+) -> dict[str, Any] | None:
+    """Normalize provider inventory into the shared deployment identity record."""
+
+    provider = attributes.get("provider")
+    service = attributes.get("service")
+    runtime_kind = attributes.get("runtime_kind")
+    raw_identifiers = attributes.get("deployment_identifiers")
+
+    # Preserve eligibility for AWS observations written before the shared identity
+    # contract existed. New provider collectors must emit the explicit fields above.
+    if (
+        provider == "aws"
+        and service in {"lambda", "ecs"}
+        and not isinstance(raw_identifiers, dict)
+    ):
+        logical_id = attributes.get("logical_id")
+        if not isinstance(logical_id, str) or not logical_id:
+            return None
+        if service == "lambda":
+            runtime_kind = "serverless_function"
+            raw_identifiers = {
+                "cloudformation_logical_id": [logical_id],
+                "function_name": [display_name],
+            }
+        else:
+            runtime_kind = "container_task"
+            raw_identifiers = {
+                "cloudformation_logical_id": [logical_id],
+                "container_name": attributes.get("container_names", []),
+            }
+
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or not isinstance(runtime_kind, str)
+        or not runtime_kind
+        or not isinstance(raw_identifiers, dict)
+    ):
+        return None
+
+    identifiers: list[dict[str, str]] = []
+    for name, raw_values in raw_identifiers.items():
+        if not isinstance(name, str) or not name:
+            return None
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        if not values:
+            return None
+        for value in values:
+            if not isinstance(value, str) or not value:
+                return None
+            identifiers.append(
+                {"name": name, "value": value, "comparison": "exact"}
+            )
+    if not identifiers:
+        return None
+    return {
+        "provider": provider,
+        "runtime_kind": runtime_kind,
+        "identifiers": identifiers,
+    }
+
+
 class PostgresInventoryRepository:
     def __init__(self, dsn: str):
         self._dsn = dsn
@@ -1389,9 +1453,7 @@ class PostgresInventoryRepository:
         with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
             rows = connection.execute(
                 f"""
-                SELECT a.natural_key, winner.display_name,
-                       winner.attributes->>'service' AS service,
-                       winner.attributes->>'logical_id' AS logical_id,
+                SELECT a.natural_key, winner.display_name, winner.attributes,
                        winner.evidence->>'locator' AS evidence_locator,
                        winner.evidence->'payload' AS evidence_payload
                 FROM asset a
@@ -1407,23 +1469,36 @@ class PostgresInventoryRepository:
                 ) winner ON true
                 WHERE a.tenant_id = %s::uuid AND a.kind = 'ai_workload'
                   AND a.lifecycle_state = 'active'
-                  AND winner.attributes->>'service' IN ('lambda', 'ecs')
-                  AND COALESCE(winner.attributes->>'logical_id', '') <> ''
                 ORDER BY a.natural_key
                 """,
                 (tenant_id,),
             ).fetchall()
-        return [
-            {
-                "natural_key": row["natural_key"],
-                "display_name": row["display_name"],
-                "service": row["service"],
-                "logical_id": row["logical_id"],
-                "evidence_locator": row["evidence_locator"],
-                "evidence_payload": dict(row["evidence_payload"] or {}),
-            }
-            for row in rows
-        ]
+        targets: list[dict[str, Any]] = []
+        for row in rows:
+            attributes = dict(row["attributes"] or {})
+            evidence_payload = dict(row["evidence_payload"] or {})
+            if "container_names" not in attributes and isinstance(
+                evidence_payload.get("container_names"), list
+            ):
+                attributes["container_names"] = evidence_payload["container_names"]
+            identity = _deployment_identity_from_attributes(
+                attributes,
+                display_name=str(row["display_name"]),
+            )
+            service = attributes.get("service")
+            if identity is None or not isinstance(service, str) or not service:
+                continue
+            targets.append(
+                {
+                    "natural_key": row["natural_key"],
+                    "display_name": row["display_name"],
+                    "service": service,
+                    "identity": identity,
+                    "evidence_locator": row["evidence_locator"],
+                    "evidence_payload": evidence_payload,
+                }
+            )
+        return targets
 
     def code_to_cloud_deployments(self, tenant_id: str) -> list[dict[str, Any]]:
         """Return proven repository-to-workload links and their runtime context."""

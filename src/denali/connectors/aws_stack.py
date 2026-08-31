@@ -218,10 +218,17 @@ class AwsStackConnector:
             attributes={
                 "provider": "aws",
                 "service": "lambda",
+                "runtime_kind": "serverless_function",
                 "account_id": self.account_id,
                 "region": self.region,
                 "stack_name": self.stack_name,
                 "logical_id": logical_id,
+                "deployment_identifiers": {
+                    "cloudformation_logical_id": [logical_id],
+                    "function_name": [
+                        _string(response.get("FunctionName")) or function_name
+                    ],
+                },
                 "runtime": _string(response.get("Runtime")),
                 "package_type": _string(response.get("PackageType")),
                 "memory_mb": response.get("MemorySize"),
@@ -322,10 +329,15 @@ class AwsStackConnector:
             attributes={
                 "provider": "aws",
                 "service": "ecs",
+                "runtime_kind": "container_task",
                 "account_id": self.account_id,
                 "region": self.region,
                 "stack_name": self.stack_name,
                 "logical_id": logical_id,
+                "deployment_identifiers": {
+                    "cloudformation_logical_id": [logical_id],
+                    "container_name": sorted(container_names),
+                },
                 "family": family,
                 "revision": task.get("revision"),
                 "network_mode": _string(task.get("networkMode")),

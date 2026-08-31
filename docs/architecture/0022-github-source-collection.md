@@ -43,7 +43,8 @@ types are not materialized. A truncated GitHub tree is a failure, never complete
 
 ## Current limits
 
-- Correlation supports the existing literal AWS CDK Lambda and ECS rules.
+- The shared identity matcher is provider-neutral, but source and workload adapters currently
+  support only the existing literal AWS CDK Lambda and ECS rules.
 - The source revision is analysis context until an independently observed deployed artifact
   attests that revision.
 - Background job ownership is process-local; durable leases across replicas remain deferred.

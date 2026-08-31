@@ -57,10 +57,10 @@ Implemented collection and import paths include:
 
 | Source | Current path |
 | --- | --- |
-| Source repositories | Local or GitHub App-backed static Python, TypeScript, and JavaScript AI/MCP discovery; bounded repository posture; exact-identifier code-to-cloud correlation |
+| Source repositories | Local or GitHub App-backed static Python, TypeScript, JavaScript, Terraform, and Cloud Run YAML analysis; bounded repository posture; exact-identifier code-to-cloud correlation |
 | MCP Streamable HTTP | Initialization and paginated `tools/list` observation without tool invocation |
 | AWS | Bedrock Agents Classic, AgentCore, bounded CloudFormation-stack inventory and posture, and Bedrock management activity from CloudTrail Event History |
-| Google Cloud | Vertex AI audit activity from Cloud Logging |
+| Google Cloud | Cloud Run and Cloud Run functions Gen2 deployment inventory through Cloud Asset RESOURCE snapshots; Vertex AI audit activity from Cloud Logging |
 | Microsoft Entra | AI application, permission, sign-in, and application-management collection through a separate Microsoft Graph connector |
 | External findings and scanners | OCSF findings, Syft SBOMs, and Grype vulnerability reports |
 | Runtime exports | AWS Bedrock CloudTrail, Google Cloud Vertex AI, Google Workspace Gemini, and Microsoft Entra AI sign-in JSON |
@@ -139,7 +139,8 @@ The installed entrypoints include `denali-repo-scan`, `denali-mcp-observe`,
 `denali-agentcore-scan`, `denali-aws-scan`, `denali-aws-stack-scan`,
 `denali-aws-stack-posture`, `denali-repository-posture`, `denali-code-to-cloud`,
 `denali-ocsf-import`, `denali-syft-import`, `denali-grype-import`,
-`denali-activity-import`, `denali-aws-runtime`, `denali-gcp-vertex-runtime`, and
+`denali-activity-import`, `denali-aws-runtime`, `denali-gcp-vertex-runtime`,
+`denali-gcp-deployments-scan`, and
 `denali-entra-scan`. Use each command's `--help` output for its exact scope and inputs.
 
 ## Provider onboarding
@@ -177,6 +178,8 @@ Start with the product and evidence boundaries, then follow only the slice being
   [artifact correlation](docs/architecture/0013-artifact-vulnerability-correlation.md), and
   [package occurrence identity](docs/architecture/0014-package-occurrence-identity.md)
 - [Evidence-led code to cloud](docs/architecture/0010-evidence-led-code-to-cloud.md),
+  [provider-neutral deployment identity](docs/architecture/0023-provider-neutral-deployment-identity.md),
+  [GCP code to cloud](docs/architecture/0024-gcp-code-to-cloud.md),
   [static artifact inclusion](docs/architecture/0011-static-artifact-inclusion.md), and
   [deployment artifact provenance](docs/architecture/0012-deployment-artifact-provenance.md)
 - [Provider-neutral runtime activity](docs/architecture/0015-provider-neutral-runtime-activity.md),
