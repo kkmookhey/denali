@@ -1007,7 +1007,7 @@ def test_consent_then_use_issue_persists_exact_detection_and_activity_evidence(
     assert detail["attributes"]["high_impact_scopes"] == ["Mail.ReadWrite"]
 
 
-def test_deployment_targets_accept_provider_neutral_identity(repository) -> None:
+def test_deployment_targets_accept_provider_neutral_identity(repository, tmp_path: Path) -> None:
     tenant, repo = repository
     now = datetime.now(UTC)
     workload = AssetRef(
@@ -1048,6 +1048,7 @@ def test_deployment_targets_accept_provider_neutral_identity(repository) -> None
                         "runtime_kind": "container_service",
                         "deployment_identifiers": {
                             "project": ["denali-test"],
+                            "project_number": ["123456789012"],
                             "location": ["us-central1"],
                             "service_name": ["denali-ai"],
                         },
@@ -1066,8 +1067,44 @@ def test_deployment_targets_accept_provider_neutral_identity(repository) -> None
             {"name": "project", "value": "denali-test", "comparison": "exact"},
             {"name": "location", "value": "us-central1", "comparison": "exact"},
             {"name": "service_name", "value": "denali-ai", "comparison": "exact"},
+            {
+                "name": "project_number",
+                "value": "123456789012",
+                "comparison": "exact",
+            },
         ],
     }
+
+    (tmp_path / "service.yaml").write_text(
+        """
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: denali-ai
+  namespace: '123456789012'
+  labels:
+    cloud.googleapis.com/location: us-central1
+"""
+    )
+    targets = tuple(
+        DeploymentTarget.from_record(item) for item in repo.deployment_targets(tenant)
+    )
+    correlated = CodeToCloudConnector(
+        tmp_path,
+        targets=targets,
+        repository_name="github.com/example/denali-gcp",
+    ).collect()
+    repo.ingest(tenant, correlated)
+
+    [deployment] = repo.code_to_cloud_deployments(tenant)
+    assert deployment["repository_natural_key"] == "github.com/example/denali-gcp"
+    assert deployment["workload_natural_key"] == workload.natural_key
+    assert deployment["workload_attributes"]["provider"] == "gcp"
+    assert deployment["evidence"]["payload"]["match_basis"] == [
+        "literal_gcp_project_number",
+        "literal_gcp_location",
+        "literal_cloud_run_service_name",
+    ]
 
 
 def test_code_to_cloud_query_preserves_proven_runtime_context(repository, tmp_path: Path) -> None:

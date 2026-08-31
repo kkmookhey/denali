@@ -1535,7 +1535,10 @@ class PostgresInventoryRepository:
                     WHERE aa.tenant_id = workload.tenant_id AND aa.asset_id = workload.id
                       AND aa.withdrawn_at IS NULL
                       AND aa.attributes ? 'service'
-                      AND aa.attributes ? 'logical_id'
+                      AND (
+                        aa.attributes ? 'deployment_identifiers'
+                        OR aa.attributes ? 'logical_id'
+                      )
                     ORDER BY {_ASSERTION_RANK_SQL} DESC, aa.last_seen_at DESC LIMIT 1
                 ) workload_view ON true
                 JOIN LATERAL (
