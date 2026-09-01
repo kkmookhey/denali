@@ -14,7 +14,8 @@ input to Clerk and provider callbacks, and the Modal URL is an input to Vercel.
 - [x] Apply all 12 migrations through `012_tenant_connection_constraints.sql`.
 - [x] Create Modal environment `denali-prod` and its current `custom-secret`.
 - [x] Add the production origin settings and deploy the Modal API/worker in `us-east`.
-- [x] Configure and deploy Vercel project `transilience/denali` under `transilience-pro`.
+- [x] Configure and deploy Vercel project `transilience-a55654db/denali` under
+  `transilience-dev`; the duplicate Pro project has been removed.
 - [x] Verify the canonical frontend and same-origin API boundary: `/` returns `200`,
   `/api/healthz` returns `200`, and unauthenticated `/api/v1/context` returns `401`.
 - [ ] Complete two-organization Clerk acceptance.
@@ -27,6 +28,39 @@ Web:   https://denali.transilience.cloud
 API:   https://transilience-denali-prod--denali-production-api.modal.run
 Neon:  database denali; migrations 001 through 012 applied
 ```
+
+## Prioritized remaining work
+
+### P0 — make the empty product useful
+
+1. Configure the existing GitHub App in Modal and complete create, setup callback, validation,
+   source collection, disable, and delete from the hosted UI.
+2. Configure AWS Modal OIDC and the onboarding bucket/principal, then complete the same hosted
+   lifecycle. GitHub plus AWS unlocks the first complete source-to-cloud acceptance path.
+3. Move Clerk from development keys to a production instance before inviting pilot users.
+4. Test `org:member` read-only enforcement and two-organization isolation with non-empty data.
+
+### P1 — complete provider coverage
+
+1. Configure and accept Google Cloud.
+2. Configure and accept Azure.
+3. Use a least-privilege Neon runtime role instead of an owner-capable runtime DSN.
+
+### P2 — hardening and operations
+
+1. Enable Modal failure/timeout alerts, Vercel deployment monitoring, and Neon alerts/backups.
+2. Run and document a Neon restore drill.
+3. Add the Clerk publishable key to Vercel Development if Vercel-hosted development builds are
+   required; Production and Preview are already configured.
+
+Live authenticated smoke acceptance completed on 2026-09-01:
+
+- Clerk sign-in and active organization authorization return `200` from `/v1/context`.
+- AirtelAfrica loads with the admin connection controls.
+- Switching to `muzaffartest1` and back reauthorizes successfully without browser errors.
+- All eleven protected product pages load, and a deep-link refresh succeeds.
+- The active tenant currently has zero connections, so zero inventory is expected.
+- Core Modal configuration is ready; AWS, Azure, GCP, and GitHub provider configuration is absent.
 
 ## Ordered TODOs
 
@@ -141,7 +175,8 @@ build and publish, while `/api/*` remains intentionally unusable. Record Vercel'
 use it to configure Clerk and Modal, deploy Modal, then replace the placeholder with the real
 Modal origin and redeploy Vercel.
 
-- [x] Add both values for Production, Preview, and Development.
+- [x] Add both values for Production and Preview; `MODAL_API_ORIGIN` is also configured for
+  Development. Add the Clerk publishable key to Development only if that target will be used.
 - [x] Deploy the project and attach `denali.transilience.cloud`.
 - [ ] Verify an authenticated refresh and SPA navigation. Unauthenticated `/` and
   `/api/healthz` are verified.
@@ -160,12 +195,13 @@ If the deployed URL differs from step 1, update all of these together and redepl
 
 ### 8. Accept Clerk tenancy before adding providers
 
-- [ ] Sign in through the hosted UI.
+- [x] Sign in through the hosted UI.
 - [ ] Verify users without an active organization cannot load Denali.
 - [ ] Verify `org:member` can read and receives `403` for mutations.
 - [ ] Verify `org:admin` can mutate governance and connections.
 - [ ] Switch between two organizations and confirm `/api/v1/context` returns different Denali
-  tenant UUIDs and no data crosses organizations.
+  tenant UUIDs and no data crosses organizations. Switching and reauthorization are verified;
+  repeat with non-empty fixtures to prove data isolation.
 
 ### 9. Add providers one at a time
 
