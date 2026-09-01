@@ -152,6 +152,23 @@ class PostgresInventoryRepository:
     def __init__(self, dsn: str):
         self._dsn = dsn
 
+    def resolve_tenant(self, clerk_organization_id: str) -> str:
+        """Return the stable Denali UUID for an authenticated Clerk organization."""
+
+        with psycopg.connect(self._dsn) as connection:
+            row = connection.execute(
+                """
+                INSERT INTO denali_tenant (clerk_organization_id)
+                VALUES (%s)
+                ON CONFLICT (clerk_organization_id) DO UPDATE
+                SET last_seen_at = now()
+                RETURNING id
+                """,
+                (clerk_organization_id,),
+            ).fetchone()
+        assert row is not None
+        return str(row[0])
+
     def ingest(self, tenant_id: str, batch: InventoryBatch) -> dict[str, int]:
         """Persist a batch atomically and reconcile only completely covered planes."""
 
@@ -1903,6 +1920,151 @@ class PostgresInventoryRepository:
                 (tenant_id, tenant_id, tenant_id),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def create_connection_validation_job(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        wait_for_credentials: bool,
+        wait_for_healthy: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create one durable active validation job per tenant and connection."""
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            with connection.transaction():
+                connection.execute(
+                    """
+                    UPDATE connection_validation_job
+                    SET state = 'failed', completed_at = now(),
+                        lease_expires_at = NULL,
+                        error_summary = CASE
+                          WHEN state = 'queued' THEN 'Validation dispatch timed out.'
+                          ELSE 'Validation worker lease expired.'
+                        END
+                    WHERE tenant_id = %s::uuid AND connection_id = %s::uuid
+                      AND (
+                        (state = 'running' AND lease_expires_at < now())
+                        OR (state = 'queued' AND created_at < now() - interval '30 minutes')
+                      )
+                    """,
+                    (tenant_id, connection_id),
+                )
+                row = connection.execute(
+                    """
+                    INSERT INTO connection_validation_job
+                      (tenant_id, connection_id, wait_for_credentials, wait_for_healthy)
+                    VALUES (%s::uuid, %s::uuid, %s, %s)
+                    ON CONFLICT (tenant_id, connection_id)
+                      WHERE state IN ('queued', 'running')
+                    DO NOTHING
+                    RETURNING *
+                    """,
+                    (
+                        tenant_id,
+                        connection_id,
+                        wait_for_credentials,
+                        wait_for_healthy,
+                    ),
+                ).fetchone()
+                if row is not None:
+                    return dict(row), True
+                active = connection.execute(
+                    """
+                    SELECT * FROM connection_validation_job
+                    WHERE tenant_id = %s::uuid AND connection_id = %s::uuid
+                      AND state IN ('queued', 'running')
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (tenant_id, connection_id),
+                ).fetchone()
+        if active is None:
+            raise RuntimeError("unable to create or find the connection validation job")
+        return dict(active), False
+
+    def claim_connection_validation_job(
+        self, job_id: str, *, lease_seconds: int
+    ) -> dict[str, Any] | None:
+        with psycopg.connect(self._dsn, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                UPDATE connection_validation_job
+                SET state = 'running', started_at = COALESCE(started_at, now()),
+                    attempt_count = attempt_count + 1,
+                    lease_expires_at = now() + make_interval(secs => %s)
+                WHERE id = %s::uuid
+                  AND (
+                    state = 'queued'
+                    OR (state = 'running' AND lease_expires_at < now())
+                  )
+                RETURNING *
+                """,
+                (lease_seconds, job_id),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def set_connection_validation_call_id(self, job_id: str, call_id: str) -> None:
+        with psycopg.connect(self._dsn) as connection:
+            connection.execute(
+                """
+                UPDATE connection_validation_job SET modal_call_id = %s
+                WHERE id = %s::uuid AND state IN ('queued', 'running')
+                """,
+                (call_id, job_id),
+            )
+
+    def complete_connection_validation_job(self, job_id: str) -> None:
+        with psycopg.connect(self._dsn) as connection:
+            connection.execute(
+                """
+                UPDATE connection_validation_job
+                SET state = 'succeeded', completed_at = now(), lease_expires_at = NULL,
+                    error_summary = NULL
+                WHERE id = %s::uuid AND state = 'running'
+                """,
+                (job_id,),
+            )
+
+    def fail_connection_validation_job(self, job_id: str, summary: str) -> None:
+        with psycopg.connect(self._dsn) as connection:
+            connection.execute(
+                """
+                UPDATE connection_validation_job
+                SET state = 'failed', completed_at = now(), lease_expires_at = NULL,
+                    error_summary = %s
+                WHERE id = %s::uuid AND state IN ('queued', 'running')
+                """,
+                (summary[:500], job_id),
+            )
+
+    def connection_validation_job_state(self, tenant_id: str, connection_id: str) -> str:
+        with psycopg.connect(self._dsn) as connection:
+            connection.execute(
+                """
+                UPDATE connection_validation_job
+                SET state = 'failed', completed_at = now(), lease_expires_at = NULL,
+                    error_summary = CASE
+                      WHEN state = 'queued' THEN 'Validation dispatch timed out.'
+                      ELSE 'Validation worker lease expired.'
+                    END
+                WHERE tenant_id = %s::uuid AND connection_id = %s::uuid
+                  AND (
+                    (state = 'running' AND lease_expires_at < now())
+                    OR (state = 'queued' AND created_at < now() - interval '30 minutes')
+                  )
+                """,
+                (tenant_id, connection_id),
+            )
+            row = connection.execute(
+                """
+                SELECT state FROM connection_validation_job
+                WHERE tenant_id = %s::uuid AND connection_id = %s::uuid
+                  AND state IN ('queued', 'running')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (tenant_id, connection_id),
+            ).fetchone()
+        return "running" if row is not None else "idle"
 
     def create_connection(
         self,

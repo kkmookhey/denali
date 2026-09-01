@@ -9,9 +9,9 @@ from denali.store.repository import PostgresInventoryRepository
 
 
 def migrate_main() -> None:
-    dsn = os.environ.get("DENALI_DSN")
+    dsn = os.environ.get("DENALI_MIGRATION_DSN") or os.environ.get("DENALI_DSN")
     if not dsn:
-        raise SystemExit("DENALI_DSN is required")
+        raise SystemExit("DENALI_MIGRATION_DSN or DENALI_DSN is required")
     migrate(dsn)
 
 

@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import psycopg
 import pytest
 
 from denali.connections import (
@@ -247,6 +248,141 @@ def repository():
     migrate(DSN)
     tenant = str(uuid.uuid4())
     return tenant, PostgresInventoryRepository(DSN)
+
+
+def test_clerk_organization_mapping_is_stable_and_isolated(repository) -> None:
+    _, repo = repository
+
+    first = repo.resolve_tenant("org_DenaliPilotA")
+    assert repo.resolve_tenant("org_DenaliPilotA") == first
+    assert repo.resolve_tenant("org_DenaliPilotB") != first
+
+
+def test_clerk_tenants_cannot_cross_read_or_mutate_evidence_and_jobs(repository) -> None:
+    _, repo = repository
+    alpha = repo.resolve_tenant("org_IsolationAlpha")
+    beta = repo.resolve_tenant("org_IsolationBeta")
+    now = datetime.now(UTC)
+    repo.ingest(alpha, demo_batch(now))
+    repo.ingest_findings(alpha, demo_findings_batch(now))
+
+    alpha_asset = repo.list_assets(alpha)[0]
+    alpha_finding = repo.list_findings(alpha)[0]
+    assert repo.list_assets(beta) == []
+    assert repo.get_asset(beta, str(alpha_asset["id"])) is None
+    assert repo.list_findings(beta) == []
+    assert repo.get_finding(beta, str(alpha_finding["id"])) is None
+    assert (
+        repo.set_governance(
+            beta,
+            str(alpha_asset["id"]),
+            status="approved",
+        )
+        is None
+    )
+
+    connection_id = str(uuid.uuid4())
+    repo.create_connection(
+        alpha,
+        connection_id=connection_id,
+        provider="aws",
+        display_name="Tenant isolation connection",
+        credential_type="aws_assume_role",
+        credential_reference={
+            "role_arn": "arn:aws:iam::123456789012:role/DenaliSecurityAuditRole",
+            "external_id": "denali-tenant-isolation-fixture",
+        },
+        declared_scopes=[],
+        coverage_plan=[],
+        configuration={"account_id": "123456789012", "regions": []},
+    )
+    job, created = repo.create_connection_validation_job(
+        alpha,
+        connection_id,
+        wait_for_credentials=False,
+        wait_for_healthy=False,
+    )
+    assert created is True
+    assert repo.list_connections(beta) == []
+    assert repo.get_connection(beta, connection_id) is None
+    assert repo.connection_validation_job_state(beta, connection_id) == "idle"
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        repo.create_connection_validation_job(
+            beta,
+            connection_id,
+            wait_for_credentials=False,
+            wait_for_healthy=False,
+        )
+    repo.fail_connection_validation_job(str(job["id"]), "fixture cleanup")
+
+
+def test_connection_validation_jobs_are_deduplicated_and_expire(repository) -> None:
+    tenant, repo = repository
+    connection_id = str(uuid.uuid4())
+    repo.create_connection(
+        tenant,
+        connection_id=connection_id,
+        provider="aws",
+        display_name="Durable validation fixture",
+        credential_type="aws_assume_role",
+        credential_reference={
+            "role_arn": "arn:aws:iam::123456789012:role/DenaliSecurityAuditRole",
+            "external_id": "denali-durable-validation-fixture",
+        },
+        declared_scopes=[],
+        coverage_plan=[],
+        configuration={"account_id": "123456789012", "regions": []},
+    )
+
+    job, created = repo.create_connection_validation_job(
+        tenant,
+        connection_id,
+        wait_for_credentials=False,
+        wait_for_healthy=False,
+    )
+    duplicate, duplicate_created = repo.create_connection_validation_job(
+        tenant,
+        connection_id,
+        wait_for_credentials=False,
+        wait_for_healthy=False,
+    )
+    assert created is True
+    assert duplicate_created is False
+    assert duplicate["id"] == job["id"]
+    assert repo.connection_validation_job_state(tenant, connection_id) == "running"
+
+    claimed = repo.claim_connection_validation_job(str(job["id"]), lease_seconds=60)
+    assert claimed is not None
+    assert claimed["attempt_count"] == 1
+    assert repo.claim_connection_validation_job(str(job["id"]), lease_seconds=60) is None
+    repo.complete_connection_validation_job(str(job["id"]))
+    assert repo.connection_validation_job_state(tenant, connection_id) == "idle"
+
+    stale, stale_created = repo.create_connection_validation_job(
+        tenant,
+        connection_id,
+        wait_for_credentials=False,
+        wait_for_healthy=False,
+    )
+    assert stale_created is True
+    assert DSN
+    with psycopg.connect(DSN) as connection:
+        connection.execute(
+            """
+            UPDATE connection_validation_job
+            SET created_at = now() - interval '31 minutes'
+            WHERE id = %s::uuid
+            """,
+            (str(stale["id"]),),
+        )
+    assert repo.connection_validation_job_state(tenant, connection_id) == "idle"
+    with psycopg.connect(DSN) as connection:
+        state, error_summary = connection.execute(
+            "SELECT state, error_summary FROM connection_validation_job WHERE id = %s::uuid",
+            (str(stale["id"]),),
+        ).fetchone()
+    assert state == "failed"
+    assert error_summary == "Validation dispatch timed out."
 
 
 def test_connection_lifecycle_retains_collected_evidence(repository) -> None:

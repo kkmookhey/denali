@@ -21,6 +21,7 @@ services:
       dockerfile: Dockerfile.api
     environment:
       DENALI_DSN: postgresql://denali:denali-local@postgres:5432/denali
+      DENALI_AUTH_MODE: local
       DENALI_TENANT_ID: 00000000-0000-4000-8000-000000000001
       DENALI_WEB_URL: http://127.0.0.1:3080
       DENALI_AWS_ONBOARDING_BUCKET: ${DENALI_AWS_ONBOARDING_BUCKET:-}

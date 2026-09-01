@@ -35,10 +35,29 @@ import type {
 
 const API_BASE = "/api";
 
+export type DenaliContext = {
+  tenant_id: string;
+  organization_id: string | null;
+  role: "admin" | "member";
+  can_write: boolean;
+};
+
+type TokenProvider = () => Promise<string | null>;
+let tokenProvider: TokenProvider = async () => null;
+
+export function configureApiTokenProvider(provider: TokenProvider) {
+  tokenProvider = provider;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = await tokenProvider();
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...init?.headers,
+    },
   });
   if (!response.ok) {
     const contentType = response.headers.get("content-type") ?? "";
@@ -52,7 +71,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const token = await tokenProvider();
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!response.ok) throw new Error(`Request failed (${response.status})`);
+  return response.blob();
+}
+
 export const api = {
+  context: () => request<DenaliContext>("/v1/context"),
   connections: () => request<{ items: Connection[] }>("/v1/connections"),
   connection: (id: string) => request<Connection>(`/v1/connections/${id}`),
   createConnection: (connection: AwsConnectionCreate | AzureConnectionCreate | GcpConnectionCreate | GitHubConnectionCreate) =>
@@ -72,8 +101,8 @@ export const api = {
       `/v1/connections/${id}?confirm=${encodeURIComponent(confirmation)}`,
       { method: "DELETE" },
     ),
-  cloudFormationUrl: (id: string) =>
-    `${API_BASE}/v1/connections/${id}/aws/cloudformation.yaml`,
+  cloudFormationTemplate: (id: string) =>
+    requestBlob(`/v1/connections/${id}/aws/cloudformation.yaml`),
   launchCloudFormation: (id: string) =>
     request<AwsCloudFormationLaunch>(
       `/v1/connections/${id}/aws/cloudformation/launch`,

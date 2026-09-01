@@ -130,6 +130,11 @@ The local Compose runtime uses one configured tenant and has no end-user authent
 authorization layer. It is an evaluation and development stack, not a production deployment
 recipe. Data persists in the `denali-postgres` Docker volume.
 
+For the Clerk Organizations, Vercel, Modal, and Neon pilot deployment, follow the
+[hosted multi-tenant pilot runbook](docs/deployment/hosted-pilot.md). Hosted mode maps each
+active Clerk organization to a stable Denali tenant UUID, enforces admin-only mutations, and
+runs provider validation through durable Modal jobs.
+
 ## Run collectors and importers
 
 For CLI work, install the provider extras you need and point the commands at the local
@@ -218,8 +223,8 @@ Documented planned or deferred capabilities are not shipped:
 - Slack and Jira onboarding after GitHub acceptance.
 - Application-wide typography and clearer elapsed-time context during bounded cloud-IAM
   propagation waits.
-- Durable job and lease coordination for onboarding validation across API restarts or
-  multiple replicas.
+- Automatic collector scheduling after a connection validates; hosted connections still
+  validate access only and existing collectors remain operator-run.
 
 Prompt- and response-content telemetry is neither shipped nor silently planned into the
 current cloud roles. It remains an explicit product-policy decision that would require

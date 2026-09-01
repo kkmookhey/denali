@@ -7,8 +7,10 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,9 +22,18 @@ from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
+from denali.api.auth import (
+    AuthContext,
+    AuthenticationError,
+    AuthorizationError,
+    ClerkAuthenticator,
+    RequestAuthenticator,
+)
+from denali.api.validation import run_durable_validation_job
 from denali.connections import (
     AWS_COVERAGE_AUTOMATIC,
     AWS_COVERAGE_SELECTED,
@@ -57,6 +68,8 @@ from denali.domain import FindingBatch, InventoryBatch
 from denali.store.db import migrate
 from denali.store.repository import PostgresInventoryRepository
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_LOCAL_TENANT = "00000000-0000-4000-8000-000000000001"
 
 
@@ -64,6 +77,8 @@ class InventoryReader(Protocol):
     def ingest(self, tenant_id: str, batch: InventoryBatch) -> dict[str, int]: ...
 
     def ingest_findings(self, tenant_id: str, batch: FindingBatch) -> dict[str, int]: ...
+
+    def resolve_tenant(self, clerk_organization_id: str) -> str: ...
 
     def create_connection(
         self,
@@ -90,6 +105,17 @@ class InventoryReader(Protocol):
     def record_connection_validation(
         self, tenant_id: str, connection_id: str, validation: dict[str, Any]
     ) -> dict[str, Any] | None: ...
+
+    def create_connection_validation_job(
+        self,
+        tenant_id: str,
+        connection_id: str,
+        *,
+        wait_for_credentials: bool,
+        wait_for_healthy: bool,
+    ) -> tuple[dict[str, Any], bool]: ...
+
+    def connection_validation_job_state(self, tenant_id: str, connection_id: str) -> str: ...
 
     def record_connection_launch(
         self, tenant_id: str, connection_id: str, launch: dict[str, Any]
@@ -387,10 +413,19 @@ def create_app(
     onboarding_validation_timeout_seconds: int | None = None,
     onboarding_validation_retry_seconds: int | None = None,
     tenant_id: str | None = None,
+    auth_mode: Literal["local", "clerk"] | None = None,
+    authenticator: RequestAuthenticator | None = None,
+    validation_dispatcher: Callable[[str], str | None] | None = None,
     migrate_on_start: bool = True,
 ) -> FastAPI:
     configured_dsn = os.environ.get("DENALI_DSN")
     configured_tenant = tenant_id or os.environ.get("DENALI_TENANT_ID", DEFAULT_LOCAL_TENANT)
+    configured_auth_mode = auth_mode or os.environ.get("DENALI_AUTH_MODE", "local")
+    if configured_auth_mode not in {"local", "clerk"}:
+        raise ValueError("DENALI_AUTH_MODE must be 'local' or 'clerk'")
+    configured_authenticator = authenticator or (
+        ClerkAuthenticator.from_environment() if configured_auth_mode == "clerk" else None
+    )
     configured_launcher = cloudformation_launcher or _cloudformation_launcher_from_environment()
     configured_azure_launcher = azure_setup_launcher or _azure_setup_launcher_from_environment()
     configured_gcp_provisioner = (
@@ -427,6 +462,9 @@ def create_app(
         else:
             app.state.repository = None
         app.state.tenant_id = configured_tenant
+        app.state.auth_mode = configured_auth_mode
+        app.state.authenticator = configured_authenticator
+        app.state.validation_dispatcher = validation_dispatcher
         app.state.connection_validator = connection_validator or AwsConnectionValidator()
         app.state.azure_connection_validator = (
             azure_connection_validator or AzureConnectionValidator()
@@ -485,8 +523,57 @@ def create_app(
         allow_origins=_cors_origins(),
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Authorization", "Content-Type"],
     )
+
+    @app.middleware("http")
+    async def authenticate_request_context(request: Request, call_next: Callable[..., Any]):
+        if request.app.state.auth_mode == "local" or _is_public_request(request):
+            return await call_next(request)
+        authenticator = request.app.state.authenticator
+        if authenticator is None:
+            return JSONResponse(status_code=503, content={"detail": "authentication unavailable"})
+        try:
+            identity = await run_in_threadpool(authenticator.authenticate, request)
+        except AuthenticationError as error:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": str(error)},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        except AuthorizationError as error:
+            return JSONResponse(status_code=403, content={"detail": str(error)})
+
+        repo = request.app.state.repository
+        if repo is None:
+            return JSONResponse(
+                status_code=503, content={"detail": "Denali storage is not configured"}
+            )
+        resolve_tenant = getattr(repo, "resolve_tenant", None)
+        if resolve_tenant is None:
+            return JSONResponse(
+                status_code=503, content={"detail": "tenant mapping is not configured"}
+            )
+        tenant_id = await run_in_threadpool(resolve_tenant, identity.organization_id)
+        request.state.denali_auth = identity
+        request.state.denali_tenant_id = tenant_id
+        if _requires_admin(request) and not identity.can_write:
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "organization admin role is required"},
+            )
+        response = await call_next(request)
+        logger.info(
+            "authenticated API request",
+            extra={
+                "tenant_id": tenant_id,
+                "connection_id": request.path_params.get("connection_id"),
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+            },
+        )
+        return response
 
     def queue_validation(
         request: Request,
@@ -499,14 +586,6 @@ def create_app(
         wait_for_healthy: bool = False,
     ) -> dict[str, str]:
         connection_id = str(target["id"])
-        connection_key = (current_tenant, connection_id)
-        validation_lock = request.app.state.connection_validation_lock
-        active_validations = request.app.state.active_connection_validations
-        with validation_lock:
-            if connection_key in active_validations:
-                return {"status": "already_running", "connection_id": connection_id}
-            active_validations.add(connection_key)
-
         validators = {
             "aws": request.app.state.connection_validator,
             "azure": request.app.state.azure_connection_validator,
@@ -518,6 +597,51 @@ def create_app(
             raise HTTPException(status_code=503, detail="connection validator is not configured")
         retry_seconds = request.app.state.onboarding_validation_retry
         timeout_seconds = request.app.state.onboarding_validation_timeout
+
+        create_job = getattr(repo, "create_connection_validation_job", None)
+        if create_job is not None:
+            job, created = create_job(
+                current_tenant,
+                connection_id,
+                wait_for_credentials=wait_for_credentials,
+                wait_for_healthy=wait_for_healthy,
+            )
+            if not created:
+                return {"status": "already_running", "connection_id": connection_id}
+            job_id = str(job["id"])
+            dispatcher = request.app.state.validation_dispatcher
+            if dispatcher is not None:
+                try:
+                    call_id = dispatcher(job_id)
+                    if call_id:
+                        repo.set_connection_validation_call_id(job_id, call_id)  # type: ignore[attr-defined]
+                except Exception as error:
+                    repo.fail_connection_validation_job(  # type: ignore[attr-defined]
+                        job_id, "Unable to dispatch validation worker."
+                    )
+                    raise HTTPException(
+                        status_code=503, detail="Unable to dispatch connection validation"
+                    ) from error
+            else:
+                background_tasks.add_task(
+                    run_durable_validation_job,
+                    repo,
+                    validators,
+                    job_id,
+                    timeout_seconds=timeout_seconds,
+                    retry_seconds=retry_seconds,
+                )
+            return {"status": "started", "connection_id": connection_id}
+
+        # Injected in-memory repositories used by local contract tests retain the
+        # legacy runner; production Postgres always takes the durable path above.
+        connection_key = (current_tenant, connection_id)
+        validation_lock = request.app.state.connection_validation_lock
+        active_validations = request.app.state.active_connection_validations
+        with validation_lock:
+            if connection_key in active_validations:
+                return {"status": "already_running", "connection_id": connection_id}
+            active_validations.add(connection_key)
 
         def run_validation() -> None:
             deadline = monotonic() + timeout_seconds
@@ -734,6 +858,24 @@ def create_app(
     def health(request: Request) -> dict[str, str]:
         state = "ready" if request.app.state.repository is not None else "storage_unconfigured"
         return {"status": state, "version": app.version}
+
+    @app.get("/v1/context")
+    def request_context(request: Request) -> dict[str, Any]:
+        _, tenant_id = _context(request)
+        if request.app.state.auth_mode == "local":
+            return {
+                "tenant_id": tenant_id,
+                "organization_id": None,
+                "role": "admin",
+                "can_write": True,
+            }
+        identity: AuthContext = request.state.denali_auth
+        return {
+            "tenant_id": tenant_id,
+            "organization_id": identity.organization_id,
+            "role": identity.role,
+            "can_write": identity.can_write,
+        }
 
     @app.get("/v1/connections")
     def list_connections(request: Request) -> dict[str, Any]:
@@ -1330,10 +1472,8 @@ def create_app(
         state: str = Query(min_length=32, max_length=1024),
         installation_id: int = Query(gt=0),
     ) -> RedirectResponse:
-        repo, current_tenant = _context(request)
         state_tenant, connection_id = _github_state_context(state)
-        if state_tenant != current_tenant:
-            raise HTTPException(status_code=409, detail="GitHub setup state is invalid")
+        repo, current_tenant = _context_for_tenant(request, state_tenant)
         target = repo.get_connection_validation_target(current_tenant, connection_id)
         if target is None or target["provider"] != "github":
             raise HTTPException(status_code=404, detail="GitHub connection not found")
@@ -1375,10 +1515,8 @@ def create_app(
         state: str = Query(min_length=32, max_length=1024),
         code: str = Query(min_length=8, max_length=1024),
     ) -> RedirectResponse:
-        repo, current_tenant = _context(request)
         state_tenant, connection_id = _github_state_context(state)
-        if state_tenant != current_tenant:
-            raise HTTPException(status_code=409, detail="GitHub OAuth state is invalid")
+        repo, current_tenant = _context_for_tenant(request, state_tenant)
         target = repo.get_connection_validation_target(current_tenant, connection_id)
         if target is None or target["provider"] != "github":
             raise HTTPException(status_code=404, detail="GitHub connection not found")
@@ -1587,12 +1725,11 @@ def create_app(
     def disable_connection(request: Request, connection_id: UUID) -> dict[str, Any]:
         repo, current_tenant = _context(request)
         connection_key = (current_tenant, str(connection_id))
-        with request.app.state.connection_validation_lock:
-            if connection_key in request.app.state.active_connection_validations:
-                raise HTTPException(
-                    status_code=409,
-                    detail="wait for the active validation to finish before disabling",
-                )
+        if _connection_validation_state(request, *connection_key) == "running":
+            raise HTTPException(
+                status_code=409,
+                detail="wait for the active validation to finish before disabling",
+            )
         with request.app.state.github_collection_lock:
             if connection_key in request.app.state.active_github_collections:
                 raise HTTPException(
@@ -1918,7 +2055,23 @@ def _context(request: Request) -> tuple[InventoryReader, str]:
     repository = request.app.state.repository
     if repository is None:
         raise HTTPException(status_code=503, detail="Denali storage is not configured")
+    if request.app.state.auth_mode == "clerk":
+        tenant_id = getattr(request.state, "denali_tenant_id", None)
+        if tenant_id is None:
+            raise HTTPException(status_code=401, detail="authentication required")
+        return repository, str(tenant_id)
     return repository, request.app.state.tenant_id
+
+
+def _context_for_tenant(request: Request, tenant_id: str) -> tuple[InventoryReader, str]:
+    repository = request.app.state.repository
+    if repository is None:
+        raise HTTPException(status_code=503, detail="Denali storage is not configured")
+    try:
+        normalized = str(UUID(tenant_id))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail="provider setup state is invalid") from error
+    return repository, normalized
 
 
 def _with_validation_state(
@@ -1926,9 +2079,9 @@ def _with_validation_state(
 ) -> dict[str, Any]:
     result = dict(row)
     connection_key = (tenant_id, str(result["id"]))
-    with request.app.state.connection_validation_lock:
-        running = connection_key in request.app.state.active_connection_validations
-    result["validation_state"] = "running" if running else "idle"
+    result["validation_state"] = _connection_validation_state(
+        request, tenant_id, str(result["id"])
+    )
     with request.app.state.github_collection_lock:
         collecting = connection_key in request.app.state.active_github_collections
         collection_result = request.app.state.github_collection_results.get(connection_key)
@@ -1984,6 +2137,45 @@ def _with_validation_state(
         ),
     }
     return result
+
+
+def _connection_validation_state(
+    request: Request, tenant_id: str, connection_id: str
+) -> str:
+    repository = request.app.state.repository
+    durable_state = getattr(repository, "connection_validation_job_state", None)
+    if durable_state is not None:
+        return str(durable_state(tenant_id, connection_id))
+    connection_key = (tenant_id, connection_id)
+    with request.app.state.connection_validation_lock:
+        running = connection_key in request.app.state.active_connection_validations
+    return "running" if running else "idle"
+
+
+def _is_public_request(request: Request) -> bool:
+    if request.method == "OPTIONS":
+        return True
+    if request.url.path in {
+        "/",
+        "/healthz",
+        "/openapi.json",
+        "/docs",
+        "/docs/oauth2-redirect",
+        "/redoc",
+        "/v1/connections/github/setup/callback",
+        "/v1/connections/github/oauth/callback",
+    }:
+        return True
+    return False
+
+
+def _requires_admin(request: Request) -> bool:
+    return request.url.path.startswith("/v1/") and request.method in {
+        "POST",
+        "PATCH",
+        "PUT",
+        "DELETE",
+    }
 
 
 def _cloudformation_launcher_from_environment() -> AwsCloudFormationLauncher | None:
@@ -2052,17 +2244,24 @@ def _github_app_from_environment() -> GitHubAppClient | None:
     client_id = os.environ.get("DENALI_GITHUB_CLIENT_ID")
     client_secret = os.environ.get("DENALI_GITHUB_CLIENT_SECRET")
     app_slug = os.environ.get("DENALI_GITHUB_APP_SLUG")
+    private_key_value = os.environ.get("DENALI_GITHUB_PRIVATE_KEY")
     private_key_file = os.environ.get("DENALI_GITHUB_PRIVATE_KEY_FILE")
     callback_url = os.environ.get(
         "DENALI_GITHUB_CALLBACK_URL",
         "http://127.0.0.1:8088/v1/connections/github/oauth/callback",
     )
     web_url = os.environ.get("DENALI_WEB_URL", "http://127.0.0.1:3080")
-    if not all((app_id, client_id, client_secret, app_slug, private_key_file)):
+    if not all((app_id, client_id, client_secret, app_slug)) or not (
+        private_key_value or private_key_file
+    ):
         return None
     if not str(app_id).isdigit():
         raise ValueError("DENALI_GITHUB_APP_ID must be a positive integer")
-    private_key = Path(str(private_key_file)).read_text(encoding="utf-8")
+    private_key = (
+        str(private_key_value).replace("\\n", "\n")
+        if private_key_value
+        else Path(str(private_key_file)).read_text(encoding="utf-8")
+    )
     return GitHubAppClient(
         app_id=int(str(app_id)),
         client_id=str(client_id),
