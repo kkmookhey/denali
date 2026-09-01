@@ -125,6 +125,12 @@ only these two values:
 | `VITE_CLERK_PUBLISHABLE_KEY` | Clerk publishable key | Public client configuration |
 | `MODAL_API_ORIGIN` | Deployed Modal origin, without trailing slash | Public server configuration |
 
+For the first URL-reservation deployment, when Modal is not deployed yet, set
+`MODAL_API_ORIGIN=https://example.com`. This is a temporary non-secret placeholder: the UI will
+build and publish, while `/api/*` remains intentionally unusable. Record Vercel's production URL,
+use it to configure Clerk and Modal, deploy Modal, then replace the placeholder with the real
+Modal origin and redeploy Vercel.
+
 - [ ] Add both values for Production and Preview as appropriate.
 - [ ] Deploy the project and attach the chosen domain.
 - [ ] Verify `/`, an authenticated refresh, SPA navigation, and `/api/healthz`.
