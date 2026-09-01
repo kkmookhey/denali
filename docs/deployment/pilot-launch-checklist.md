@@ -7,33 +7,43 @@ input to Clerk and provider callbacks, and the Modal URL is an input to Vercel.
 
 - [x] Hosted multi-tenant application code is implemented and committed.
 - [x] The configured Clerk development publishable key resolves to a live Clerk JWKS endpoint.
-- [ ] Select the permanent production URL. `https://denali.example.com` is still a placeholder.
-- [ ] Add the Clerk backend key material and finish the production Clerk configuration.
+- [x] Select `https://denali.transilience.cloud` as the permanent production URL.
+- [x] Store the Clerk backend key material in Modal. The pilot still uses a Clerk development
+  instance and requires hosted organization acceptance before launch approval.
 - [x] Provision Neon database `denali`; pooled/direct connection strings are stored in Modal.
 - [x] Apply all 12 migrations through `012_tenant_connection_constraints.sql`.
 - [x] Create Modal environment `denali-prod` and its current `custom-secret`.
-- [ ] Add the production origin settings to `custom-secret`, then deploy the Modal API/worker.
-- [x] Create Vercel project `transilience/denali`.
-- [ ] Configure and deploy the Vercel project. It has not been deployed yet.
+- [x] Add the production origin settings and deploy the Modal API/worker in `us-east`.
+- [x] Configure and deploy Vercel project `transilience/denali` under `transilience-pro`.
+- [x] Verify the canonical frontend and same-origin API boundary: `/` returns `200`,
+  `/api/healthz` returns `200`, and unauthenticated `/api/v1/context` returns `401`.
 - [ ] Complete two-organization Clerk acceptance.
 - [ ] Configure and accept AWS, Azure, GCP, and GitHub individually.
+
+Production runtime:
+
+```text
+Web:   https://denali.transilience.cloud
+API:   https://transilience-denali-prod--denali-production-api.modal.run
+Neon:  database denali; migrations 001 through 012 applied
+```
 
 ## Ordered TODOs
 
 ### 1. Choose the production URL and regions
 
-- [ ] Choose the final web URL, for example `https://denali.company.com`.
-- [ ] Choose a Neon region and a compatible nearby Modal region.
-- [ ] Reserve the custom domain, or create the Vercel project name now so its stable
+- [x] Choose the final web URL: `https://denali.transilience.cloud`.
+- [x] Use Neon in AWS `us-east-2` and Modal in `us-east`.
+- [x] Reserve the custom domain and create the Vercel project so its stable
   `<project>.vercel.app` URL is known.
 
 Record these non-secret values:
 
 ```text
-DENALI_WEB_URL=https://<production-domain>
-DENALI_CORS_ORIGINS=https://<production-domain>
-CLERK_AUTHORIZED_PARTIES=https://<production-domain>
-DENALI_MODAL_REGION=<modal-region>
+DENALI_WEB_URL=https://denali.transilience.cloud
+DENALI_CORS_ORIGINS=https://denali.transilience.cloud
+CLERK_AUTHORIZED_PARTIES=https://denali.transilience.cloud
+DENALI_MODAL_REGION=us-east
 ```
 
 ### 2. Finish Clerk
@@ -61,10 +71,10 @@ Never add `CLERK_SECRET_KEY` to Vercel or any `VITE_...` variable.
 
 ### 3. Provision Neon
 
-- [ ] Create a PostgreSQL project in the selected region.
+- [x] Create a PostgreSQL project in the selected region.
 - [ ] Create a least-privilege runtime role and a migration/owner role.
-- [ ] Obtain the pooled PgBouncer runtime URL and direct migration URL with TLS required.
-- [ ] Store both only in Modal, never in Vercel.
+- [x] Obtain the pooled PgBouncer runtime URL and direct migration URL with TLS required.
+- [x] Store both only in Modal, never in Vercel.
 - [ ] Enable backups and record a restore-test procedure.
 
 | Variable | Value | Destination | Classification |
@@ -94,7 +104,7 @@ Then create or replace the named Modal secret without placing values in shell hi
 modal secret create --from-dotenv .env.modal.production denali-production
 ```
 
-- [ ] Confirm `modal secret list` includes `denali-production`.
+- [x] Confirm `modal secret list --env denali-prod` includes the deployed `custom-secret`.
 - [ ] Keep `.env.modal.production` local and ignored; do not commit or send it in chat.
 
 ### 5. Migrate and deploy Modal
@@ -111,8 +121,8 @@ modal run modal_app.py::database_status
 modal deploy modal_app.py
 ```
 
-- [ ] Record the deployed Modal `api` HTTPS origin.
-- [ ] Verify `<modal-origin>/healthz` returns `{"status":"ok"}`.
+- [x] Record the deployed Modal `api` HTTPS origin.
+- [x] Verify `<modal-origin>/healthz` returns `{"status":"ready","version":"0.1.0"}`.
 - [ ] Enable Modal failure and timeout alerts.
 
 ### 6. Create and deploy Vercel
@@ -131,18 +141,19 @@ build and publish, while `/api/*` remains intentionally unusable. Record Vercel'
 use it to configure Clerk and Modal, deploy Modal, then replace the placeholder with the real
 Modal origin and redeploy Vercel.
 
-- [ ] Add both values for Production and Preview as appropriate.
-- [ ] Deploy the project and attach the chosen domain.
-- [ ] Verify `/`, an authenticated refresh, SPA navigation, and `/api/healthz`.
-- [ ] Confirm no Clerk, Neon, Modal, or provider secret exists in Vercel.
+- [x] Add both values for Production, Preview, and Development.
+- [x] Deploy the project and attach `denali.transilience.cloud`.
+- [ ] Verify an authenticated refresh and SPA navigation. Unauthenticated `/` and
+  `/api/healthz` are verified.
+- [x] Confirm Vercel contains only the public Clerk publishable key and Modal origin.
 
 ### 7. Reconcile the final URL
 
 If the deployed URL differs from step 1, update all of these together and redeploy:
 
-- [ ] `DENALI_WEB_URL`
-- [ ] `DENALI_CORS_ORIGINS`
-- [ ] `CLERK_AUTHORIZED_PARTIES`
+- [x] `DENALI_WEB_URL`
+- [x] `DENALI_CORS_ORIGINS`
+- [x] `CLERK_AUTHORIZED_PARTIES`
 - [ ] Clerk allowed origins and redirect URLs
 - [ ] `DENALI_AZURE_CONSENT_REDIRECT_URI`
 - [ ] `DENALI_GITHUB_CALLBACK_URL`
