@@ -240,10 +240,11 @@ def test_exact_resource_name_boundary_excludes_other_project_services() -> None:
         project_id=PROJECT,
         asset_client=client,
         included_resource_names=(selected["name"],),
+        resource_display_names={selected["name"]: "Summit"},
     ).collect()
 
     assert {item.display_name for item in batch.assets} == {
-        "summit",
+        "Summit",
         f"summit@{PROJECT}.iam.gserviceaccount.com",
     }
     run_coverage = next(
@@ -345,7 +346,16 @@ def test_connection_collector_uses_selected_project_number_and_persists_batch() 
             "configuration": {
                 "projects": [
                     {"id": PROJECT, "number": "123456789012", "name": "Denali Test"}
-                ]
+                ],
+                "resource_names": [
+                    f"//run.googleapis.com/projects/{PROJECT}/locations/us-central1/services/denali-ai"
+                ],
+                "resource_display_names": {
+                    (
+                        f"//run.googleapis.com/projects/{PROJECT}/locations/"
+                        "us-central1/services/denali-ai"
+                    ): "Summit"
+                },
             },
         },
         repository=sink,
@@ -353,5 +363,9 @@ def test_connection_collector_uses_selected_project_number_and_persists_batch() 
 
     assert principals == ["denali@operator.iam.gserviceaccount.com"]
     assert len(sink.batches) == 1
+    assert {item.display_name for item in sink.batches[0].assets} == {
+        "Summit",
+        f"denali-ai@{PROJECT}.iam.gserviceaccount.com",
+    }
     assert result["state"] == "complete"
     assert result["projects"][0]["ai_workloads"] == 1

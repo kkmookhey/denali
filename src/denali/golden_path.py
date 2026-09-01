@@ -239,6 +239,10 @@ def _verify_connection_boundary(
             boundary.get("resource_names", [])
         ):
             failures.append("GCP exact resource-name boundary differs")
+        if configuration.get("resource_display_names", {}) != boundary.get(
+            "resource_display_names", {}
+        ):
+            failures.append("GCP resource display-name boundary differs")
 
 
 def _tenant_counts(connection: Any, tenant_id: str) -> dict[str, int]:

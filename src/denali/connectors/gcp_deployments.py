@@ -152,10 +152,10 @@ class GcpConnectionDeploymentCollector:
             raise ValueError("disabled Google Cloud connections cannot collect")
         if GCP_SCOPE_CODE_TO_CLOUD not in connection.get("declared_scopes", []):
             raise ValueError("Google Cloud code-to-cloud scope is not declared")
-        projects = connection.get("configuration", {}).get("projects", [])
-        configured_resource_names = connection.get("configuration", {}).get(
-            "resource_names"
-        )
+        configuration = connection.get("configuration", {})
+        projects = configuration.get("projects", [])
+        configured_resource_names = configuration.get("resource_names")
+        configured_display_names = configuration.get("resource_display_names")
         principal = connection.get("credential_reference", {}).get("principal_email")
         if not isinstance(projects, list) or not projects or not isinstance(principal, str):
             raise ValueError("complete Google Cloud project selection before collecting")
@@ -165,6 +165,22 @@ class GcpConnectionDeploymentCollector:
             or any(not isinstance(item, str) for item in configured_resource_names)
         ):
             raise ValueError("Google Cloud resource_names must be a non-empty string list")
+        if configured_display_names is not None and (
+            not isinstance(configured_display_names, dict)
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not value.strip()
+                for key, value in configured_display_names.items()
+            )
+        ):
+            raise ValueError("Google Cloud resource_display_names must map strings to names")
+        if configured_resource_names is not None and configured_display_names is not None:
+            undeclared_names = set(configured_display_names) - set(configured_resource_names)
+            if undeclared_names:
+                raise ValueError(
+                    "Google Cloud resource_display_names must stay inside resource_names"
+                )
 
         client = self._asset_client_factory(principal)
         project_results: list[dict[str, Any]] = []
@@ -186,6 +202,7 @@ class GcpConnectionDeploymentCollector:
                     if configured_resource_names is not None
                     else None
                 ),
+                resource_display_names=configured_display_names,
             ).collect(connection_id=str(connection["id"]))
             repository.ingest(tenant_id, batch)
             states = {item.state for item in batch.coverage}
@@ -238,6 +255,7 @@ class GcpDeploymentConnector:
         asset_client: GcpAssetClient,
         project_number: str | None = None,
         included_resource_names: tuple[str, ...] | None = None,
+        resource_display_names: dict[str, str] | None = None,
     ):
         if not valid_gcp_project_id(project_id):
             raise ValueError("Google Cloud project ID has an invalid shape")
@@ -249,6 +267,7 @@ class GcpDeploymentConnector:
         self.included_resource_names = (
             frozenset(included_resource_names) if included_resource_names is not None else None
         )
+        self.resource_display_names = dict(resource_display_names or {})
 
     def collect(self, *, connection_id: str | None = None) -> InventoryBatch:
         observed_at = datetime.now(UTC)
@@ -314,6 +333,9 @@ class GcpDeploymentConnector:
                     continue
                 if parsed is None:
                     continue
+                parsed["display_name"] = self.resource_display_names.get(
+                    parsed["natural_key"], parsed["name"]
+                )
                 cloud_ref, cloud_assertion, workload_assertion, identity_assertion = (
                     _asset_assertions(parsed, observed_at, inventory_plane)
                 )
@@ -542,7 +564,7 @@ def _asset_assertions(
     cloud_assertion = AssetAssertion(
         asset=cloud_ref,
         coverage_plane=plane,
-        display_name=parsed["name"],
+        display_name=parsed["display_name"],
         assertion_type=AssertionType.OBSERVED,
         confidence=1.0,
         evidence=evidence,
@@ -578,7 +600,7 @@ def _asset_assertions(
     workload_assertion = AssetAssertion(
         asset=AssetRef(AssetKind.AI_WORKLOAD, parsed["natural_key"]),
         coverage_plane=plane,
-        display_name=parsed["name"],
+        display_name=parsed["display_name"],
         assertion_type=AssertionType.OBSERVED,
         confidence=1.0,
         evidence=evidence,

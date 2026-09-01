@@ -49,6 +49,7 @@ import { api } from "./api";
 import {
   closeDrawerTransition,
   drawerTabTransition,
+  inventoryQuery,
   navigationFromUrl,
   navigationUrl,
   openDrawerTransition,
@@ -58,6 +59,7 @@ import {
   type NavigationLocation,
   type Page,
 } from "./navigation";
+import { applicableDetectionEvaluations } from "./presentation";
 import type {
   Asset,
   AssetDetail,
@@ -412,8 +414,8 @@ function App() {
     setSidebarOpen(false);
   }
 
-  function openInventory(kind = "all") {
-    commitNavigation("inventory", kind === "all" ? {} : { kind }, "push");
+  function openInventory(kind: unknown = "all") {
+    commitNavigation("inventory", inventoryQuery(kind), "push");
     setSidebarOpen(false);
   }
 
@@ -500,7 +502,6 @@ function App() {
               summary={summary}
               assets={assets}
               coverage={coverage}
-              issueSummary={issueSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
               issues={issues}
               vulnerabilitySummary={vulnerabilitySummary ?? {
                 total: 0,
@@ -512,7 +513,6 @@ function App() {
               }}
               activitySummary={activitySummary ?? { total: 0, last_24h: 0, providers: 0, failures: 0, fixture_total: 0, by_category: {} }}
               activities={activities}
-              detectionSummary={detectionSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
               deployments={deployments}
               onOpenAsset={(id) => openDrawer("asset", id)}
               onOpenIssue={(id) => openDrawer("issue", id)}
@@ -588,6 +588,7 @@ function App() {
               summary={detectionSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
               detections={detections}
               evaluations={detectionEvaluations}
+              coverage={coverage}
               navigation={filterNavigation}
               onOpenDetection={(id) => openDrawer("detection", id)}
             />
@@ -752,12 +753,10 @@ function Dashboard({
   summary,
   assets,
   coverage,
-  issueSummary,
   issues,
   vulnerabilitySummary,
   activitySummary,
   activities,
-  detectionSummary,
   deployments,
   onOpenAsset,
   onOpenIssue,
@@ -768,12 +767,10 @@ function Dashboard({
   summary: Summary;
   assets: Asset[];
   coverage: Coverage[];
-  issueSummary: IssueSummary;
   issues: Issue[];
   vulnerabilitySummary: VulnerabilitySummary;
   activitySummary: RuntimeActivitySummary;
   activities: RuntimeActivity[];
-  detectionSummary: RuntimeDetectionSummary;
   deployments: CodeToCloudDeployment[];
   onOpenAsset: (id: string) => void;
   onOpenIssue: (id: string) => void;
@@ -781,8 +778,10 @@ function Dashboard({
   onViewSources: () => void;
   onNavigate: (page: Page) => void;
 }) {
-  const unreviewed = summary.by_governance.unreviewed ?? 0;
-  const verified = assets.filter((asset) => asset.assertion_type === "externally_verified").length;
+  const unreviewedWorkloads = assets.filter(
+    (asset) => asset.kind === "ai_workload" && asset.governance_status === "unreviewed",
+  ).length;
+  const provenDeployments = deployments.length;
   const complete = coverage.filter((item) => item.state === "complete").length;
   const allComplete = coverage.length > 0 && complete === coverage.length;
   const incompleteCoverage = coverage.length - complete;
@@ -791,10 +790,6 @@ function Dashboard({
   const priorityIssue = [...issues]
     .filter((issue) => issue.state === "open")
     .sort((left, right) => (severityRank[right.severity] ?? 0) - (severityRank[left.severity] ?? 0) || right.confidence - left.confidence)[0];
-  const unreviewedApps = assets.filter((asset) => asset.kind === "ai_application" && asset.governance_status === "unreviewed").length;
-  const successfulAppSignIns = activities.filter((activity) => activity.category === "ai_app_sign_in" && activity.outcome === "success").length;
-  const openIssues = issueSummary.by_state.open ?? 0;
-  const openDetections = detectionSummary.by_state.open ?? 0;
   const criticalVulnerabilityOccurrences = vulnerabilitySummary.open_by_severity.critical ?? 0;
   const fixableVulnerabilityOccurrences = vulnerabilitySummary.open_by_fix_state.fixed ?? 0;
   const timestamps = [
@@ -838,12 +833,12 @@ function Dashboard({
               </span>
               <ChevronRight size={19} />
             </button>
-            <button className="brief-priority" onClick={() => onNavigate("shadowAi")}>
+            <button className="brief-priority" onClick={() => onViewInventory("ai_workload")}>
               <span className="priority-number">02</span>
               <span className="priority-copy">
-                <small>SHADOW AI & GOVERNANCE</small>
-                <strong>{unreviewedApps === 0 ? "No discovered AI applications await review" : `${unreviewedApps} discovered AI application${unreviewedApps === 1 ? "" : "s"} await review`}</strong>
-                <span>{successfulAppSignIns} successful sign-in{successfulAppSignIns === 1 ? "" : "s"} retained · use observed, ownership unproven</span>
+                <small>AI WORKLOAD GOVERNANCE</small>
+                <strong>{unreviewedWorkloads === 0 ? "No observed AI workloads await review" : `${unreviewedWorkloads} observed AI workload${unreviewedWorkloads === 1 ? "" : "s"} await review`}</strong>
+                <span>Observed in cloud control planes · governance decisions remain with your team</span>
               </span>
               <ChevronRight size={19} />
             </button>
@@ -870,30 +865,30 @@ function Dashboard({
             <span><strong>{complete}/{coverage.length} collection planes complete</strong><small>{allComplete ? "Declared coverage is current" : "Some declared coverage is incomplete"}</small></span>
           </div>
           <div className="evidence-boundary-list">
-            <button className="evidence-boundary-item proven" onClick={() => onNavigate("issues")}>
+            <button className="evidence-boundary-item proven" onClick={() => onNavigate("codeToCloud")}>
               <span>PROVEN</span>
-              <strong>{verified} verified assertions</strong>
-              <small>{openIssues + openDetections} evaluated conclusion{openIssues + openDetections === 1 ? "" : "s"} retained</small>
+              <strong>{provenDeployments} proven deployment link{provenDeployments === 1 ? "" : "s"}</strong>
+              <small>Exact source declaration + independently observed cloud identity</small>
               <ChevronRight size={16} />
             </button>
-            <button className="evidence-boundary-item undecided" onClick={() => onNavigate("shadowAi")}>
+            <button className="evidence-boundary-item undecided" onClick={() => onViewInventory("ai_workload")}>
               <span>NEEDS DECISION</span>
-              <strong>{unreviewed} governance review{unreviewed === 1 ? "" : "s"}</strong>
+              <strong>{unreviewedWorkloads} AI workload review{unreviewedWorkloads === 1 ? "" : "s"}</strong>
               <small>{incompleteCoverage === 0 ? "No declared collection gap" : `${incompleteCoverage} incomplete collection plane${incompleteCoverage === 1 ? "" : "s"}`}</small>
               <ChevronRight size={16} />
             </button>
           </div>
           <div className="evidence-rail-actions">
             <button onClick={onViewSources}>Inspect evidence sources <ChevronRight size={15} /></button>
-            <button onClick={() => onNavigate("shadowAi")}>Review governance <ChevronRight size={15} /></button>
+            <button onClick={() => onViewInventory("ai_workload")}>Review workload governance <ChevronRight size={15} /></button>
           </div>
         </aside>
       </section>
 
       <section className="metric-grid">
-        <MetricCard icon={Boxes} color="coral" label="Known resources" value={summary.total} detail={`${kinds.length} normalized resource types`} onClick={onViewInventory} />
-        <MetricCard icon={CircleHelp} color="amber" label="Awaiting review" value={unreviewed} detail="Needs governance decision" onClick={() => onNavigate("shadowAi")} />
-        <MetricCard icon={ShieldCheck} color="green" label="Verified assertions" value={verified} detail={`${Math.round((verified / Math.max(assets.length, 1)) * 100)}% of active inventory`} onClick={onViewInventory} />
+        <MetricCard icon={Boxes} color="coral" label="Known resources" value={summary.total} detail={`${kinds.length} normalized resource types`} onClick={() => onViewInventory()} />
+        <MetricCard icon={CircleHelp} color="amber" label="AI workloads to review" value={unreviewedWorkloads} detail="Governance state not yet decided" onClick={() => onViewInventory("ai_workload")} />
+        <MetricCard icon={ShieldCheck} color="green" label="Proven deployments" value={provenDeployments} detail="Exact source + cloud identity" onClick={() => onNavigate("codeToCloud")} />
         <MetricCard icon={Activity} color="blue" label="Runtime observations" value={activitySummary.total} detail={`${activitySummary.last_24h} observed in the last 24 hours`} onClick={() => onNavigate("runtime")} />
       </section>
 
@@ -944,9 +939,11 @@ function GoldenPath({
   deployments: CodeToCloudDeployment[];
   onOpen: () => void;
 }) {
-  const ordered = [...deployments].sort((left, right) =>
-    left.workload_natural_key.localeCompare(right.workload_natural_key),
-  );
+  const ordered = [...deployments].sort((left, right) => {
+    const providerOrder = Number(!left.workload_natural_key.startsWith("arn:aws:")) -
+      Number(!right.workload_natural_key.startsWith("arn:aws:"));
+    return providerOrder || left.workload_natural_key.localeCompare(right.workload_natural_key);
+  });
   return (
     <section className="golden-path-panel">
       <div className="golden-path-head">
@@ -961,6 +958,10 @@ function GoldenPath({
         {ordered.map((deployment, index) => {
           const provider = deployment.workload_natural_key.startsWith("arn:aws:") ? "AWS" : "GCP";
           const repositorySlug = deployment.repository_natural_key.split("/").at(-1) ?? deployment.repository_name;
+          const rawWorkloadName = deployment.workload_natural_key.split(/[/:]/).at(-1) ?? deployment.workload_name;
+          const applicationName = deployment.workload_name !== rawWorkloadName
+            ? deployment.workload_name
+            : titleCase(repositorySlug.replaceAll("-", " "));
           const location = provider === "AWS"
             ? deployment.workload_natural_key.split(":")[3]
             : deployment.workload_natural_key.match(/\/locations\/([^/]+)/)?.[1];
@@ -969,7 +970,7 @@ function GoldenPath({
               <span className={`golden-path-number ${provider.toLowerCase()}`}>{String(index + 1).padStart(2, "0")}</span>
               <span className="golden-path-copy">
                 <small>{provider} · {location ?? "cloud runtime"}</small>
-                <strong>{titleCase(repositorySlug.replaceAll("-", " "))}</strong>
+                <strong>{applicationName}</strong>
                 <code>{deployment.repository_natural_key}</code>
               </span>
               <span className="golden-path-link"><GitBranch size={15} /><i /><ShieldCheck size={15} /></span>
@@ -1887,7 +1888,7 @@ function RuntimeActivityPage({
   </div>;
 }
 
-function RuntimeMetric({ icon: Icon, tone, label, value, detail }: { icon: LucideIcon; tone: string; label: string; value: number; detail: string }) {
+function RuntimeMetric({ icon: Icon, tone, label, value, detail }: { icon: LucideIcon; tone: string; label: string; value: number | string; detail: string }) {
   return <div className={`runtime-metric ${tone}`}><span><Icon /></span><div><small>{label}</small><strong>{value}</strong><em>{detail}</em></div></div>;
 }
 
@@ -1945,12 +1946,14 @@ function RuntimeDetectionsPage({
   summary,
   detections,
   evaluations,
+  coverage,
   navigation,
   onOpenDetection,
 }: {
   summary: RuntimeDetectionSummary;
   detections: RuntimeDetection[];
   evaluations: RuntimeDetectionEvaluation[];
+  coverage: Coverage[];
   navigation: FilterNavigation;
   onOpenDetection: (id: string) => void;
 }) {
@@ -1964,18 +1967,23 @@ function RuntimeDetectionsPage({
       (severity === "all" || item.severity === severity) &&
       (state === "all" || item.state === state);
   }), [detections, search, severity, state]);
-  const complete = evaluations.filter((item) => item.state === "complete").length;
+  const applicableEvaluations = useMemo(
+    () => applicableDetectionEvaluations(evaluations, detections, coverage),
+    [coverage, detections, evaluations],
+  );
+  const complete = applicableEvaluations.filter((item) => item.state === "complete").length;
 
   return <div className="page-stack detections-page">
-    <section className="page-intro"><div><span className="eyebrow">EVALUATED BEHAVIOR</span><h2>Investigate behavior that crossed an explicit threshold.</h2><p>Evidence-led detections derived from immutable runtime observations. A detection is a reviewable conclusion, not a confirmed incident.</p></div><div className="result-count"><strong>{summary.by_state.open ?? 0}</strong><span>open runtime detections</span><small>{evaluations.length} bounded rules evaluated</small></div></section>
+    <section className="page-intro"><div><span className="eyebrow">EVALUATED BEHAVIOR</span><h2>Investigate behavior that crossed an explicit threshold.</h2><p>Evidence-led detections derived from immutable runtime observations. A detection is a reviewable conclusion, not a confirmed incident.</p></div><div className="result-count"><strong>{summary.by_state.open ?? 0}</strong><span>open runtime detections</span><small>{applicableEvaluations.length} applicable rules evaluated</small></div></section>
     <section className="runtime-metric-grid">
       <RuntimeMetric icon={Gauge} tone="total" label="Open detections" value={summary.by_state.open ?? 0} detail="evaluated conclusions" />
       <RuntimeMetric icon={CircleAlert} tone="failures" label="High severity" value={summary.open_by_severity.high ?? 0} detail="open detections" />
       <RuntimeMetric icon={Activity} tone="recent" label="Medium severity" value={summary.open_by_severity.medium ?? 0} detail="open detections" />
-      <RuntimeMetric icon={ShieldCheck} tone="providers" label="Coverage complete" value={complete} detail={`of ${evaluations.length} rule evaluations`} />
+      <RuntimeMetric icon={ShieldCheck} tone="providers" label="Applicable rule coverage" value={applicableEvaluations.length === 0 ? "N/A" : complete} detail={applicableEvaluations.length === 0 ? "No rules apply to collected sources" : `of ${applicableEvaluations.length} rule evaluations complete`} />
     </section>
     <section className="detection-coverage-grid" aria-label="Detection rule coverage">
-      {evaluations.map((item) => <div className={`detection-coverage-card ${item.state}`} key={item.rule_uid}><span className="detection-coverage-icon">{item.state === "complete" ? <CircleCheck /> : <CircleAlert />}</span><div><strong>{detectionRuleName(item.rule_uid)}</strong><small>{item.rule_uid}</small><p>{item.detail ?? `${item.confirmed_detections} confirmed; ${item.incomplete_candidates} incomplete candidates.`}</p></div><span className="detection-coverage-state">{titleCase(item.state)}</span></div>)}
+      {applicableEvaluations.map((item) => <div className={`detection-coverage-card ${item.state}`} key={item.rule_uid}><span className="detection-coverage-icon">{item.state === "complete" ? <CircleCheck /> : <CircleAlert />}</span><div><strong>{detectionRuleName(item.rule_uid)}</strong><small>{item.rule_uid}</small><p>{item.detail ?? `${item.confirmed_detections} confirmed; ${item.incomplete_candidates} incomplete candidates.`}</p></div><span className="detection-coverage-state">{titleCase(item.state)}</span></div>)}
+      {applicableEvaluations.length === 0 && <div className="lineage-trust-banner detection-applicability-empty"><CircleHelp /><div><strong>No runtime detection rules apply to the collected sources</strong><p>Connect a supported activity source to evaluate its bounded behavior rules. This is an applicability boundary, not evidence that runtime risk is absent.</p></div><span>NOT APPLICABLE</span></div>}
     </section>
     <section className="panel detections-panel">
       <div className="filterbar">

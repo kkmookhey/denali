@@ -5,6 +5,7 @@ import {
   closeDrawerTransition,
   drawerTabTransition,
   drawerTabs,
+  inventoryQuery,
   navigationFromUrl,
   navigationUrl,
   openDrawerTransition,
@@ -12,6 +13,15 @@ import {
   withoutDrawer,
   type Page,
 } from "../src/navigation.ts";
+
+test("inventory navigation accepts resource kinds but never serializes click events", () => {
+  assert.equal(navigationUrl("inventory", inventoryQuery("ai_workload")), "/inventory?kind=ai_workload");
+  assert.equal(navigationUrl("inventory", inventoryQuery("all")), "/inventory");
+  assert.equal(
+    navigationUrl("inventory", inventoryQuery({ type: "click", currentTarget: {} })),
+    "/inventory",
+  );
+});
 
 test("every product page has a refresh-safe canonical path", () => {
   for (const [page, path] of Object.entries(PAGE_PATHS)) {

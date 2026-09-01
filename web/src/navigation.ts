@@ -121,6 +121,10 @@ export function navigationUrl(
   return `${PAGE_PATHS[page]}${suffix ? `?${suffix}` : ""}`;
 }
 
+export function inventoryQuery(kind: unknown): Record<string, string> {
+  return typeof kind === "string" && kind !== "all" ? { kind } : {};
+}
+
 export function queryWith(
   current: Readonly<Record<string, string>>,
   updates: Readonly<Record<string, string | null | undefined>>,

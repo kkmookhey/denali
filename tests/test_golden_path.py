@@ -19,6 +19,8 @@ def test_repository_golden_path_manifest_is_valid_and_exact() -> None:
         "github.com/kkmookhey/denali-gemini-demo",
     ]
     assert manifest["budgets"]["vulnerabilities"] == 0
+    gcp = next(item for item in manifest["connections"] if item["provider"] == "gcp")
+    assert list(gcp["boundary"]["resource_display_names"].values()) == ["Summit"]
 
 
 def test_manifest_rejects_duplicate_connection_ids(tmp_path: Path) -> None:

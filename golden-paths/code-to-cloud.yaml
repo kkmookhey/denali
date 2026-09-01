@@ -32,6 +32,8 @@ connections:
         - vertex-api-502308
       resource_names:
         - //run.googleapis.com/projects/vertex-api-502308/locations/us-central1/services/denali-gemini-demo
+      resource_display_names:
+        //run.googleapis.com/projects/vertex-api-502308/locations/us-central1/services/denali-gemini-demo: Summit
 expected:
   repositories:
     - github.com/kkmookhey/anna-the-sales-agent
@@ -58,4 +60,4 @@ budgets:
   activities: 20
   vulnerabilities: 0
   detections: 5
-  collection_runs: 20
+  collection_runs: 30
