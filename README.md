@@ -130,7 +130,8 @@ The local Compose runtime uses one configured tenant and has no end-user authent
 authorization layer. It is an evaluation and development stack, not a production deployment
 recipe. Data persists in the `denali-postgres` Docker volume.
 
-For the Clerk Organizations, Vercel, Modal, and Neon pilot deployment, follow the
+For the Clerk Organizations, Vercel, Modal, and Neon pilot deployment, start with the
+[ordered launch checklist](docs/deployment/pilot-launch-checklist.md), then use the
 [hosted multi-tenant pilot runbook](docs/deployment/hosted-pilot.md). Hosted mode maps each
 active Clerk organization to a stable Denali tenant UUID, enforces admin-only mutations, and
 runs provider validation through durable Modal jobs.

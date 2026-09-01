@@ -1,5 +1,8 @@
 # Hosted multi-tenant pilot
 
+For the executable sequence, current status, and secret placement matrix, use the
+[pilot launch checklist](pilot-launch-checklist.md).
+
 The hosted pilot keeps PostgreSQL as Denali's source of truth and separates the runtime into:
 
 - Vercel for the static Vite application and same-origin `/api` proxy;
