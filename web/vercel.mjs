@@ -1,7 +1,6 @@
-const modalOrigin = process.env.MODAL_API_ORIGIN?.replace(/\/$/, "");
-if (!modalOrigin) {
-  throw new Error("MODAL_API_ORIGIN must be configured in the Vercel project");
-}
+import { deploymentEnv, routes } from "@vercel/config/v1";
+
+const modalOrigin = deploymentEnv("MODAL_API_ORIGIN");
 
 export const config = {
   framework: "vite",
@@ -9,8 +8,8 @@ export const config = {
   buildCommand: "npm run build",
   outputDirectory: "dist",
   rewrites: [
-    { source: "/api/:path*", destination: `${modalOrigin}/:path*` },
-    { source: "/:path*", destination: "/index.html" },
+    routes.rewrite("/api/:path*", `${modalOrigin}/:path*`),
+    routes.rewrite("/:path*", "/index.html"),
   ],
   headers: [
     {
