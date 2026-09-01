@@ -98,9 +98,12 @@ modal secret create --from-dotenv .env.modal.production denali-production
 ### 5. Migrate and deploy Modal
 
 `DENALI_MODAL_REGION` is a deploy-shell variable, not a value loaded from the runtime secret.
+If the secret is not named `denali-production`, also export its name as
+`DENALI_MODAL_SECRET_NAME`.
 
 ```bash
 export DENALI_MODAL_REGION=<modal-region>
+export DENALI_MODAL_SECRET_NAME=denali-production
 modal run modal_app.py::migrate_database
 modal deploy modal_app.py
 ```

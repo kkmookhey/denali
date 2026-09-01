@@ -8,7 +8,7 @@ from pathlib import Path
 import modal
 
 APP_NAME = "denali-production"
-SECRET_NAME = "denali-production"
+SECRET_NAME = os.environ.get("DENALI_MODAL_SECRET_NAME", "denali-production")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")

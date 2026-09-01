@@ -61,6 +61,8 @@ deployment from `.env.example`. At minimum it needs:
 
 `DENALI_MODAL_REGION` is evaluated by the local Modal CLI while it builds the deployment, so
 export it in the deploy shell (or CI environment); it is not read from the runtime secret.
+Set `DENALI_MODAL_SECRET_NAME` in the same deploy environment when using a differently named
+Modal secret.
 
 Deploy after migrating:
 
