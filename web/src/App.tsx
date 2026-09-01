@@ -46,6 +46,18 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
+import {
+  closeDrawerTransition,
+  drawerTabTransition,
+  navigationFromUrl,
+  navigationUrl,
+  openDrawerTransition,
+  queryWith,
+  withoutDrawer,
+  type DrawerKind,
+  type NavigationLocation,
+  type Page,
+} from "./navigation";
 import type {
   Asset,
   AssetDetail,
@@ -82,42 +94,21 @@ import type {
   VulnerabilitySummary,
 } from "./types";
 
-type Page = "dashboard" | "connections" | "inventory" | "shadowAi" | "findings" | "vulnerabilities" | "issues" | "codeToCloud" | "runtime" | "detections" | "sources";
 type DetailTab = "overview" | "relationships" | "evidence";
 type FindingDetailTab = "overview" | "evidence" | "history";
 type IssueDetailTab = "overview" | "path" | "evidence";
 type VulnerabilityDetailTab = "overview" | "evidence" | "sources";
 type DetectionDetailTab = "overview" | "evidence";
-
-const PAGE_PATHS: Record<Page, string> = {
-  dashboard: "/",
-  connections: "/connections",
-  inventory: "/inventory",
-  shadowAi: "/shadow-ai",
-  findings: "/posture-findings",
-  vulnerabilities: "/vulnerabilities",
-  issues: "/issues",
-  codeToCloud: "/code-to-cloud",
-  runtime: "/runtime-activity",
-  detections: "/detections",
-  sources: "/sources",
+type FilterNavigation = {
+  values: Readonly<Record<string, string>>;
+  set: (
+    key: string,
+    value: string,
+    defaultValue?: string,
+    mode?: "push" | "replace",
+  ) => void;
+  clear: (keys: string[]) => void;
 };
-
-const PATH_PAGES = new Map(Object.entries(PAGE_PATHS).map(([page, path]) => [path, page as Page]));
-
-function pageFromPath(pathname: string): Page {
-  const normalized = pathname.replace(/\/+$/, "") || "/";
-  return PATH_PAGES.get(normalized) ?? "dashboard";
-}
-
-function hasConnectionReturn(query: URLSearchParams) {
-  return query.has("github_setup") || (query.has("state") && (query.has("admin_consent") || query.has("error")));
-}
-
-function pageFromLocation(): Page {
-  const query = new URLSearchParams(window.location.search);
-  return hasConnectionReturn(query) ? "connections" : pageFromPath(window.location.pathname);
-}
 
 const KIND_META: Record<string, { label: string; plural: string; icon: LucideIcon; color: string }> = {
   ai_agent: { label: "AI agent", plural: "AI agents", icon: Bot, color: "coral" },
@@ -209,7 +200,10 @@ function readGitHubSetupReturn(): GitHubSetupReturn | null {
 function App() {
   const [azureConsentReturn] = useState(readAzureConsentReturn);
   const [githubSetupReturn] = useState(readGitHubSetupReturn);
-  const [page, setPage] = useState<Page>(pageFromLocation);
+  const [navigation, setNavigation] = useState<NavigationLocation>(() =>
+    navigationFromUrl(window.location.href),
+  );
+  const page = navigation.page;
   const [summary, setSummary] = useState<Summary | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [coverage, setCoverage] = useState<Coverage[]>([]);
@@ -229,33 +223,31 @@ function App() {
   const [detections, setDetections] = useState<RuntimeDetection[]>([]);
   const [detectionEvaluations, setDetectionEvaluations] = useState<RuntimeDetectionEvaluation[]>([]);
   const [includeActivityFixtures, setIncludeActivityFixtures] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
-  const [selectedVulnerabilityId, setSelectedVulnerabilityId] = useState<string | null>(null);
-  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
-  const [selectedActivityId, setSelectedActivityId] = useState<string | null>(null);
-  const [selectedDetectionId, setSelectedDetectionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [inventoryKind, setInventoryKind] = useState("all");
 
   useEffect(() => {
-    const initialPage = pageFromLocation();
-    const initialUrl = new URL(window.location.href);
-    const canonicalPath = PAGE_PATHS[initialPage];
-    if (window.location.pathname !== canonicalPath || window.history.state?.page !== initialPage) {
-      window.history.replaceState(
-        { ...window.history.state, page: initialPage },
-        "",
-        `${canonicalPath}${initialUrl.search}${initialUrl.hash}`,
-      );
-    }
+    const initial = navigationFromUrl(window.location.href);
+    const canonical = navigationUrl(initial.page, initial.query);
+    const overlayParent = initial.drawer
+      ? navigationUrl(initial.page, withoutDrawer(initial.query))
+      : undefined;
+    window.history.replaceState(
+      {
+        ...window.history.state,
+        denali: true,
+        page: initial.page,
+        overlayDepth: Number(window.history.state?.overlayDepth) || 0,
+        overlayParent,
+      },
+      "",
+      canonical,
+    );
+    setNavigation(initial);
 
     const handlePopState = () => {
-      const next = pageFromPath(window.location.pathname);
-      if (next === "inventory") setInventoryKind("all");
-      setPage(next);
+      setNavigation(navigationFromUrl(window.location.href));
       setSidebarOpen(false);
     };
 
@@ -369,46 +361,127 @@ function App() {
 
   useEffect(() => {
     if (!azureConsentReturn && !githubSetupReturn) return;
-    const returnUrl = new URL(window.location.href);
-    ["admin_consent", "tenant", "state", "error", "error_description", "github_setup", "connection_id", "detail"].forEach((key) =>
-      returnUrl.searchParams.delete(key),
-    );
-    window.history.replaceState(
-      { ...window.history.state, page: "connections" },
-      "",
-      `${PAGE_PATHS.connections}${returnUrl.search}${returnUrl.hash}`,
+    commitNavigation(
+      "connections",
+      { connection: (azureConsentReturn ?? githubSetupReturn)!.connectionId },
+      "replace",
     );
   }, [azureConsentReturn, githubSetupReturn]);
 
-  async function toggleActivityFixtures() {
-    const next = !includeActivityFixtures;
+  const loadRuntimeActivity = useCallback(async (includeFixtures: boolean) => {
     setError(null);
     try {
       const [summaryResult, activityResult] = await Promise.all([
-        api.activitySummary(next),
-        api.activity(next),
+        api.activitySummary(includeFixtures),
+        api.activity(includeFixtures),
       ]);
       setActivitySummary(summaryResult);
       setActivities(activityResult.items);
-      setIncludeActivityFixtures(next);
+      setIncludeActivityFixtures(includeFixtures);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Unable to load runtime activity");
     }
+  }, []);
+
+  const includeFixturesFromUrl = navigation.query.fixtures === "1";
+
+  useEffect(() => {
+    if (loading || includeActivityFixtures === includeFixturesFromUrl) return;
+    void loadRuntimeActivity(includeFixturesFromUrl);
+  }, [includeActivityFixtures, includeFixturesFromUrl, loadRuntimeActivity, loading]);
+
+  function toggleActivityFixtures() {
+    updateQuery({ fixtures: includeFixturesFromUrl ? null : "1" }, "push");
+  }
+
+  function selectConnection(id: string, mode: "push" | "replace" = "push") {
+    updateQuery({ connection: id || null, new: null, provider: null }, mode);
+  }
+
+  function showConnectionCreate(visible: boolean) {
+    updateQuery(
+      visible ? { new: "1" } : { new: null, provider: null },
+      "push",
+    );
   }
 
   function navigate(next: Page) {
-    if (next === "inventory") setInventoryKind("all");
-    if (next !== page) window.history.pushState({ page: next }, "", PAGE_PATHS[next]);
-    setPage(next);
+    if (next !== page || Object.keys(navigation.query).length > 0) {
+      commitNavigation(next, {}, "push");
+    }
     setSidebarOpen(false);
   }
 
   function openInventory(kind = "all") {
-    setInventoryKind(kind);
-    if (page !== "inventory") window.history.pushState({ page: "inventory" }, "", PAGE_PATHS.inventory);
-    setPage("inventory");
+    commitNavigation("inventory", kind === "all" ? {} : { kind }, "push");
     setSidebarOpen(false);
   }
+
+  function commitNavigation(
+    nextPage: Page,
+    query: Readonly<Record<string, string>>,
+    mode: "push" | "replace",
+    state: object = {},
+  ) {
+    const nextUrl = navigationUrl(nextPage, query);
+    const nextState = { denali: true, page: nextPage, overlayDepth: 0, ...state };
+    if (mode === "push") window.history.pushState(nextState, "", nextUrl);
+    else window.history.replaceState(nextState, "", nextUrl);
+    setNavigation(navigationFromUrl(new URL(nextUrl, window.location.origin)));
+  }
+
+  function updateQuery(
+    updates: Readonly<Record<string, string | null | undefined>>,
+    mode: "push" | "replace" = "push",
+  ) {
+    const nextQuery = queryWith(navigation.query, updates);
+    if (navigationUrl(page, nextQuery) === navigationUrl(page, navigation.query)) return;
+    commitNavigation(page, nextQuery, mode, {
+      overlayDepth: Number(window.history.state?.overlayDepth) || 0,
+      overlayParent: window.history.state?.overlayParent,
+    });
+  }
+
+  function openDrawer(kind: DrawerKind, id: string) {
+    const transition = openDrawerTransition(navigation, window.history.state, kind, id);
+    commitNavigation(transition.page, transition.query, transition.mode, transition.state);
+  }
+
+  function setDrawerTab(tab: string) {
+    const transition = drawerTabTransition(navigation, window.history.state, tab);
+    if (transition) commitNavigation(transition.page, transition.query, transition.mode, transition.state);
+  }
+
+  function closeDrawer() {
+    const transition = closeDrawerTransition(navigation, window.history.state);
+    if ("delta" in transition) {
+      window.history.go(transition.delta);
+      return;
+    }
+    commitNavigation(transition.page, transition.query, transition.mode, transition.state);
+  }
+
+  const filterNavigation: FilterNavigation = {
+    values: navigation.query,
+    set(key, value, defaultValue = "", mode = "push") {
+      updateQuery({ [key]: value === defaultValue ? null : value }, mode);
+    },
+    clear(keys) {
+      updateQuery(Object.fromEntries(keys.map((key) => [key, null])), "push");
+    },
+  };
+  const selectedAssetId =
+    navigation.drawer?.kind === "asset" ? navigation.drawer.id : null;
+  const selectedFindingId =
+    navigation.drawer?.kind === "finding" ? navigation.drawer.id : null;
+  const selectedVulnerabilityId =
+    navigation.drawer?.kind === "vulnerability" ? navigation.drawer.id : null;
+  const selectedIssueId =
+    navigation.drawer?.kind === "issue" ? navigation.drawer.id : null;
+  const selectedActivityId =
+    navigation.drawer?.kind === "activity" ? navigation.drawer.id : null;
+  const selectedDetectionId =
+    navigation.drawer?.kind === "detection" ? navigation.drawer.id : null;
 
   return (
     <div className="app-shell">
@@ -440,33 +513,35 @@ function App() {
               activitySummary={activitySummary ?? { total: 0, last_24h: 0, providers: 0, failures: 0, fixture_total: 0, by_category: {} }}
               activities={activities}
               detectionSummary={detectionSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
-              onOpenAsset={setSelectedId}
-              onOpenIssue={setSelectedIssueId}
+              onOpenAsset={(id) => openDrawer("asset", id)}
+              onOpenIssue={(id) => openDrawer("issue", id)}
               onViewInventory={openInventory}
               onViewSources={() => navigate("sources")}
               onNavigate={navigate}
             />
           ) : page === "connections" ? (
-            <ConnectionsPage connections={connections} onChanged={loadAll} azureConsentReturn={azureConsentReturn} githubSetupReturn={githubSetupReturn} />
+            <ConnectionsPage connections={connections} selectedId={navigation.query.connection} showCreate={navigation.query.new === "1" || connections.length === 0} navigation={filterNavigation} onSelect={selectConnection} onShowCreate={showConnectionCreate} onChanged={loadAll} azureConsentReturn={azureConsentReturn} githubSetupReturn={githubSetupReturn} />
           ) : page === "inventory" ? (
             <Inventory
               assets={assets}
-              initialKind={inventoryKind}
-              onOpenAsset={setSelectedId}
+              navigation={filterNavigation}
+              onOpenAsset={(id) => openDrawer("asset", id)}
             />
           ) : page === "shadowAi" ? (
             <ShadowAiPage
               assets={assets}
               activities={activities}
               coverage={coverage}
-              onOpenAsset={setSelectedId}
-              onOpenActivity={setSelectedActivityId}
+              navigation={filterNavigation}
+              onOpenAsset={(id) => openDrawer("asset", id)}
+              onOpenActivity={(id) => openDrawer("activity", id)}
             />
           ) : page === "findings" ? (
             <Findings
               summary={findingSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
               findings={findings}
-              onOpenFinding={setSelectedFindingId}
+              navigation={filterNavigation}
+              onOpenFinding={(id) => openDrawer("finding", id)}
             />
           ) : page === "vulnerabilities" ? (
             <Vulnerabilities
@@ -479,37 +554,41 @@ function App() {
                 open_by_exploit_state: {},
               }}
               vulnerabilities={vulnerabilities}
-              onOpenVulnerability={setSelectedVulnerabilityId}
+              navigation={filterNavigation}
+              onOpenVulnerability={(id) => openDrawer("vulnerability", id)}
             />
           ) : page === "issues" ? (
             <Issues
               summary={issueSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
               issues={issues}
               evaluations={issueEvaluations}
-              onOpenIssue={setSelectedIssueId}
+              navigation={filterNavigation}
+              onOpenIssue={(id) => openDrawer("issue", id)}
             />
           ) : page === "codeToCloud" ? (
             <CodeToCloud
               deployments={deployments}
               observations={codeToCloudObservations}
-              onOpenAsset={setSelectedId}
-              onOpenFinding={setSelectedFindingId}
-              onOpenVulnerability={setSelectedVulnerabilityId}
+              onOpenAsset={(id) => openDrawer("asset", id)}
+              onOpenFinding={(id) => openDrawer("finding", id)}
+              onOpenVulnerability={(id) => openDrawer("vulnerability", id)}
             />
           ) : page === "runtime" ? (
             <RuntimeActivityPage
               summary={activitySummary ?? { total: 0, last_24h: 0, providers: 0, failures: 0, fixture_total: 0, by_category: {} }}
               activities={activities}
               includeFixtures={includeActivityFixtures}
-              onToggleFixtures={() => void toggleActivityFixtures()}
-              onOpenActivity={setSelectedActivityId}
+              navigation={filterNavigation}
+              onToggleFixtures={toggleActivityFixtures}
+              onOpenActivity={(id) => openDrawer("activity", id)}
             />
           ) : page === "detections" ? (
             <RuntimeDetectionsPage
               summary={detectionSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
               detections={detections}
               evaluations={detectionEvaluations}
-              onOpenDetection={setSelectedDetectionId}
+              navigation={filterNavigation}
+              onOpenDetection={(id) => openDrawer("detection", id)}
             />
           ) : (
             <Sources coverage={coverage} />
@@ -517,14 +596,15 @@ function App() {
         </div>
       </main>
 
-      {selectedId && (
+      {selectedAssetId && (
         <ResourceDrawer
-          assetId={selectedId}
-          onClose={() => setSelectedId(null)}
-          onOpenAsset={setSelectedId}
+          assetId={selectedAssetId}
+          tab={(navigation.drawer?.tab ?? "overview") as DetailTab}
+          onTab={setDrawerTab}
+          onClose={closeDrawer}
+          onOpenAsset={(id) => openDrawer("asset", id)}
           onOpenActivity={(activityId) => {
-            setSelectedId(null);
-            setSelectedActivityId(activityId);
+            openDrawer("activity", activityId);
           }}
           onUpdated={loadAll}
         />
@@ -532,43 +612,47 @@ function App() {
       {selectedFindingId && (
         <FindingDrawer
           findingId={selectedFindingId}
-          onClose={() => setSelectedFindingId(null)}
+          tab={(navigation.drawer?.tab ?? "overview") as FindingDetailTab}
+          onTab={setDrawerTab}
+          onClose={closeDrawer}
         />
       )}
       {selectedIssueId && (
-        <IssueDrawer issueId={selectedIssueId} onClose={() => setSelectedIssueId(null)} />
+        <IssueDrawer issueId={selectedIssueId} tab={(navigation.drawer?.tab ?? "overview") as IssueDetailTab} onTab={setDrawerTab} onClose={closeDrawer} />
       )}
       {selectedVulnerabilityId && (
         <VulnerabilityDrawer
           vulnerabilityId={selectedVulnerabilityId}
-          onClose={() => setSelectedVulnerabilityId(null)}
+          tab={(navigation.drawer?.tab ?? "overview") as VulnerabilityDetailTab}
+          onTab={setDrawerTab}
+          onClose={closeDrawer}
           onOpenAsset={(assetId) => {
-            setSelectedVulnerabilityId(null);
-            setSelectedId(assetId);
+            openDrawer("asset", assetId);
           }}
         />
       )}
       {selectedActivityId && (
         <RuntimeActivityDrawer
           activityId={selectedActivityId}
-          onClose={() => setSelectedActivityId(null)}
+          tab={(navigation.drawer?.tab ?? "overview") as "overview" | "evidence"}
+          onTab={setDrawerTab}
+          onClose={closeDrawer}
           onOpenAsset={(assetId) => {
-            setSelectedActivityId(null);
-            setSelectedId(assetId);
+            openDrawer("asset", assetId);
           }}
         />
       )}
       {selectedDetectionId && (
         <RuntimeDetectionDrawer
           detectionId={selectedDetectionId}
-          onClose={() => setSelectedDetectionId(null)}
+          tab={(navigation.drawer?.tab ?? "overview") as DetectionDetailTab}
+          onTab={setDrawerTab}
+          onClose={closeDrawer}
           onOpenActivity={(activityId) => {
-            setSelectedDetectionId(null);
-            setSelectedActivityId(activityId);
+            openDrawer("activity", activityId);
           }}
           onOpenAsset={(assetId) => {
-            setSelectedDetectionId(null);
-            setSelectedId(assetId);
+            openDrawer("asset", assetId);
           }}
         />
       )}
@@ -871,12 +955,10 @@ function AssetMiniRow({ asset, onClick }: { asset: Asset; onClick: () => void })
   return <button className="asset-mini-row" onClick={onClick}><span className={`asset-icon ${itemMeta.color}`}><Icon size={17} /></span><span><strong>{asset.display_name ?? shortKey(asset.natural_key)}</strong><small>{itemMeta.label} · {asset.assertion_type?.replaceAll("_", " ")}</small></span><ChevronRight size={16} /></button>;
 }
 
-function Inventory({ assets, initialKind, onOpenAsset }: { assets: Asset[]; initialKind: string; onOpenAsset: (id: string) => void }) {
-  const [search, setSearch] = useState("");
-  const [kind, setKind] = useState(initialKind);
-  const [governance, setGovernance] = useState("all");
-
-  useEffect(() => setKind(initialKind), [initialKind]);
+function Inventory({ assets, navigation, onOpenAsset }: { assets: Asset[]; navigation: FilterNavigation; onOpenAsset: (id: string) => void }) {
+  const search = navigation.values.q ?? "";
+  const kind = navigation.values.kind ?? "all";
+  const governance = navigation.values.governance ?? "all";
 
   const filtered = useMemo(() => assets.filter((asset) => {
     const haystack = `${asset.display_name ?? ""} ${asset.natural_key} ${asset.kind}`.toLowerCase();
@@ -889,10 +971,10 @@ function Inventory({ assets, initialKind, onOpenAsset }: { assets: Asset[]; init
       <section className="page-intro"><div><span className="eyebrow">CANONICAL INVENTORY</span><h2>Every AI resource, one trustworthy record.</h2><p>Search normalized inventory while preserving every source assertion and its evidence.</p></div><div className="result-count"><strong>{filtered.length}</strong><span>active resources</span></div></section>
       <section className="panel inventory-panel">
         <div className="filterbar">
-          <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name, key, or type…" /></label>
-          <label className="select-field"><ListFilter size={16} /><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="all">All resource types</option>{kinds.map((item) => <option key={item} value={item}>{meta(item).plural}</option>)}</select></label>
-          <label className="select-field"><Filter size={16} /><select value={governance} onChange={(event) => setGovernance(event.target.value)}><option value="all">All governance</option><option value="approved">Approved</option><option value="unreviewed">Unreviewed</option><option value="unwanted">Unwanted</option></select></label>
-          {(search || kind !== "all" || governance !== "all") && <button className="clear-button" onClick={() => { setSearch(""); setKind("all"); setGovernance("all"); }}>Clear filters</button>}
+          <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => navigation.set("q", event.target.value, "", "replace")} placeholder="Search name, key, or type…" /></label>
+          <label className="select-field"><ListFilter size={16} /><select value={kind} onChange={(event) => navigation.set("kind", event.target.value, "all")}><option value="all">All resource types</option>{kinds.map((item) => <option key={item} value={item}>{meta(item).plural}</option>)}</select></label>
+          <label className="select-field"><Filter size={16} /><select value={governance} onChange={(event) => navigation.set("governance", event.target.value, "all")}><option value="all">All governance</option><option value="approved">Approved</option><option value="unreviewed">Unreviewed</option><option value="unwanted">Unwanted</option></select></label>
+          {(search || kind !== "all" || governance !== "all") && <button className="clear-button" onClick={() => navigation.clear(["q", "kind", "governance"])}>Clear filters</button>}
         </div>
         <div className="inventory-table" role="table" aria-label="AI inventory">
           <div className="inventory-table-head" role="row"><span>Resource</span><span>Type</span><span>Verification</span><span>Governance</span><span>Last seen</span><span /></div>
@@ -920,15 +1002,17 @@ const SEVERITY_ORDER: FindingSeverity[] = ["critical", "high", "medium", "low", 
 function Findings({
   summary,
   findings,
+  navigation,
   onOpenFinding,
 }: {
   summary: FindingSummary;
   findings: Finding[];
+  navigation: FilterNavigation;
   onOpenFinding: (id: string) => void;
 }) {
-  const [search, setSearch] = useState("");
-  const [severity, setSeverity] = useState("all");
-  const [state, setState] = useState("open");
+  const search = navigation.values.q ?? "";
+  const severity = navigation.values.severity ?? "all";
+  const state = navigation.values.state ?? "open";
   const filtered = useMemo(
     () =>
       findings.filter((finding) => {
@@ -949,10 +1033,10 @@ function Findings({
     </section>
     <section className="panel findings-panel">
       <div className="filterbar">
-        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search finding, rule, class, or source…" /></label>
-        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option>{SEVERITY_ORDER.map((item) => <option key={item} value={item}>{titleCase(item)}</option>)}</select></label>
-        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => setState(event.target.value)}><option value="all">All states</option><option value="open">Open</option><option value="unknown">Unknown</option><option value="suppressed">Suppressed</option><option value="resolved">Resolved</option></select></label>
-        {(search || severity !== "all" || state !== "open") && <button className="clear-button" onClick={() => { setSearch(""); setSeverity("all"); setState("open"); }}>Reset</button>}
+        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => navigation.set("q", event.target.value, "", "replace")} placeholder="Search finding, rule, class, or source…" /></label>
+        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => navigation.set("severity", event.target.value, "all")}><option value="all">All severities</option>{SEVERITY_ORDER.map((item) => <option key={item} value={item}>{titleCase(item)}</option>)}</select></label>
+        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => navigation.set("state", event.target.value, "open")}><option value="all">All states</option><option value="open">Open</option><option value="unknown">Unknown</option><option value="suppressed">Suppressed</option><option value="resolved">Resolved</option></select></label>
+        {(search || severity !== "all" || state !== "open") && <button className="clear-button" onClick={() => navigation.clear(["q", "severity", "state"])}>Reset</button>}
       </div>
       <div className="findings-table" role="table" aria-label="AI configuration findings">
         <div className="findings-table-head" role="row"><span>Finding</span><span>Severity</span><span>State</span><span>Affected</span><span>Source</span><span>Last seen</span><span /></div>
@@ -979,13 +1063,12 @@ function FindingTableRow({ finding, onClick }: { finding: Finding; onClick: () =
   </button>;
 }
 
-function FindingDrawer({ findingId, onClose }: { findingId: string; onClose: () => void }) {
+function FindingDrawer({ findingId, tab, onTab, onClose }: { findingId: string; tab: FindingDetailTab; onTab: (tab: string) => void; onClose: () => void }) {
   const [detail, setDetail] = useState<FindingDetail | null>(null);
-  const [tab, setTab] = useState<FindingDetailTab>("overview");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setDetail(null); setError(null); setTab("overview");
+    setDetail(null); setError(null);
     api.finding(findingId).then(setDetail).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load finding"));
   }, [findingId]);
 
@@ -993,7 +1076,7 @@ function FindingDrawer({ findingId, onClose }: { findingId: string; onClose: () 
     {!detail && !error ? <LoadingState compact /> : error ? <ErrorState message={error} subject="finding" /> : detail && <>
       <div className="drawer-header finding-drawer-header"><button className="drawer-close" onClick={onClose}><X /></button><span className={`finding-icon large severity-${detail.severity}`}><CircleAlert /></span><div><span>{detail.class_name}</span><h2>{detail.title}</h2><p>{detail.rule_uid} · {detail.connector_id}</p></div><span className={`severity-badge ${detail.severity}`}>{titleCase(detail.severity)}</span></div>
       <div className="finding-summary-strip"><span className={`finding-state ${detail.state}`}>{titleCase(detail.state)}</span><span><strong>{detail.resources.length}</strong> affected {detail.resources.length === 1 ? "resource" : "resources"}</span><span><strong>{Object.keys(detail.compliance).length}</strong> frameworks</span><span>Last seen <strong>{formatTime(detail.last_seen_at)}</strong></span></div>
-      <div className="drawer-tabs">{(["overview", "evidence", "history"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{titleCase(item)}{item === "history" && <small>{detail.observations.length}</small>}</button>)}</div>
+      <div className="drawer-tabs">{(["overview", "evidence", "history"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => onTab(item)}>{titleCase(item)}{item === "history" && <small>{detail.observations.length}</small>}</button>)}</div>
       <div className="drawer-content">
         {tab === "overview" ? <FindingOverview detail={detail} /> : tab === "evidence" ? <FindingEvidence detail={detail} /> : <FindingHistory detail={detail} />}
       </div>
@@ -1040,16 +1123,18 @@ function FindingHistory({ detail }: { detail: FindingDetail }) {
 function Vulnerabilities({
   summary,
   vulnerabilities,
+  navigation,
   onOpenVulnerability,
 }: {
   summary: VulnerabilitySummary;
   vulnerabilities: Vulnerability[];
+  navigation: FilterNavigation;
   onOpenVulnerability: (id: string) => void;
 }) {
-  const [search, setSearch] = useState("");
-  const [severity, setSeverity] = useState("all");
-  const [state, setState] = useState("open");
-  const [fix, setFix] = useState("all");
+  const search = navigation.values.q ?? "";
+  const severity = navigation.values.severity ?? "all";
+  const state = navigation.values.state ?? "open";
+  const fix = navigation.values.fix ?? "all";
   const filtered = useMemo(() => vulnerabilities.filter((item) => {
     const component = item.component_name ?? item.component_natural_key;
     const haystack = `${item.vulnerability_id} ${item.title ?? ""} ${component} ${item.scanner}`.toLowerCase();
@@ -1072,11 +1157,11 @@ function Vulnerabilities({
     </section>
     <section className="panel vulnerabilities-panel">
       <div className="filterbar">
-        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search CVE, component, or scanner…" /></label>
-        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option>{SEVERITY_ORDER.map((item) => <option key={item} value={item}>{titleCase(item)}</option>)}</select></label>
-        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => setState(event.target.value)}><option value="all">All states</option><option value="open">Open</option><option value="unknown">Unknown</option><option value="suppressed">Suppressed</option><option value="resolved">Resolved</option></select></label>
-        <label className="select-field"><ShieldCheck size={16} /><select value={fix} onChange={(event) => setFix(event.target.value)}><option value="all">Any fix state</option><option value="fixed">Fix available</option><option value="not_fixed">No fix</option><option value="wont_fix">Won't fix</option><option value="unknown">Unknown fix state</option></select></label>
-        {(search || severity !== "all" || state !== "open" || fix !== "all") && <button className="clear-button" onClick={() => { setSearch(""); setSeverity("all"); setState("open"); setFix("all"); }}>Reset</button>}
+        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => navigation.set("q", event.target.value, "", "replace")} placeholder="Search CVE, component, or scanner…" /></label>
+        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => navigation.set("severity", event.target.value, "all")}><option value="all">All severities</option>{SEVERITY_ORDER.map((item) => <option key={item} value={item}>{titleCase(item)}</option>)}</select></label>
+        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => navigation.set("state", event.target.value, "open")}><option value="all">All states</option><option value="open">Open</option><option value="unknown">Unknown</option><option value="suppressed">Suppressed</option><option value="resolved">Resolved</option></select></label>
+        <label className="select-field"><ShieldCheck size={16} /><select value={fix} onChange={(event) => navigation.set("fix", event.target.value, "all")}><option value="all">Any fix state</option><option value="fixed">Fix available</option><option value="not_fixed">No fix</option><option value="wont_fix">Won't fix</option><option value="unknown">Unknown fix state</option></select></label>
+        {(search || severity !== "all" || state !== "open" || fix !== "all") && <button className="clear-button" onClick={() => navigation.clear(["q", "severity", "state", "fix"])}>Reset</button>}
       </div>
       <div className="vulnerabilities-table" role="table" aria-label="AI vulnerabilities">
         <div className="vulnerabilities-table-head" role="row"><span>Vulnerability</span><span>Severity</span><span>Component</span><span>Fix</span><span>Scanner</span><span>Last seen</span><span /></div>
@@ -1106,13 +1191,12 @@ function VulnerabilityTableRow({ item, onClick }: { item: Vulnerability; onClick
   </button>;
 }
 
-function VulnerabilityDrawer({ vulnerabilityId, onClose, onOpenAsset }: { vulnerabilityId: string; onClose: () => void; onOpenAsset: (id: string) => void }) {
+function VulnerabilityDrawer({ vulnerabilityId, tab, onTab, onClose, onOpenAsset }: { vulnerabilityId: string; tab: VulnerabilityDetailTab; onTab: (tab: string) => void; onClose: () => void; onOpenAsset: (id: string) => void }) {
   const [detail, setDetail] = useState<VulnerabilityDetail | null>(null);
-  const [tab, setTab] = useState<VulnerabilityDetailTab>("overview");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setDetail(null); setError(null); setTab("overview");
+    setDetail(null); setError(null);
     api.vulnerability(vulnerabilityId).then(setDetail).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load vulnerability"));
   }, [vulnerabilityId]);
 
@@ -1121,7 +1205,7 @@ function VulnerabilityDrawer({ vulnerabilityId, onClose, onOpenAsset }: { vulner
     {!detail && !error ? <LoadingState compact /> : error ? <ErrorState message={error} subject="vulnerability" /> : detail && winner && <>
       <div className="drawer-header vulnerability-drawer-header"><button className="drawer-close" onClick={onClose}><X /></button><span className={`finding-icon large severity-${winner.severity}`}><Bug /></span><div><span>SOFTWARE VULNERABILITY</span><h2>{detail.vulnerability_id}</h2><p>{detail.component.display_name ?? detail.component.natural_key}</p></div><span className={`severity-badge ${winner.severity}`}>{titleCase(winner.severity)}</span></div>
       <div className="finding-summary-strip"><span className={`finding-state ${detail.state}`}>{titleCase(detail.state)}</span><span>CVSS <strong>{winner.cvss_score?.toFixed(1) ?? "Unknown"}</strong></span><span><strong>{detail.observations.filter((item) => !item.withdrawn_at).length}</strong> active sources</span><span>Last seen <strong>{formatTime(detail.last_seen_at)}</strong></span></div>
-      <div className="drawer-tabs">{(["overview", "evidence", "sources"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{titleCase(item)}{item === "sources" && <small>{detail.observations.length}</small>}</button>)}</div>
+      <div className="drawer-tabs">{(["overview", "evidence", "sources"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => onTab(item)}>{titleCase(item)}{item === "sources" && <small>{detail.observations.length}</small>}</button>)}</div>
       <div className="drawer-content">{tab === "overview" ? <VulnerabilityOverview detail={detail} winner={winner} onOpenAsset={onOpenAsset} /> : tab === "evidence" ? <VulnerabilityEvidence detail={detail} winner={winner} /> : <VulnerabilitySources detail={detail} />}</div>
     </>}
   </aside></div>;
@@ -1172,16 +1256,18 @@ function Issues({
   summary,
   issues,
   evaluations,
+  navigation,
   onOpenIssue,
 }: {
   summary: IssueSummary;
   issues: Issue[];
   evaluations: IssueEvaluation[];
+  navigation: FilterNavigation;
   onOpenIssue: (id: string) => void;
 }) {
-  const [search, setSearch] = useState("");
-  const [severity, setSeverity] = useState("all");
-  const [state, setState] = useState("open");
+  const search = navigation.values.q ?? "";
+  const severity = navigation.values.severity ?? "all";
+  const state = navigation.values.state ?? "open";
   const filtered = useMemo(() => issues.filter((issue) => {
     const haystack = `${issue.title} ${issue.rule_uid} ${issue.description}`.toLowerCase();
     return haystack.includes(search.toLowerCase()) &&
@@ -1207,10 +1293,10 @@ function Issues({
     </section>
     <section className="panel issues-panel">
       <div className="filterbar">
-        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search issue, rule, or consequence…" /></label>
-        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option>{SEVERITY_ORDER.map((item) => <option key={item} value={item}>{titleCase(item)}</option>)}</select></label>
-        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => setState(event.target.value)}><option value="all">All states</option><option value="open">Open</option><option value="unknown">Unknown</option><option value="resolved">Resolved</option></select></label>
-        {(search || severity !== "all" || state !== "open") && <button className="clear-button" onClick={() => { setSearch(""); setSeverity("all"); setState("open"); }}>Reset</button>}
+        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => navigation.set("q", event.target.value, "", "replace")} placeholder="Search issue, rule, or consequence…" /></label>
+        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => navigation.set("severity", event.target.value, "all")}><option value="all">All severities</option>{SEVERITY_ORDER.map((item) => <option key={item} value={item}>{titleCase(item)}</option>)}</select></label>
+        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => navigation.set("state", event.target.value, "open")}><option value="all">All states</option><option value="open">Open</option><option value="unknown">Unknown</option><option value="resolved">Resolved</option></select></label>
+        {(search || severity !== "all" || state !== "open") && <button className="clear-button" onClick={() => navigation.clear(["q", "severity", "state"])}>Reset</button>}
       </div>
       <div className="issues-table" role="table" aria-label="AI issues and attack paths">
         <div className="issues-table-head" role="row"><span>Issue</span><span>Severity</span><span>State</span><span>Context</span><span>Evidence</span><span>Last confirmed</span><span /></div>
@@ -1234,15 +1320,18 @@ function IssueTableRow({ issue, onClick }: { issue: Issue; onClick: () => void }
   </button>;
 }
 
-function IssueDrawer({ issueId, onClose }: { issueId: string; onClose: () => void }) {
+function IssueDrawer({ issueId, tab, onTab, onClose }: { issueId: string; tab: IssueDetailTab; onTab: (tab: string) => void; onClose: () => void }) {
   const [detail, setDetail] = useState<IssueDetail | null>(null);
-  const [tab, setTab] = useState<IssueDetailTab>("overview");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setDetail(null); setError(null); setTab("overview");
+    setDetail(null); setError(null);
     api.issue(issueId).then(setDetail).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load issue"));
   }, [issueId]);
+
+  useEffect(() => {
+    if (detail && tab === "path" && detail.path_edges.length === 0) onTab("overview");
+  }, [detail, onTab, tab]);
 
   return <div className="drawer-layer"><button className="drawer-scrim" onClick={onClose} aria-label="Close issue detail" /><aside className="resource-drawer issue-drawer" aria-label="Issue detail">
     {!detail && !error ? <LoadingState compact /> : error ? <ErrorState message={error} subject="issue" /> : detail && (() => {
@@ -1252,7 +1341,7 @@ function IssueDrawer({ issueId, onClose }: { issueId: string; onClose: () => voi
       return <>
       <div className="drawer-header issue-drawer-header"><button className="drawer-close" onClick={onClose}><X /></button><span className={`finding-icon large severity-${detail.severity}`}>{temporal ? <Gauge /> : <Network />}</span><div><span>{temporal ? "CROSS-SIGNAL SECURITY ISSUE" : "CONFIRMED SECURITY ISSUE"}</span><h2>{detail.title}</h2><p>{detail.rule_uid}</p></div><span className={`severity-badge ${detail.severity}`}>{titleCase(detail.severity)}</span></div>
       <div className="finding-summary-strip"><span className={`issue-state ${detail.state}`}>{titleCase(detail.state)}</span><span><strong>{Math.round(detail.confidence * 100)}%</strong> evidence confidence</span>{temporal ? <><span><strong>{detail.detections.length}</strong> detection</span><span><strong>{detail.activities.length}</strong> later activities</span></> : <><span><strong>{detail.findings.length}</strong> findings</span><span><strong>{detail.path_edges.length}</strong> confirmed edges</span></>}</div>
-      <div className="drawer-tabs">{tabs.map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{titleCase(item)}{item === "path" && <small>{detail.path_nodes.length}</small>}{item === "evidence" && <small>{evidenceCount}</small>}</button>)}</div>
+      <div className="drawer-tabs">{tabs.map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => onTab(item)}>{titleCase(item)}{item === "path" && <small>{detail.path_nodes.length}</small>}{item === "evidence" && <small>{evidenceCount}</small>}</button>)}</div>
       <div className="drawer-content">
         {tab === "overview" ? <IssueOverview detail={detail} /> : tab === "path" ? <IssuePath detail={detail} /> : <IssueEvidence detail={detail} />}
       </div>
@@ -1540,19 +1629,21 @@ function ShadowAiPage({
   assets,
   activities,
   coverage,
+  navigation,
   onOpenAsset,
   onOpenActivity,
 }: {
   assets: Asset[];
   activities: RuntimeActivity[];
   coverage: Coverage[];
+  navigation: FilterNavigation;
   onOpenAsset: (id: string) => void;
   onOpenActivity: (id: string) => void;
 }) {
-  const [search, setSearch] = useState("");
-  const [category, setCategory] = useState("all");
-  const [governance, setGovernance] = useState("all");
-  const [connection, setConnection] = useState("latest");
+  const search = navigation.values.q ?? "";
+  const category = navigation.values.category ?? "all";
+  const governance = navigation.values.governance ?? "all";
+  const connection = navigation.values.connection ?? "latest";
   const allApplications = useMemo(
     () => assets.filter((asset) => asset.kind === "ai_application"),
     [assets],
@@ -1632,11 +1723,11 @@ function ShadowAiPage({
     <section className="shadow-principle"><CircleHelp /><div><strong>A catalog match means “review this application.”</strong><span>Denali does not claim an application is unsanctioned, unsafe, or training on company data without separate evidence and policy.</span></div></section>
     <section className="panel shadow-app-panel">
       <div className="filterbar">
-        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search application or publisher…" /></label>
-        <label className="select-field"><Waypoints size={16} /><select value={connection} onChange={(event) => setConnection(event.target.value)}><option value="latest">Most recently active tenant</option><option value="all">All connected tenants</option>{connections.map((item) => <option value={item} key={item}>{entraConnectionLabel(item)}</option>)}</select></label>
-        <label className="select-field"><AppWindow size={16} /><select value={category} onChange={(event) => setCategory(event.target.value)}><option value="all">All categories</option>{categories.map((item) => <option value={item} key={item}>{titleCase(item)}</option>)}</select></label>
-        <label className="select-field"><ShieldCheck size={16} /><select value={governance} onChange={(event) => setGovernance(event.target.value)}><option value="all">All governance</option><option value="approved">Approved</option><option value="unreviewed">Unreviewed</option><option value="unwanted">Unwanted</option></select></label>
-        {(search || connection !== "latest" || category !== "all" || governance !== "all") && <button className="clear-button" onClick={() => { setSearch(""); setConnection("latest"); setCategory("all"); setGovernance("all"); }}>Reset</button>}
+        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => navigation.set("q", event.target.value, "", "replace")} placeholder="Search application or publisher…" /></label>
+        <label className="select-field"><Waypoints size={16} /><select value={connection} onChange={(event) => navigation.set("connection", event.target.value, "latest")}><option value="latest">Most recently active tenant</option><option value="all">All connected tenants</option>{connections.map((item) => <option value={item} key={item}>{entraConnectionLabel(item)}</option>)}</select></label>
+        <label className="select-field"><AppWindow size={16} /><select value={category} onChange={(event) => navigation.set("category", event.target.value, "all")}><option value="all">All categories</option>{categories.map((item) => <option value={item} key={item}>{titleCase(item)}</option>)}</select></label>
+        <label className="select-field"><ShieldCheck size={16} /><select value={governance} onChange={(event) => navigation.set("governance", event.target.value, "all")}><option value="all">All governance</option><option value="approved">Approved</option><option value="unreviewed">Unreviewed</option><option value="unwanted">Unwanted</option></select></label>
+        {(search || connection !== "latest" || category !== "all" || governance !== "all") && <button className="clear-button" onClick={() => navigation.clear(["q", "connection", "category", "governance"])}>Reset</button>}
       </div>
       <div className="shadow-app-table" role="table" aria-label="Enterprise AI applications">
         <div className="shadow-app-head" role="row"><span>Application</span><span>Category</span><span>Permissions</span><span>Publisher</span><span>Governance</span><span>Last seen</span><span /></div>
@@ -1690,18 +1781,20 @@ function RuntimeActivityPage({
   summary,
   activities,
   includeFixtures,
+  navigation,
   onToggleFixtures,
   onOpenActivity,
 }: {
   summary: RuntimeActivitySummary;
   activities: RuntimeActivity[];
   includeFixtures: boolean;
+  navigation: FilterNavigation;
   onToggleFixtures: () => void;
   onOpenActivity: (id: string) => void;
 }) {
-  const [search, setSearch] = useState("");
-  const [category, setCategory] = useState("all");
-  const [outcome, setOutcome] = useState("all");
+  const search = navigation.values.q ?? "";
+  const category = navigation.values.category ?? "all";
+  const outcome = navigation.values.outcome ?? "all";
   const filtered = useMemo(() => activities.filter((item) => {
     const haystack = `${item.title} ${item.activity_name} ${item.actor_name ?? ""} ${item.actor_uid ?? ""} ${item.provider}`.toLowerCase();
     return haystack.includes(search.toLowerCase()) &&
@@ -1723,10 +1816,10 @@ function RuntimeActivityPage({
     </section>}
     <section className="panel runtime-panel">
       <div className="filterbar">
-        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search activity, actor, or provider…" /></label>
-        <label className="select-field"><Activity size={16} /><select value={category} onChange={(event) => setCategory(event.target.value)}><option value="all">All activity types</option>{Object.entries(ACTIVITY_META).map(([value, item]) => <option key={value} value={value}>{item.label}</option>)}</select></label>
-        <label className="select-field"><ListFilter size={16} /><select value={outcome} onChange={(event) => setOutcome(event.target.value)}><option value="all">All outcomes</option><option value="success">Success</option><option value="failure">Failure</option><option value="unknown">Unknown</option></select></label>
-        {(search || category !== "all" || outcome !== "all") && <button className="clear-button" onClick={() => { setSearch(""); setCategory("all"); setOutcome("all"); }}>Reset</button>}
+        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => navigation.set("q", event.target.value, "", "replace")} placeholder="Search activity, actor, or provider…" /></label>
+        <label className="select-field"><Activity size={16} /><select value={category} onChange={(event) => navigation.set("category", event.target.value, "all")}><option value="all">All activity types</option>{Object.entries(ACTIVITY_META).map(([value, item]) => <option key={value} value={value}>{item.label}</option>)}</select></label>
+        <label className="select-field"><ListFilter size={16} /><select value={outcome} onChange={(event) => navigation.set("outcome", event.target.value, "all")}><option value="all">All outcomes</option><option value="success">Success</option><option value="failure">Failure</option><option value="unknown">Unknown</option></select></label>
+        {(search || category !== "all" || outcome !== "all") && <button className="clear-button" onClick={() => navigation.clear(["q", "category", "outcome"])}>Reset</button>}
       </div>
       <div className="runtime-table" role="table" aria-label="AI runtime activity">
         <div className="runtime-table-head" role="row"><span>Activity</span><span>Type</span><span>Outcome</span><span>Actor</span><span>Provider</span><span>Occurred</span><span /></div>
@@ -1755,13 +1848,12 @@ function RuntimeActivityRow({ item, onClick }: { item: RuntimeActivity; onClick:
   </button>;
 }
 
-function RuntimeActivityDrawer({ activityId, onClose, onOpenAsset }: { activityId: string; onClose: () => void; onOpenAsset: (id: string) => void }) {
+function RuntimeActivityDrawer({ activityId, tab, onTab, onClose, onOpenAsset }: { activityId: string; tab: "overview" | "evidence"; onTab: (tab: string) => void; onClose: () => void; onOpenAsset: (id: string) => void }) {
   const [detail, setDetail] = useState<RuntimeActivityDetail | null>(null);
-  const [tab, setTab] = useState<"overview" | "evidence">("overview");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setDetail(null); setError(null); setTab("overview");
+    setDetail(null); setError(null);
     api.activityDetail(activityId).then(setDetail).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load runtime activity"));
   }, [activityId]);
 
@@ -1772,7 +1864,7 @@ function RuntimeActivityDrawer({ activityId, onClose, onOpenAsset }: { activityI
     {!detail && !error ? <LoadingState compact /> : error ? <ErrorState message={error} subject="runtime activity" /> : detail && activity && <>
       <div className="drawer-header runtime-drawer-header"><button className="drawer-close" onClick={onClose}><X /></button><span className={`asset-icon large ${activity.color}`}><Icon /></span><div><span>{activity.label}</span><h2>{detail.title}</h2><p>{detail.provider} · {detail.source_uid}</p></div><span className={`outcome-badge ${detail.outcome}`}>{titleCase(detail.outcome)}</span></div>
       <div className="finding-summary-strip"><span><strong>{formatTime(detail.occurred_at)}</strong></span><span><strong>{detail.entities.length}</strong> observed entities</span><span><strong>{correlated}</strong> inventory correlated</span><span>{titleCase(detail.provider)}</span></div>
-      <div className="drawer-tabs">{(["overview", "evidence"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{titleCase(item)}{item === "overview" && <small>{detail.entities.length}</small>}</button>)}</div>
+      <div className="drawer-tabs">{(["overview", "evidence"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => onTab(item)}>{titleCase(item)}{item === "overview" && <small>{detail.entities.length}</small>}</button>)}</div>
       <div className="drawer-content">{tab === "overview" ? <RuntimeActivityOverview detail={detail} onOpenAsset={onOpenAsset} /> : <RuntimeActivityEvidence detail={detail} />}</div>
     </>}
   </aside></div>;
@@ -1797,16 +1889,18 @@ function RuntimeDetectionsPage({
   summary,
   detections,
   evaluations,
+  navigation,
   onOpenDetection,
 }: {
   summary: RuntimeDetectionSummary;
   detections: RuntimeDetection[];
   evaluations: RuntimeDetectionEvaluation[];
+  navigation: FilterNavigation;
   onOpenDetection: (id: string) => void;
 }) {
-  const [search, setSearch] = useState("");
-  const [severity, setSeverity] = useState("all");
-  const [state, setState] = useState("open");
+  const search = navigation.values.q ?? "";
+  const severity = navigation.values.severity ?? "all";
+  const state = navigation.values.state ?? "open";
   const filtered = useMemo(() => detections.filter((item) => {
     const actor = stringValue(item.attributes.actor_display_name) ?? stringValue(item.attributes.actor_uid) ?? "";
     const haystack = `${item.title} ${item.rule_uid} ${item.description} ${actor}`.toLowerCase();
@@ -1829,10 +1923,10 @@ function RuntimeDetectionsPage({
     </section>
     <section className="panel detections-panel">
       <div className="filterbar">
-        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search detection, actor, or rule…" /></label>
-        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => setSeverity(event.target.value)}><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
-        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => setState(event.target.value)}><option value="all">All states</option><option value="open">Open</option><option value="resolved">Resolved</option><option value="unknown">Unknown</option></select></label>
-        {(search || severity !== "all" || state !== "open") && <button className="clear-button" onClick={() => { setSearch(""); setSeverity("all"); setState("open"); }}>Reset</button>}
+        <label className="search-field"><Search size={18} /><input value={search} onChange={(event) => navigation.set("q", event.target.value, "", "replace")} placeholder="Search detection, actor, or rule…" /></label>
+        <label className="select-field"><CircleAlert size={16} /><select value={severity} onChange={(event) => navigation.set("severity", event.target.value, "all")}><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
+        <label className="select-field"><ListFilter size={16} /><select value={state} onChange={(event) => navigation.set("state", event.target.value, "open")}><option value="all">All states</option><option value="open">Open</option><option value="resolved">Resolved</option><option value="unknown">Unknown</option></select></label>
+        {(search || severity !== "all" || state !== "open") && <button className="clear-button" onClick={() => navigation.clear(["q", "severity", "state"])}>Reset</button>}
       </div>
       <div className="detections-table" role="table" aria-label="AI runtime detections">
         <div className="detections-table-head" role="row"><span>Detection</span><span>Severity</span><span>State</span><span>Evidence</span><span>Actor</span><span>Last seen</span><span /></div>
@@ -1856,19 +1950,18 @@ function RuntimeDetectionRow({ item, onClick }: { item: RuntimeDetection; onClic
   </button>;
 }
 
-function RuntimeDetectionDrawer({ detectionId, onClose, onOpenActivity, onOpenAsset }: { detectionId: string; onClose: () => void; onOpenActivity: (id: string) => void; onOpenAsset: (id: string) => void }) {
+function RuntimeDetectionDrawer({ detectionId, tab, onTab, onClose, onOpenActivity, onOpenAsset }: { detectionId: string; tab: DetectionDetailTab; onTab: (tab: string) => void; onClose: () => void; onOpenActivity: (id: string) => void; onOpenAsset: (id: string) => void }) {
   const [detail, setDetail] = useState<RuntimeDetectionDetail | null>(null);
-  const [tab, setTab] = useState<DetectionDetailTab>("overview");
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
-    setDetail(null); setError(null); setTab("overview");
+    setDetail(null); setError(null);
     api.detection(detectionId).then(setDetail).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to load runtime detection"));
   }, [detectionId]);
   return <div className="drawer-layer"><button className="drawer-scrim" onClick={onClose} aria-label="Close runtime detection detail" /><aside className="resource-drawer detection-drawer" aria-label="Runtime detection detail">
     {!detail && !error ? <LoadingState compact /> : error ? <ErrorState message={error} subject="runtime detection" /> : detail && <>
       <div className="drawer-header detection-drawer-header"><button className="drawer-close" onClick={onClose}><X /></button><span className="asset-icon large coral"><Gauge /></span><div><span>BEHAVIOR DETECTION</span><h2>{detail.title}</h2><p>{detail.rule_uid}</p></div><span className={`severity-badge ${detail.severity}`}>{titleCase(detail.severity)}</span></div>
       <div className="finding-summary-strip"><span className={`finding-state ${detail.state}`}>{titleCase(detail.state)}</span><span><strong>{Math.round(detail.confidence * 100)}%</strong> evidence confidence</span><span><strong>{detail.activities.length}</strong> activities</span><span><strong>{detail.assets.length}</strong> exact assets</span><span>Last seen <strong>{formatTime(detail.last_seen_at)}</strong></span></div>
-      <div className="drawer-tabs">{(["overview", "evidence"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{titleCase(item)}{item === "evidence" && <small>{detail.activities.length + detail.assets.length}</small>}</button>)}</div>
+      <div className="drawer-tabs">{(["overview", "evidence"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => onTab(item)}>{titleCase(item)}{item === "evidence" && <small>{detail.activities.length + detail.assets.length}</small>}</button>)}</div>
       <div className="drawer-content">{tab === "overview" ? <RuntimeDetectionOverview detail={detail} onOpenAsset={onOpenAsset} /> : <RuntimeDetectionEvidence detail={detail} onOpenActivity={onOpenActivity} onOpenAsset={onOpenAsset} />}</div>
     </>}
   </aside></div>;
@@ -1926,31 +2019,44 @@ const GITHUB_CONNECTION_SCOPES = [
   { id: "github.actions_workflows", label: "GitHub Actions workflows", detail: "Workflow inventory only; no workflow runs, secrets, or writes" },
 ];
 
+function connectionScopes(provider: "aws" | "azure" | "gcp" | "github") {
+  return provider === "aws" ? AWS_CONNECTION_SCOPES
+    : provider === "azure" ? AZURE_CONNECTION_SCOPES
+      : provider === "gcp" ? GCP_CONNECTION_SCOPES
+        : GITHUB_CONNECTION_SCOPES;
+}
+
 function ConnectionsPage({
   connections,
+  selectedId,
+  showCreate,
+  navigation,
+  onSelect,
+  onShowCreate,
   onChanged,
   azureConsentReturn,
   githubSetupReturn,
 }: {
   connections: Connection[];
+  selectedId?: string;
+  showCreate: boolean;
+  navigation: FilterNavigation;
+  onSelect: (id: string, mode?: "push" | "replace") => void;
+  onShowCreate: (visible: boolean) => void;
   onChanged: () => Promise<void>;
   azureConsentReturn: AzureConsentReturn | null;
   githubSetupReturn: GitHubSetupReturn | null;
 }) {
-  const [selectedId, setSelectedId] = useState<string | null>(() =>
-    connections.some((connection) => connection.id === (githubSetupReturn?.connectionId ?? azureConsentReturn?.connectionId))
-      ? githubSetupReturn?.connectionId ?? azureConsentReturn?.connectionId ?? null
-      : connections[0]?.id ?? null,
-  );
-  const [showCreate, setShowCreate] = useState(connections.length === 0);
-  const [provider, setProvider] = useState<"aws" | "azure" | "gcp" | "github">("aws");
+  const provider = (["aws", "azure", "gcp", "github"] as const).includes(navigation.values.provider as "aws" | "azure" | "gcp" | "github")
+    ? navigation.values.provider as "aws" | "azure" | "gcp" | "github"
+    : "aws";
   const [displayName, setDisplayName] = useState("");
   const [accountId, setAccountId] = useState("");
   const [partition, setPartition] = useState<AwsConnectionCreate["partition"]>("aws");
   const [deploymentRegion, setDeploymentRegion] = useState("us-east-1");
   const [coverageMode, setCoverageMode] = useState<AwsConnectionCreate["coverage_mode"]>("automatic");
   const [regions, setRegions] = useState("us-east-1");
-  const [scopes, setScopes] = useState(AWS_CONNECTION_SCOPES.map((scope) => scope.id));
+  const [scopes, setScopes] = useState(() => connectionScopes(provider).map((scope) => scope.id));
   const [azureTenantId, setAzureTenantId] = useState("");
   const [azureLaunches, setAzureLaunches] = useState<Record<string, AzureSetupLaunch>>({});
   const [azureCompletionCode, setAzureCompletionCode] = useState<Record<string, string>>({});
@@ -1959,6 +2065,19 @@ function ConnectionsPage({
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const selected = connections.find((connection) => connection.id === selectedId) ?? connections[0];
+
+  useEffect(() => {
+    setScopes(connectionScopes(provider).map((scope) => scope.id));
+  }, [provider]);
+
+  useEffect(() => {
+    if (selected && selected.id !== selectedId) onSelect(selected.id, "replace");
+    if (!selected && selectedId) onSelect("", "replace");
+  }, [onSelect, selected, selectedId]);
+
+  function selectProvider(next: "aws" | "azure" | "gcp" | "github") {
+    navigation.set("provider", next, "aws");
+  }
 
   async function createConnection(event: React.FormEvent) {
     event.preventDefault();
@@ -1991,8 +2110,7 @@ function ConnectionsPage({
         };
       const created = await api.createConnection(payload);
       await onChanged();
-      setSelectedId(created.id);
-      setShowCreate(false);
+      onSelect(created.id);
       setDisplayName("");
       setAccountId("");
       setAzureTenantId("");
@@ -2251,8 +2369,8 @@ function ConnectionsPage({
     setActionError(null);
     try {
       await api.deleteConnection(connection.id, confirmation);
-      setSelectedId(null);
       await onChanged();
+      onSelect("", "replace");
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "Unable to delete connection");
     } finally {
@@ -2269,7 +2387,7 @@ function ConnectionsPage({
   return <div className="page-stack connections-page">
     <section className="page-intro connection-intro">
       <div><span className="eyebrow">SELF-SERVICE ONBOARDING</span><h2>Connect evidence sources without handing Denali customer credentials.</h2><p>AWS uses assume-role; Azure and Google Cloud use provider-native, keyless identities; GitHub uses short-lived App installation tokens. Customers select exact cloud scopes or repositories, and every declared plane is validated separately.</p></div>
-      <button className="primary-action" onClick={() => setShowCreate((visible) => !visible)}><Plus /> Add connection</button>
+      <button className="primary-action" onClick={() => onShowCreate(!showCreate)}><Plus /> Add connection</button>
     </section>
     <section className="connection-boundary"><ShieldCheck /><div><strong>Connection health is not a risk verdict.</strong><span>A healthy connection means the configured role and declared validation calls worked. It does not mean collection is complete, findings are absent, or the connected environment is safe.</span></div></section>
     {azureConsentReturn && <div className={`connection-consent-return ${azureConsentReturn.state}`}>
@@ -2282,7 +2400,7 @@ function ConnectionsPage({
     </div>}
     {actionError && <div className="connection-error"><CircleAlert /><span>{actionError}</span></div>}
     {showCreate && <form className="panel connection-create" onSubmit={(event) => void createConnection(event)}>
-      <div className="connection-provider-picker"><button type="button" className={provider === "aws" ? "active" : ""} onClick={() => { setProvider("aws"); setScopes(AWS_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Amazon Web Services</button><button type="button" className={provider === "azure" ? "active" : ""} onClick={() => { setProvider("azure"); setScopes(AZURE_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Microsoft Azure</button><button type="button" className={provider === "gcp" ? "active" : ""} onClick={() => { setProvider("gcp"); setScopes(GCP_CONNECTION_SCOPES.map((scope) => scope.id)); }}>Google Cloud</button><button type="button" className={provider === "github" ? "active" : ""} onClick={() => { setProvider("github"); setScopes(GITHUB_CONNECTION_SCOPES.map((scope) => scope.id)); }}>GitHub</button></div>
+      <div className="connection-provider-picker"><button type="button" className={provider === "aws" ? "active" : ""} onClick={() => selectProvider("aws")}>Amazon Web Services</button><button type="button" className={provider === "azure" ? "active" : ""} onClick={() => selectProvider("azure")}>Microsoft Azure</button><button type="button" className={provider === "gcp" ? "active" : ""} onClick={() => selectProvider("gcp")}>Google Cloud</button><button type="button" className={provider === "github" ? "active" : ""} onClick={() => selectProvider("github")}>GitHub</button></div>
       <div className="connection-create-head"><div><span>NEW CONNECTION</span><h3>{provider === "aws" ? "Amazon Web Services" : provider === "azure" ? "Microsoft Azure" : provider === "gcp" ? "Google Cloud" : "GitHub"}</h3><p>{provider === "aws" ? "CloudFormation creates one read-only role with an external-ID trust condition. No access keys are created or stored." : provider === "azure" ? "Denali’s multi-tenant application receives Reader only on subscriptions you select in Azure Cloud Shell. No customer client secret is created or stored." : provider === "gcp" ? "Denali creates a unique keyless service account for this connection. Google Cloud Shell grants it bounded read roles only on projects you select; no customer key or user token is stored." : "Install Denali’s GitHub App on repositories you select. Denali uses short-lived, exact-repository installation tokens and never stores a personal access token or GitHub user token."}</p></div><span className="provider-mark">{provider === "aws" ? "AWS" : provider === "azure" ? "AZURE" : provider === "gcp" ? "GCP" : "GITHUB"}</span></div>
       <div className="connection-form-grid">
         <label><span>Connection name</span><input required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder={provider === "aws" ? "Production AWS" : provider === "azure" ? "Production Azure" : provider === "gcp" ? "Production Google Cloud" : "Production GitHub"} /></label>
@@ -2300,14 +2418,14 @@ function ConnectionsPage({
         <label><span>Token boundary</span><input value="One exact repository per short-lived token" disabled /><small>Denali records immutable repository IDs and does not silently include repositories added later.</small></label></>}
       </div>
       <fieldset className="connection-scope-picker"><legend>Declared collection planes</legend>{(provider === "aws" ? AWS_CONNECTION_SCOPES : provider === "azure" ? AZURE_CONNECTION_SCOPES : provider === "gcp" ? GCP_CONNECTION_SCOPES : GITHUB_CONNECTION_SCOPES).map((scope) => <label key={scope.id}><input type="checkbox" checked={scopes.includes(scope.id)} onChange={() => toggleScope(scope.id)} /><span><strong>{scope.label}</strong><small>{scope.detail}</small></span></label>)}</fieldset>
-      <div className="connection-form-actions"><button type="button" onClick={() => setShowCreate(false)}>Cancel</button><button className="primary-action" type="submit" disabled={busy === "create" || scopes.length === 0}>{busy === "create" ? "Creating…" : "Create onboarding plan"}</button></div>
+      <div className="connection-form-actions"><button type="button" onClick={() => onShowCreate(false)}>Cancel</button><button className="primary-action" type="submit" disabled={busy === "create" || scopes.length === 0}>{busy === "create" ? "Creating…" : "Create onboarding plan"}</button></div>
     </form>}
     <div className="connections-layout">
       <section className="panel connection-list-panel">
         <PanelHeader eyebrow="SOURCES" title={`${connections.length} connection${connections.length === 1 ? "" : "s"}`} />
-        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => setSelectedId(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : connection.provider === "azure" ? `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions` : connection.provider === "gcp" ? `${connection.configuration.projects?.length ?? 0} selected projects` : `${connection.configuration.account_login ?? "not installed"} · ${connection.configuration.repositories?.length ?? 0} exact repositories`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No connections configured</strong><span>Create an AWS, Azure, Google Cloud, or GitHub onboarding plan to begin.</span></div>}</div>
+        <div className="connection-list">{connections.map((connection) => <button key={connection.id} className={selected?.id === connection.id ? "active" : ""} onClick={() => onSelect(connection.id)}><span className="connection-provider-icon"><CloudCog /></span><span><strong>{connection.display_name}</strong><small>{connection.provider === "aws" ? `${connection.configuration.account_id} · ${(connection.configuration.coverage_mode ?? "automatic") === "automatic" ? "all enabled regions" : (connection.configuration.regions ?? []).join(", ")}` : connection.provider === "azure" ? `${connection.configuration.tenant_id} · ${connection.configuration.subscriptions?.length ?? 0} selected subscriptions` : connection.provider === "gcp" ? `${connection.configuration.projects?.length ?? 0} selected projects` : `${connection.configuration.account_login ?? "not installed"} · ${connection.configuration.repositories?.length ?? 0} exact repositories`}</small></span><ConnectionHealth state={connection.health_state} /></button>)}{connections.length === 0 && <div className="empty-state"><CloudCog /><strong>No connections configured</strong><span>Create an AWS, Azure, Google Cloud, or GitHub onboarding plan to begin.</span></div>}</div>
       </section>
-      {selected && <ConnectionDetail connection={selected} busy={busy} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} onCollectAzure={() => void collectAzureDeployments(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onCollectGcp={() => void collectGcpDeployments(selected)} onCollectAws={() => void collectAwsDeployments(selected)} onPrepareGitHub={() => void prepareGitHubSetup(selected)} onCollectGitHub={() => void collectGitHubSource(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
+      {selected && <ConnectionDetail connection={selected} busy={busy} navigation={navigation} azureLaunch={azureLaunches[selected.id]} azureCompletionCode={azureCompletionCode[selected.id] ?? ""} onAzureCompletionCode={(value) => setAzureCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareAzure={() => void prepareAzureSetup(selected)} onCompleteAzure={() => void completeAzureSetup(selected)} onCollectAzure={() => void collectAzureDeployments(selected)} gcpLaunch={gcpLaunches[selected.id]} gcpCompletionCode={gcpCompletionCode[selected.id] ?? ""} onGcpCompletionCode={(value) => setGcpCompletionCode((current) => ({ ...current, [selected.id]: value }))} onPrepareGcp={() => void prepareGcpSetup(selected)} onCompleteGcp={() => void completeGcpSetup(selected)} onCollectGcp={() => void collectGcpDeployments(selected)} onCollectAws={() => void collectAwsDeployments(selected)} onPrepareGitHub={() => void prepareGitHubSetup(selected)} onCollectGitHub={() => void collectGitHubSource(selected)} onLaunch={() => void launchConnection(selected)} onValidate={() => void validateConnection(selected)} onDisable={() => void disableConnection(selected)} onDelete={() => void deleteConnection(selected)} />}
     </div>
   </div>;
 }
@@ -2317,10 +2435,10 @@ function ConnectionHealth({ state }: { state: Connection["health_state"] }) {
   return <span className={`connection-health ${state}`}><Icon />{titleCase(state)}</span>;
 }
 
-function ConnectionDetail({ connection, busy, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, onCollectAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onCollectGcp, onCollectAws, onPrepareGitHub, onCollectGitHub, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; onCollectAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onCollectGcp: () => void; onCollectAws: () => void; onPrepareGitHub: () => void; onCollectGitHub: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+function ConnectionDetail({ connection, busy, navigation, azureLaunch, azureCompletionCode, onAzureCompletionCode, onPrepareAzure, onCompleteAzure, onCollectAzure, gcpLaunch, gcpCompletionCode, onGcpCompletionCode, onPrepareGcp, onCompleteGcp, onCollectGcp, onCollectAws, onPrepareGitHub, onCollectGitHub, onLaunch, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; navigation: FilterNavigation; azureLaunch?: AzureSetupLaunch; azureCompletionCode: string; onAzureCompletionCode: (value: string) => void; onPrepareAzure: () => void; onCompleteAzure: () => void; onCollectAzure: () => void; gcpLaunch?: GcpSetupLaunch; gcpCompletionCode: string; onGcpCompletionCode: (value: string) => void; onPrepareGcp: () => void; onCompleteGcp: () => void; onCollectGcp: () => void; onCollectAws: () => void; onPrepareGitHub: () => void; onCollectGitHub: () => void; onLaunch: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
   if (connection.provider === "azure") return <AzureConnectionDetail connection={connection} busy={busy} launch={azureLaunch} completionCode={azureCompletionCode} onCompletionCode={onAzureCompletionCode} onPrepare={onPrepareAzure} onComplete={onCompleteAzure} onCollect={onCollectAzure} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   if (connection.provider === "gcp") return <GcpConnectionDetail connection={connection} busy={busy} launch={gcpLaunch} completionCode={gcpCompletionCode} onCompletionCode={onGcpCompletionCode} onPrepare={onPrepareGcp} onComplete={onCompleteGcp} onCollect={onCollectGcp} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
-  if (connection.provider === "github") return <GitHubConnectionDetail connection={connection} busy={busy} onPrepare={onPrepareGitHub} onCollect={onCollectGitHub} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
+  if (connection.provider === "github") return <GitHubConnectionDetail connection={connection} busy={busy} navigation={navigation} onPrepare={onPrepareGitHub} onCollect={onCollectGitHub} onValidate={onValidate} onDisable={onDisable} onDelete={onDelete} />;
   const validation = connection.last_validation;
   const awsCredential = connection.credential_reference.type === "aws_assume_role" ? connection.credential_reference : null;
   const launching = busy === `launch:${connection.id}`;
@@ -2408,7 +2526,7 @@ function GcpConnectionDetail({ connection, busy, launch, completionCode, onCompl
   </section>;
 }
 
-function GitHubConnectionDetail({ connection, busy, onPrepare, onCollect, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; onPrepare: () => void; onCollect: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
+function GitHubConnectionDetail({ connection, busy, navigation, onPrepare, onCollect, onValidate, onDisable, onDelete }: { connection: Connection; busy: string | null; navigation: FilterNavigation; onPrepare: () => void; onCollect: () => void; onValidate: () => void; onDisable: () => void; onDelete: () => void }) {
   const validation = connection.last_validation;
   const repositories = connection.configuration.repositories ?? [];
   const setupComplete = repositories.length > 0;
@@ -2416,8 +2534,9 @@ function GitHubConnectionDetail({ connection, busy, onPrepare, onCollect, onVali
   const validating = connection.validation_state === "running" || busy === `validate:${connection.id}`;
   const credential = connection.credential_reference.type === "github_app_installation" ? connection.credential_reference : null;
   const permissions = [...new Set(connection.coverage_plan.flatMap((item) => item.permissions))].sort();
-  const [validationFilter, setValidationFilter] = useState<"attention" | "all" | "passed">("attention");
-  useEffect(() => setValidationFilter("attention"), [connection.id, validation?.completed_at]);
+  const validationFilter = (["attention", "all", "passed"] as const).includes(navigation.values.validation as "attention" | "all" | "passed")
+    ? navigation.values.validation as "attention" | "all" | "passed"
+    : "attention";
   const recordedResults = validation?.results ?? [];
   const recordedByRepository = recordedResults.reduce((grouped, result) => {
     if (result.repository_id === undefined) return grouped;
@@ -2462,7 +2581,7 @@ function GitHubConnectionDetail({ connection, busy, onPrepare, onCollect, onVali
       <div className={validation ? (connection.health_state === "healthy" ? "complete" : "attention") : "pending"}><span>{connection.health_state === "healthy" ? <Check /> : "3"}</span><div><strong>3. Validate every exact repository</strong><small>Denali mints a separate short-lived installation token for one recorded repository at a time, rebinds its immutable identity, and tests each declared read plane independently.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={validating} onClick={onValidate}><RefreshCw className={validating ? "spin" : undefined} />{validating ? "Validating GitHub…" : validation ? "Validate again" : "Validate connection"}</button>}{validating && <small className="validation-progress-note">Validation continues in the background. This page refreshes automatically when every repository is complete.</small>}</div></div>
       <div className={collection ? (collection.failed_count === 0 && collection.partial_count === 0 ? "complete" : "attention") : "pending"}><span>{collection?.failed_count === 0 && collection?.partial_count === 0 ? <Check /> : "4"}</span><div><strong>4. Collect source and correlate</strong><small>Denali resolves each default branch to an immutable commit, downloads only bounded analysis inputs with a repository-scoped token, and joins literal deployment identifiers to independently observed cloud workloads.</small>{connection.lifecycle_state === "active" && setupComplete && <button className="primary-action" disabled={collecting || validating} onClick={onCollect}><GitBranch className={collecting ? "spin" : undefined} />{collecting ? "Collecting and correlating…" : collection ? "Collect and correlate again" : "Collect source & correlate"}</button>}{collection && <small className="validation-progress-note">{collection.repository_count - collection.failed_count - collection.partial_count} complete · {collection.partial_count} partial · {collection.failed_count} failed · finished {formatTime(collection.completed_at)}</small>}</div></div>
     </div>
-    <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed GitHub account ID {validation.account_id_observed ?? "not established"}</small></div><div className="github-validation-overview"><div><small>Exact repositories</small><strong>{repositories.length}</strong><span>{attentionRepositories > 0 ? `${attentionRepositories} need attention` : unboundResults.length > 0 ? `${unboundResults.length} unbound result${unboundResults.length === 1 ? "" : "s"}` : "All repository boundaries checked"}</span></div><div><small>Independent plane checks</small><strong>{repositoryGroups.reduce((total, group) => total + group.results.length, 0)}</strong><span>Metadata · Contents · Actions</span></div><div className="passed"><small>Passed</small><strong>{totalPassed}</strong><span>Successful read checks</span></div><div className={totalAttention > 0 ? "attention" : "passed"}><small>Failed or unknown</small><strong>{totalAttention}</strong><span>{totalAttention > 0 ? "Expanded below" : "No unresolved checks"}</span></div></div><div className="github-validation-toolbar"><div><strong>Repository results</strong><small>Failures and unknowns are listed first. Passing repositories stay compact until expanded.</small></div><div role="group" aria-label="Filter repository validation results"><button type="button" className={effectiveFilter === "attention" ? "active" : ""} disabled={attentionRepositories === 0 && unboundResults.length === 0} onClick={() => setValidationFilter("attention")}>Needs attention <span>{attentionRepositories + (unboundResults.length > 0 ? 1 : 0)}</span></button><button type="button" className={effectiveFilter === "all" ? "active" : ""} onClick={() => setValidationFilter("all")}>All <span>{repositoryGroups.length + (unboundResults.length > 0 ? 1 : 0)}</span></button><button type="button" className={effectiveFilter === "passed" ? "active" : ""} disabled={passingRepositories === 0} onClick={() => setValidationFilter("passed")}>Passing <span>{passingRepositories}</span></button></div></div>{effectiveFilter !== "passed" && unboundResults.length > 0 && <details className="github-repository-validation attention" open><summary><span className="github-repository-state"><CircleAlert /></span><span><strong>Unbound validation results</strong><small>These results do not match a repository in the recorded exact boundary.</small></span><span className="github-plane-statuses" /><span className="github-repository-counts"><b>{unboundResults.length} unknown</b></span></summary><div className="github-plane-results">{unboundResults.map((result, index) => <GitHubValidationResult key={`${result.repository_id ?? "unbound"}:${result.plane}:${index}`} result={result} />)}</div></details>}<div className="github-repository-validations">{visibleGroups.map((group) => <details className={`github-repository-validation ${group.attention > 0 ? "attention" : "passed"}`} key={group.repository.id} open={group.attention > 0}><summary><span className="github-repository-state">{group.attention > 0 ? <CircleAlert /> : <CircleCheck />}</span><span><strong>{group.repository.full_name}</strong><small><code>Repository ID {group.repository.id}</code><code>Node ID {group.repository.node_id}</code></small></span><span className="github-plane-statuses">{group.results.map((result) => <i className={result.state} key={result.plane} title={`${result.label}: ${titleCase(result.state)}`}>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}<em>{result.label.replace("Repository ", "")}</em></i>)}</span><span className="github-repository-counts"><b className={group.attention > 0 ? "attention" : "passed"}>{group.attention > 0 ? `${group.attention} need attention` : `${group.passed} passed`}</b><small>{group.attention > 0 ? "Details expanded" : "Details collapsed"}</small></span></summary><div className="github-plane-results">{group.results.map((result) => <GitHubValidationResult key={`${group.repository.id}:${result.plane}`} result={result} />)}</div></details>)}</div>{visibleGroups.length === 0 && <div className="connection-unknown"><CircleHelp /><span><strong>No repositories match this filter</strong><small>Choose another result filter to inspect the recorded repository boundary.</small></span></div>}</> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Install the GitHub App and finish repository selection first.</small></span></div>}</div>
+    <div className="connection-section"><h4>Validation coverage</h4>{validation ? <><div className={`validation-summary ${validation.health_state}`}><strong>{validation.summary}</strong><small>Checked {formatTime(validation.completed_at)} · observed GitHub account ID {validation.account_id_observed ?? "not established"}</small></div><div className="github-validation-overview"><div><small>Exact repositories</small><strong>{repositories.length}</strong><span>{attentionRepositories > 0 ? `${attentionRepositories} need attention` : unboundResults.length > 0 ? `${unboundResults.length} unbound result${unboundResults.length === 1 ? "" : "s"}` : "All repository boundaries checked"}</span></div><div><small>Independent plane checks</small><strong>{repositoryGroups.reduce((total, group) => total + group.results.length, 0)}</strong><span>Metadata · Contents · Actions</span></div><div className="passed"><small>Passed</small><strong>{totalPassed}</strong><span>Successful read checks</span></div><div className={totalAttention > 0 ? "attention" : "passed"}><small>Failed or unknown</small><strong>{totalAttention}</strong><span>{totalAttention > 0 ? "Expanded below" : "No unresolved checks"}</span></div></div><div className="github-validation-toolbar"><div><strong>Repository results</strong><small>Failures and unknowns are listed first. Passing repositories stay compact until expanded.</small></div><div role="group" aria-label="Filter repository validation results"><button type="button" className={effectiveFilter === "attention" ? "active" : ""} disabled={attentionRepositories === 0 && unboundResults.length === 0} onClick={() => navigation.set("validation", "attention", "attention")}>Needs attention <span>{attentionRepositories + (unboundResults.length > 0 ? 1 : 0)}</span></button><button type="button" className={effectiveFilter === "all" ? "active" : ""} onClick={() => navigation.set("validation", "all", "attention")}>All <span>{repositoryGroups.length + (unboundResults.length > 0 ? 1 : 0)}</span></button><button type="button" className={effectiveFilter === "passed" ? "active" : ""} disabled={passingRepositories === 0} onClick={() => navigation.set("validation", "passed", "attention")}>Passing <span>{passingRepositories}</span></button></div></div>{effectiveFilter !== "passed" && unboundResults.length > 0 && <details className="github-repository-validation attention" open><summary><span className="github-repository-state"><CircleAlert /></span><span><strong>Unbound validation results</strong><small>These results do not match a repository in the recorded exact boundary.</small></span><span className="github-plane-statuses" /><span className="github-repository-counts"><b>{unboundResults.length} unknown</b></span></summary><div className="github-plane-results">{unboundResults.map((result, index) => <GitHubValidationResult key={`${result.repository_id ?? "unbound"}:${result.plane}:${index}`} result={result} />)}</div></details>}<div className="github-repository-validations">{visibleGroups.map((group) => <details className={`github-repository-validation ${group.attention > 0 ? "attention" : "passed"}`} key={group.repository.id} open={group.attention > 0}><summary><span className="github-repository-state">{group.attention > 0 ? <CircleAlert /> : <CircleCheck />}</span><span><strong>{group.repository.full_name}</strong><small><code>Repository ID {group.repository.id}</code><code>Node ID {group.repository.node_id}</code></small></span><span className="github-plane-statuses">{group.results.map((result) => <i className={result.state} key={result.plane} title={`${result.label}: ${titleCase(result.state)}`}>{result.state === "passed" ? <CircleCheck /> : result.state === "failed" ? <CircleAlert /> : <CircleHelp />}<em>{result.label.replace("Repository ", "")}</em></i>)}</span><span className="github-repository-counts"><b className={group.attention > 0 ? "attention" : "passed"}>{group.attention > 0 ? `${group.attention} need attention` : `${group.passed} passed`}</b><small>{group.attention > 0 ? "Details expanded" : "Details collapsed"}</small></span></summary><div className="github-plane-results">{group.results.map((result) => <GitHubValidationResult key={`${group.repository.id}:${result.plane}`} result={result} />)}</div></details>)}</div>{visibleGroups.length === 0 && <div className="connection-unknown"><CircleHelp /><span><strong>No repositories match this filter</strong><small>Choose another result filter to inspect the recorded repository boundary.</small></span></div>}</> : <div className="connection-unknown"><CircleHelp /><span><strong>Not validated</strong><small>Install the GitHub App and finish repository selection first.</small></span></div>}</div>
     <details className="connection-permissions"><summary>Review {permissions.length || 3} declared GitHub permissions</summary><div>{(permissions.length ? permissions : ["metadata:read", "contents:read", "actions:read"]).map((permission) => <code key={permission}>{permission}</code>)}</div><p>This slice cannot write source, dispatch workflows, read Actions secrets, administer repositories, receive webhooks, or access repositories outside the recorded immutable IDs. Branch-protection posture is not claimed.</p></details>
     <div className="connection-safeguards"><div><strong>Connection lifecycle</strong><span>Disabling prevents further validation. Deleting removes Denali’s connection configuration and validation history only; uninstall the GitHub App separately in GitHub. Previously collected evidence remains.</span>{credential?.installation_id && <code>Installation ID {credential.installation_id}</code>}{connection.configuration.installer && <code>Verified installer {connection.configuration.installer.login} · user ID {connection.configuration.installer.id}</code>}</div>{connection.lifecycle_state === "active" ? <button disabled={busy === `disable:${connection.id}`} onClick={onDisable}><Power /> Disable</button> : <button className="danger-action" disabled={busy === `delete:${connection.id}`} onClick={onDelete}><Trash2 /> Delete configuration</button>}</div>
   </section>;
@@ -2499,12 +2618,16 @@ function Sources({ coverage }: { coverage: Coverage[] }) {
 
 function ResourceDrawer({
   assetId,
+  tab,
+  onTab,
   onClose,
   onOpenAsset,
   onOpenActivity,
   onUpdated,
 }: {
   assetId: string;
+  tab: DetailTab;
+  onTab: (tab: string) => void;
   onClose: () => void;
   onOpenAsset: (id: string) => void;
   onOpenActivity: (id: string) => void;
@@ -2512,12 +2635,11 @@ function ResourceDrawer({
 }) {
   const [detail, setDetail] = useState<AssetDetail | null>(null);
   const [assetActivities, setAssetActivities] = useState<RuntimeActivity[]>([]);
-  const [tab, setTab] = useState<DetailTab>("overview");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    setDetail(null); setAssetActivities([]); setError(null); setTab("overview");
+    setDetail(null); setAssetActivities([]); setError(null);
     Promise.all([api.asset(assetId), api.activityForAsset(assetId)])
       .then(([asset, activity]) => {
         setDetail(asset);
@@ -2542,7 +2664,7 @@ function ResourceDrawer({
     {!detail && !error ? <LoadingState compact /> : error ? <ErrorState message={error} /> : detail && <>
       <div className="drawer-header"><button className="drawer-close" onClick={onClose}><X /></button><span className={`asset-icon large ${itemMeta.color}`}><Icon /></span><div><span>{itemMeta.label}</span><h2>{detail.assertions[0]?.display_name ?? shortKey(detail.natural_key)}</h2><p>{detail.natural_key}</p></div><span className={`lifecycle-badge ${detail.lifecycle_state}`}><span />{titleCase(detail.lifecycle_state)}</span></div>
       <div className="drawer-actions"><span>Governance</span>{(["approved", "unreviewed", "unwanted"] as const).map((status) => <button key={status} disabled={saving} className={detail.governance_status === status ? "active" : ""} onClick={() => void updateGovernance(status)}>{status === "approved" ? <CircleCheck /> : status === "unwanted" ? <CircleAlert /> : <CircleHelp />}{titleCase(status)}</button>)}</div>
-      <div className="drawer-tabs">{(["overview", "relationships", "evidence"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{titleCase(item)}{item === "relationships" && <small>{detail.relationships.length}</small>}{item === "evidence" && <small>{detail.assertions.length}</small>}</button>)}</div>
+      <div className="drawer-tabs">{(["overview", "relationships", "evidence"] as const).map((item) => <button key={item} className={tab === item ? "active" : ""} onClick={() => onTab(item)}>{titleCase(item)}{item === "relationships" && <small>{detail.relationships.length}</small>}{item === "evidence" && <small>{detail.assertions.length}</small>}</button>)}</div>
       <div className="drawer-content">
         {tab === "overview" ? <OverviewTab detail={detail} activities={assetActivities} onOpenAsset={onOpenAsset} onOpenActivity={onOpenActivity} /> : tab === "relationships" ? <RelationshipsTab detail={detail} onOpenAsset={onOpenAsset} /> : <EvidenceTab detail={detail} />}
       </div>
