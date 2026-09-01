@@ -10,8 +10,18 @@ The hosted pilot keeps PostgreSQL as Denali's source of truth and separates the 
 - Modal for the FastAPI application and durable validation workers;
 - Neon for managed PostgreSQL.
 
+The canonical architecture and contributor constraints are in
+[ADR 0028](../architecture/0028-hosted-multi-tenant-runtime.md). Repository-wide agent guidance is
+in [`AGENTS.md`](../../AGENTS.md).
+
 Provider connections retain their current boundary: they onboard and validate access. They do
 not schedule or run collectors automatically.
+
+Connection validation is durable because it uses a PostgreSQL job and a separately spawned Modal
+worker. The current manually triggered GitHub source and cloud deployment collection endpoints run
+inside the Modal API container with FastAPI background tasks; they are not restart-safe. Do not
+extend that pattern. Migrate collection to PostgreSQL-backed Modal jobs before treating collection
+as a reliable hosted production workflow.
 
 ## 1. Create the Neon database
 
@@ -52,8 +62,9 @@ query continues to use the UUID tenant predicate. Members can read; only admins 
 
 ## 3. Configure and deploy Modal
 
-Create one Modal secret named `denali-production` containing the variables relevant to the
-deployment from `.env.example`. At minimum it needs:
+Create one Modal secret containing the variables relevant to the deployment from `.env.example`.
+The source default name is `denali-production`; set `DENALI_MODAL_SECRET_NAME` in the deploy shell
+when the environment uses another name. At minimum it needs:
 
 - `DENALI_DSN`, `DENALI_MIGRATION_DSN`, and `DENALI_WEB_URL`;
 - `CLERK_SECRET_KEY`, `CLERK_JWT_KEY`, and `CLERK_AUTHORIZED_PARTIES`;
@@ -83,6 +94,11 @@ boto's standard web-identity provider chain.
 Do not put the GitHub private key in the image. Store its PEM value as
 `DENALI_GITHUB_PRIVATE_KEY` in the Modal secret. The local file-based variable remains available
 for Compose development.
+
+The provider entries in this Secret configure Denali-operated identities and artifact publishers.
+Do not add a tenant's access keys, service-account JSON, OAuth access token, or GitHub personal
+token. Each organization grants access through the provider-specific assume-role, consent,
+principal, or App-installation flow; tenant identifiers and selected scopes are stored in Neon.
 
 ## 4. Configure Vercel and the domain
 

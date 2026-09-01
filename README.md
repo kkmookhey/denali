@@ -134,7 +134,9 @@ For the Clerk Organizations, Vercel, Modal, and Neon pilot deployment, start wit
 [ordered launch checklist](docs/deployment/pilot-launch-checklist.md), then use the
 [hosted multi-tenant pilot runbook](docs/deployment/hosted-pilot.md). Hosted mode maps each
 active Clerk organization to a stable Denali tenant UUID, enforces admin-only mutations, and
-runs provider validation through durable Modal jobs.
+runs provider validation through durable Modal jobs. The canonical service boundaries, secret
+ownership, tenant isolation rules, and durable-work standard are recorded in
+[ADR 0028](docs/architecture/0028-hosted-multi-tenant-runtime.md).
 
 ## Run collectors and importers
 
@@ -186,6 +188,8 @@ Start with the product and evidence boundaries, then follow only the slice being
 
 - [Standalone product](docs/architecture/0001-standalone-product.md) and
   [OCSF boundary](docs/architecture/0002-ocsf-boundary.md)
+- [Hosted multi-tenant runtime](docs/architecture/0028-hosted-multi-tenant-runtime.md) for the
+  Vercel, Clerk, Modal, and Neon deployment, tenant authorization, secrets, and durable jobs
 - [Evidence-bearing issues](docs/architecture/0005-evidence-bearing-issues.md)
 - [SBOM-first vulnerability model](docs/architecture/0006-sbom-first-vulnerability-model.md),
   [artifact correlation](docs/architecture/0013-artifact-vulnerability-correlation.md), and

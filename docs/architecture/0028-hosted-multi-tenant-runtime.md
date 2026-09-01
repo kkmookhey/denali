@@ -1,0 +1,171 @@
+# ADR 0028: Hosted multi-tenant runtime uses Vercel, Clerk, Modal, and Neon
+
+## Status
+
+Accepted and deployed for the invitation-only pilot on 2026-09-01. The web application,
+same-origin API proxy, Clerk Organization authorization, Modal API, durable connection-validation
+worker, and Neon schema are live. Provider integrations still require individual production
+configuration and hosted acceptance. Provider collection jobs are not yet restart-safe and remain
+a documented migration item.
+
+## Decision
+
+Denali's hosted runtime has four service boundaries:
+
+```text
+Browser
+  -> Vercel: React/Vite application and same-origin /api/* rewrite
+  -> Modal: FastAPI authorization/API boundary
+       -> Modal validation_worker: durable connection validation
+  -> Neon: PostgreSQL system of record
+
+Clerk Organizations
+  -> browser session token
+  -> FastAPI JWT verification and active-organization resolution
+```
+
+Vercel serves static frontend assets and proxies `/api/*` to the Modal origin. The browser attaches
+the current Clerk session token to every API request and does not know the Neon DSN, Clerk backend
+key, or provider integration secrets. Keeping the API same-origin gives the application one public
+domain for authenticated requests and provider callbacks.
+
+Modal packages the existing FastAPI application as an ASGI application. API containers are
+ephemeral and must be replaceable; durable correctness cannot depend on their memory. Neon
+PostgreSQL is the sole durable application store. Migrations execute as an explicit deployment
+operation using the direct Neon connection and a PostgreSQL advisory lock; API startup never
+mutates the schema.
+
+## Identity and authorization
+
+Clerk owns sign-in, invitations, membership, Organization switching, and the `org:admin` and
+`org:member` roles. Denali owns authorization and data isolation.
+
+On the first approved authenticated request, the API maps the active Clerk Organization ID to one
+random Denali tenant UUID in the `tenant` table. This mapping is permanent. All existing tenant
+foreign keys and predicates continue to use the Denali UUID; Clerk identifiers do not become
+domain primary keys.
+
+The API verifies the Clerk token signature, issuer, expiry, authorized party, session state, active
+Organization, and Organization role. Both roles may read. Only `org:admin` may create, configure,
+validate, disable, or delete connections and mutate governance. UI role checks may hide controls,
+but they never replace API enforcement.
+
+Every tenant-owned repository method accepts the server-resolved Denali tenant UUID. Tenant IDs
+from request bodies, query parameters, routes, arbitrary headers, or the browser's selected state
+are untrusted and cannot select a tenant.
+
+`/healthz`, API documentation, and the GitHub provider callbacks are public at the HTTP middleware
+layer. Callback authorization instead uses verified, expiring, one-time setup state. The stored
+state resolves both tenant and connection, so changing the browser's active Organization cannot
+redirect a callback into another tenant.
+
+## Durable work
+
+Connection validation is the reference durable-work implementation:
+
+1. The authenticated API creates a `connection_validation_job` row scoped to tenant and
+   connection. A partial unique index prevents two active jobs for the same connection.
+2. The API calls Modal `Function.spawn()` with only the job UUID and stores the Modal call ID.
+3. `validation_worker` claims a bounded PostgreSQL lease, reloads the tenant-scoped connection,
+   performs validation idempotently, and records success or a sanitized failure.
+4. Status polling reads PostgreSQL. It does not rely on the API process that accepted the request.
+5. Stale leases become failed before a later manual retry creates a replacement job.
+
+All new hosted work that can outlive a request must follow this pattern: durable job row, idempotent
+claim, explicit lease/timeout, Modal worker receiving durable identifiers, database-backed status,
+sanitized terminal result, and safe retry/deduplication behavior.
+
+The current GitHub source and AWS/Azure/GCP deployment collection endpoints predate this standard.
+They use FastAPI `BackgroundTasks`, process-local locks, and process-local last-result dictionaries.
+They can run in the Modal API container but are not durable across container replacement or scale
+out. They must be migrated to PostgreSQL collection jobs and dedicated Modal workers before they
+are treated as reliable hosted production workflows. New code must not extend this temporary
+pattern.
+
+## Database connections and migrations
+
+- `DENALI_DSN` is the pooled Neon endpoint used by the API and workers.
+- `DENALI_MIGRATION_DSN` is the direct Neon endpoint used only by explicit migration and database
+  administration operations.
+- Production runtime roles should be least privilege; the migration role owns the schema while the
+  runtime role receives required DML and sequence privileges.
+- A schema change always adds a new numbered SQL migration. Applied migrations are immutable.
+- Tenant-owned tables, jobs, connections, inventory, findings, and governance records must retain
+  database-enforced tenant relationships where practical and tenant predicates in every query.
+
+## Configuration and secret ownership
+
+Vercel receives only:
+
+| Variable | Purpose | Secret |
+| --- | --- | --- |
+| `VITE_CLERK_PUBLISHABLE_KEY` | Initialize Clerk in the browser | No |
+| `MODAL_API_ORIGIN` | Server-side rewrite target | No |
+
+Modal receives core backend configuration:
+
+| Variable | Purpose | Secret |
+| --- | --- | --- |
+| `DENALI_DSN` | Pooled Neon runtime connection | Yes |
+| `DENALI_MIGRATION_DSN` | Direct Neon migration connection | Yes, privileged |
+| `CLERK_SECRET_KEY` | Clerk backend operations | Yes |
+| `CLERK_JWT_KEY` | Offline Clerk JWT verification key | Public key material, backend-only |
+| `CLERK_AUTHORIZED_PARTIES` | Allowed production browser origins | No |
+| `DENALI_WEB_URL`, `DENALI_CORS_ORIGINS` | Canonical web and controlled direct-call origins | No |
+
+Provider values in Modal describe Denali-operated integrations: the GitHub App, Azure multi-tenant
+application, GCP operator project, private setup-artifact locations, and Modal's AWS OIDC role.
+They are not one shared customer credential and they do not replace tenant-specific grants.
+
+Tenant onboarding remains bring-your-own-cloud without uploaded long-lived credentials:
+
+- AWS stores a tenant role ARN, external ID, selected account/Regions, and validation evidence.
+  Modal uses its short-lived OIDC identity to assume the role.
+- Azure stores the consented tenant and selected subscription identifiers. The Denali-operated
+  multi-tenant application obtains bounded tokens when required; access tokens are not persisted.
+- GCP stores selected project identifiers and a unique per-connection principal grant. No service
+  account JSON key is accepted or stored.
+- GitHub stores App installation and exact repository identifiers. Installer OAuth tokens and App
+  private keys never enter tenant records.
+
+## Deployment and request contracts
+
+The frontend continues to call relative `/api/v1/*` paths. Production provider redirect URLs use
+the same canonical web domain under `/api/v1/connections/...`; they never expose the Modal origin
+as the product callback URL.
+
+The Modal application contains separate functions for the ASGI API, database migration, database
+status, configuration status, and validation worker. The pilot keeps a warm API container, but
+correctness must not depend on its lifetime or on requests reaching the same container.
+
+`DENALI_MODAL_REGION` and `DENALI_MODAL_SECRET_NAME` are deploy-shell configuration because Modal
+resolves image/function declarations before runtime Secrets are attached. They must be set in the
+deployment environment when the region or Secret name differs from the source defaults.
+
+Local Compose mode remains supported for development with one configured tenant and no Clerk
+authorization. Local mode is not a production topology and must not weaken hosted defaults.
+
+## Observability and acceptance
+
+Structured logs may carry Denali tenant UUID, connection UUID, job UUID, route, status, and bounded
+error classification. They must not carry Clerk tokens, authorization headers, DSNs, callback
+codes, provider tokens, private keys, source contents, or customer credential payloads.
+
+A hosted change is accepted only after the relevant automated tests and production builds pass.
+Authentication or persistence changes additionally require PostgreSQL-backed cross-tenant tests.
+Durable work requires restart, duplicate, retry, timeout, failure, and stale-lease coverage.
+
+A provider is enabled only after its production configuration exists and the hosted UI completes
+create, setup/callback, validation, disable, and delete. Connection health and provider collection
+are separate acceptance planes; one cannot stand in for the other.
+
+## Consequences
+
+- Vercel is replaceable static delivery and routing, not a trusted backend or secret store.
+- Modal API containers may scale or restart without losing authoritative state.
+- Clerk Organization switching changes the server-resolved tenant without changing domain keys.
+- Neon stays compatible with the existing PostgreSQL repository and transaction semantics.
+- Customer cloud access is revocable at the provider and does not require Denali to retain
+  long-lived customer secrets.
+- Durable validation meets the pilot requirement. Durable hosted collection remains explicit work
+  rather than an implied property of running collectors in the API container.

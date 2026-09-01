@@ -48,9 +48,11 @@ Neon:  database denali; migrations 001 through 012 applied
 
 ### P2 — hardening and operations
 
-1. Enable Modal failure/timeout alerts, Vercel deployment monitoring, and Neon alerts/backups.
-2. Run and document a Neon restore drill.
-3. Add the Clerk publishable key to Vercel Development if Vercel-hosted development builds are
+1. Replace API-container collection background tasks and in-memory status with PostgreSQL-backed,
+   idempotent Modal collection jobs before treating hosted collection as restart-safe.
+2. Enable Modal failure/timeout alerts, Vercel deployment monitoring, and Neon alerts/backups.
+3. Run and document a Neon restore drill.
+4. Add the Clerk publishable key to Vercel Development if Vercel-hosted development builds are
    required; Production and Preview are already configured.
 
 Live authenticated smoke acceptance completed on 2026-09-01:
