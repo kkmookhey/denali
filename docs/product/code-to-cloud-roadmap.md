@@ -31,11 +31,14 @@ context, exact identity requirements, and visible proven, ambiguous, and unmatch
    A live selected-Region role validation and all eight collection planes passed on
    2026-08-31; see [the acceptance record](aws-code-to-cloud-live-acceptance-2026-08-31.md)
    and [the AWS decision record](../architecture/0026-aws-deployment-code-to-cloud.md).
-5. **Shared Kubernetes correlation — implementation complete; live cluster acceptance
-   pending.** EKS, AKS, and GKE workloads now share one bounded snapshot importer and exact
+5. **Shared Kubernetes correlation — complete.** EKS, AKS, and GKE workloads share one
+   bounded snapshot importer and exact
    provider-cluster, namespace, kind, name, service-account, UID/revision, and image-digest
    evidence contract. GKE and AKS cluster resources are independently observed alongside the
-   existing EKS inventory. See
+   existing EKS inventory. A zero-compute EKS fixture passed live exact-match, unmatched,
+   ambiguity, persistence, served-API, evidence-minimization, and teardown acceptance on
+   2026-08-31; see
+   [the acceptance record](kubernetes-code-to-cloud-live-acceptance-2026-08-31.md) and
    [the Kubernetes decision record](../architecture/0027-shared-kubernetes-code-to-cloud.md).
 
 ## Acceptance rules for every step

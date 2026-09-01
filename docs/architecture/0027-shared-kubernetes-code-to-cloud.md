@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted and implemented on 2026-08-31. Automated connector and correlation verification
-passes for EKS, GKE, and AKS identity shapes. Live cluster acceptance remains pending.
+Accepted, implemented, and live-accepted through EKS on 2026-08-31. Automated connector and
+correlation verification also passes for GKE and AKS identity shapes. See the
+[live acceptance record](../product/kubernetes-code-to-cloud-live-acceptance-2026-08-31.md).
 
 ## Decision
 
@@ -106,5 +107,5 @@ credential.
 - Kubernetes API observation and cloud cluster observation remain independent evidence.
 - Workload source revision remains unattested unless a separate artifact provenance source
   proves it.
-- Live acceptance needs existing EKS, GKE, and AKS clusters or explicit authorization to
-  create cost-bearing fixtures.
+- The shared workload contract has live EKS evidence. GKE and AKS workload identities retain
+  automated contract coverage but have not each received a separate live workload fixture.

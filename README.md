@@ -31,7 +31,7 @@ Status terms in this README are deliberately independent:
 | Self-service GitHub connection | **Shipped** | **Locally accepted** through the organization-owned GitHub App against 18 exact repositories, with all 54 repository/plane validations passing |
 | GCP and Azure code-to-cloud correlation | **Shipped** | **Locally accepted** against independently observed, private scale-to-zero fixtures with exact source identity, PostgreSQL reporting, and browser evidence |
 | AWS Lambda, ECS, EKS, and SageMaker code-to-cloud correlation | **Shipped** | **Locally accepted** against exact live account/Region validation and eight independent deployment collection planes |
-| Shared EKS, GKE, and AKS workload correlation | **Shipped** | Exact cluster/workload/service-account/image-digest implementation and local gates pass; live cluster acceptance remains pending |
+| Shared EKS, GKE, and AKS workload correlation | **Shipped** | **Locally accepted** through a live, control-plane-only EKS fixture with exact workload UID/revision, service-account, image-digest, negative-case, persistence, API, and teardown evidence; GKE and AKS workload identities remain covered by automated contract tests |
 | GitHub source-to-cloud correlation | **Shipped** | Automated connector, API, PostgreSQL, and production-web gates pass; live GitHub collection and browser acceptance remain pending |
 
 These connection statuses describe onboarding and access validation. They do **not** mean
