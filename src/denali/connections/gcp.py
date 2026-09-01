@@ -404,4 +404,10 @@ def _authorized_request(credential: GcpCredential) -> GcpRequest:
 def authorized_gcp_request(principal_email: str) -> GcpRequest:
     """Create the bounded authorized request callable for one connection principal."""
 
-    return _authorized_request(_default_credential(principal_email))
+    return _authorized_request(authorized_gcp_credential(principal_email))
+
+
+def authorized_gcp_credential(principal_email: str) -> GcpCredential:
+    """Create credentials impersonating one configured Denali reader principal."""
+
+    return _default_credential(principal_email)

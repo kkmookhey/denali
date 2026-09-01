@@ -789,6 +789,18 @@ def test_unresolved_local_import_is_partial_without_inventing_a_module(tmp_path:
     assert "local import './missing.js' was not found" in (batch.coverage[0].detail or "")
 
 
+def test_missing_generated_import_is_deliberately_omitted_from_artifact_graph() -> None:
+    sources = {
+        "src/entry.ts": "import './screenshots.generated.js';\nexport const entry = true;\n",
+    }
+
+    reachable, chains, warnings = _local_module_graph("src/entry.ts", sources)
+
+    assert warnings == []
+    assert reachable == {"src/entry.ts"}
+    assert chains == {"src/entry.ts": ["src/entry.ts"]}
+
+
 def test_model_or_name_only_match_does_not_create_a_deployment_edge(tmp_path: Path) -> None:
     (tmp_path / "stack.ts").write_text(SOURCE)
     wrong_logical_id = target(

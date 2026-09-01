@@ -41,6 +41,16 @@ context, exact identity requirements, and visible proven, ambiguous, and unmatch
    [the acceptance record](kubernetes-code-to-cloud-live-acceptance-2026-08-31.md) and
    [the Kubernetes decision record](../architecture/0027-shared-kubernetes-code-to-cloud.md).
 
+## Demo operationalization — complete
+
+The accepted provider slices now feed a deliberately small
+[two-application Golden Path](golden-path-demo.md): Anna on AWS and Summit on GCP. A
+versioned manifest defines exact connection, repository, workload, relationship, forbidden
+connector, and row-budget boundaries. The guarded reset command removes stale localhost
+evidence without touching cloud resources; the verification command fails closed if the
+rebuilt tenant drifts from the story. The Overview page exposes both applications before the
+presenter enters the detailed code-to-cloud evidence view.
+
 ## Acceptance rules for every step
 
 - A runtime target is eligible only when independently and actively observed.

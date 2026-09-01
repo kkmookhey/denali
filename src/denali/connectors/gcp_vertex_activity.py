@@ -8,6 +8,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from denali.connections.gcp import authorized_gcp_credential
 from denali.connectors.activity_json import ActivityJsonConnector
 from denali.domain import ActivityBatch, ConnectorCapabilities, Coverage, CoverageState
 from denali.store.db import migrate
@@ -121,6 +122,10 @@ def scan_main() -> None:
         description="Collect Vertex AI activity metadata from Google Cloud Logging"
     )
     parser.add_argument("--project-id", help="Google Cloud project; defaults to ADC project")
+    parser.add_argument(
+        "--principal-email",
+        help="bounded Denali reader service account to impersonate",
+    )
     parser.add_argument("--lookback-hours", type=int, default=24)
     parser.add_argument("--connection-id", help="source connection id")
     parser.add_argument(
@@ -140,9 +145,13 @@ def scan_main() -> None:
         message = "GCP activity collection requires: pip install 'denali-ai-security[gcp]'"
         raise SystemExit(message) from error
 
-    credentials, default_project = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform.read-only"]
-    )
+    if args.principal_email:
+        credentials = authorized_gcp_credential(args.principal_email)
+        default_project = None
+    else:
+        credentials, default_project = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform.read-only"]
+        )
     project_id = args.project_id or default_project
     if not project_id:
         parser.error("--project-id is required when ADC has no default project")

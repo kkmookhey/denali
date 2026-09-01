@@ -32,7 +32,8 @@ Status terms in this README are deliberately independent:
 | GCP and Azure code-to-cloud correlation | **Shipped** | **Locally accepted** against independently observed, private scale-to-zero fixtures with exact source identity, PostgreSQL reporting, and browser evidence |
 | AWS Lambda, ECS, EKS, and SageMaker code-to-cloud correlation | **Shipped** | **Locally accepted** against exact live account/Region validation and eight independent deployment collection planes |
 | Shared EKS, GKE, and AKS workload correlation | **Shipped** | **Locally accepted** through a live, control-plane-only EKS fixture with exact workload UID/revision, service-account, image-digest, negative-case, persistence, API, and teardown evidence; GKE and AKS workload identities remain covered by automated contract tests |
-| GitHub source-to-cloud correlation | **Shipped** | Automated connector, API, PostgreSQL, and production-web gates pass; live GitHub collection and browser acceptance remain pending |
+| GitHub source-to-cloud correlation | **Shipped** | **Locally accepted** against two immutable GitHub revisions, with all source/inventory/posture/correlation planes complete and two independently observed runtime links proven |
+| Two-application code-to-cloud Golden Path | **Shipped** | Anna on AWS and Summit on GCP are bounded by a versioned reset/verify manifest with two live, exact source-to-runtime links and a dedicated dashboard story |
 
 These connection statuses describe onboarding and access validation. They do **not** mean
 that provider collection ran or that inventory, findings, or a security verdict exist.
@@ -53,6 +54,8 @@ Denali presents the following product surfaces in the web application and API:
 - Source coverage that keeps complete, partial, failed, unsupported, and unknown states
   visible.
 - Stable application routes with direct deep links and browser Back/Forward navigation.
+- A manifest-bounded Golden Path dashboard for a small, reproducible two-application demo;
+  see the [operator and presenter guide](docs/product/golden-path-demo.md).
 - Connection lifecycle and access validation for AWS, Azure, Google Cloud, and GitHub,
   including explicit scope selection and disable-before-delete safeguards.
 

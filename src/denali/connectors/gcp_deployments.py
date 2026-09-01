@@ -153,9 +153,18 @@ class GcpConnectionDeploymentCollector:
         if GCP_SCOPE_CODE_TO_CLOUD not in connection.get("declared_scopes", []):
             raise ValueError("Google Cloud code-to-cloud scope is not declared")
         projects = connection.get("configuration", {}).get("projects", [])
+        configured_resource_names = connection.get("configuration", {}).get(
+            "resource_names"
+        )
         principal = connection.get("credential_reference", {}).get("principal_email")
         if not isinstance(projects, list) or not projects or not isinstance(principal, str):
             raise ValueError("complete Google Cloud project selection before collecting")
+        if configured_resource_names is not None and (
+            not isinstance(configured_resource_names, list)
+            or not configured_resource_names
+            or any(not isinstance(item, str) for item in configured_resource_names)
+        ):
+            raise ValueError("Google Cloud resource_names must be a non-empty string list")
 
         client = self._asset_client_factory(principal)
         project_results: list[dict[str, Any]] = []
@@ -172,6 +181,11 @@ class GcpConnectionDeploymentCollector:
                 project_id=project_id,
                 project_number=project_number,
                 asset_client=client,
+                included_resource_names=(
+                    tuple(configured_resource_names)
+                    if configured_resource_names is not None
+                    else None
+                ),
             ).collect(connection_id=str(connection["id"]))
             repository.ingest(tenant_id, batch)
             states = {item.state for item in batch.coverage}
@@ -223,6 +237,7 @@ class GcpDeploymentConnector:
         project_id: str,
         asset_client: GcpAssetClient,
         project_number: str | None = None,
+        included_resource_names: tuple[str, ...] | None = None,
     ):
         if not valid_gcp_project_id(project_id):
             raise ValueError("Google Cloud project ID has an invalid shape")
@@ -231,6 +246,9 @@ class GcpDeploymentConnector:
         self.project_id = project_id
         self.project_number = project_number
         self.asset_client = asset_client
+        self.included_resource_names = (
+            frozenset(included_resource_names) if included_resource_names is not None else None
+        )
 
     def collect(self, *, connection_id: str | None = None) -> InventoryBatch:
         observed_at = datetime.now(UTC)
@@ -276,7 +294,14 @@ class GcpDeploymentConnector:
                 continue
 
             ai_workloads = 0
+            selected_resources = 0
             for position, raw in enumerate(raw_assets):
+                if (
+                    self.included_resource_names is not None
+                    and raw.get("name") not in self.included_resource_names
+                ):
+                    continue
+                selected_resources += 1
                 try:
                     parsed = _parse_asset(
                         raw,
@@ -321,7 +346,12 @@ class GcpDeploymentConnector:
             state = CoverageState.PARTIAL if warnings else CoverageState.COMPLETE
             summary = (
                 f"Observed {len(raw_assets)} {asset_type} resources; "
-                f"classified {ai_workloads} as AI workloads."
+                + (
+                    f"selected {selected_resources} by exact resource name; "
+                    if self.included_resource_names is not None
+                    else ""
+                )
+                + f"classified {ai_workloads} as AI workloads."
             )
             detail = "; ".join([summary, *warnings[:10]])
             coverage.extend(

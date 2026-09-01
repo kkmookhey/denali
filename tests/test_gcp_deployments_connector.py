@@ -225,6 +225,33 @@ def test_asset_type_failures_are_isolated_by_coverage_plane() -> None:
     assert all("secret" not in (item.detail or "") for item in batch.coverage)
 
 
+def test_exact_resource_name_boundary_excludes_other_project_services() -> None:
+    selected = run_asset(name="summit", ai=True)
+    client = FakeAssetClient(
+        {
+            CLOUD_RUN_ASSET_TYPE: (
+                selected,
+                run_asset(name="older-fixture", ai=True),
+            )
+        }
+    )
+
+    batch = GcpDeploymentConnector(
+        project_id=PROJECT,
+        asset_client=client,
+        included_resource_names=(selected["name"],),
+    ).collect()
+
+    assert {item.display_name for item in batch.assets} == {
+        "summit",
+        f"summit@{PROJECT}.iam.gserviceaccount.com",
+    }
+    run_coverage = next(
+        item for item in batch.coverage if item.plane == CLOUD_RUN_INVENTORY_PLANE
+    )
+    assert "selected 1 by exact resource name" in (run_coverage.detail or "")
+
+
 def test_cloud_asset_knative_v1_service_shape_is_normalized() -> None:
     client = FakeAssetClient({CLOUD_RUN_ASSET_TYPE: (run_asset_v1(),)})
 

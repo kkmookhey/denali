@@ -15,7 +15,7 @@ import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -1665,6 +1665,8 @@ def _local_module_graph(
         for specifier in _local_imports(source_texts[current]):
             matches = _resolve_local_module(current, specifier, source_texts)
             if len(matches) != 1:
+                if not matches and ".generated." in PurePosixPath(specifier).name.lower():
+                    continue
                 outcome = "not found" if not matches else f"ambiguous ({', '.join(matches)})"
                 warnings.append(f"{current}: local import {specifier!r} was {outcome}")
                 continue

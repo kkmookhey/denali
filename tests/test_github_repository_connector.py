@@ -30,6 +30,12 @@ def test_github_snapshot_selects_gcp_iac_inputs() -> None:
     assert _eligible_path("deploy/service.yml")
 
 
+def test_github_snapshot_excludes_generated_source_artifacts() -> None:
+    assert not _eligible_path("src/render/screenshots.generated.ts")
+    assert not _eligible_path("src/client.generated.js")
+    assert _eligible_path("src/generated-client.ts")
+
+
 @dataclass
 class Response:
     payload: dict[str, Any]

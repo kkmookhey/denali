@@ -501,6 +501,8 @@ def _eligible_path(path: str) -> bool:
     if any(part in _EXCLUDED_PARTS or part.startswith(".") for part in parts[:-1]):
         return False
     name = parts[-1]
+    if ".generated." in name.lower():
+        return False
     suffix = PurePosixPath(name).suffix.lower()
     return (
         suffix in _SOURCE_SUFFIXES

@@ -3,6 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
+COPY golden-paths ./golden-paths
 RUN pip install --no-cache-dir '.[api,aws,azure,gcp,github]'
 
 EXPOSE 8000

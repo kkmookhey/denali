@@ -513,6 +513,7 @@ function App() {
               activitySummary={activitySummary ?? { total: 0, last_24h: 0, providers: 0, failures: 0, fixture_total: 0, by_category: {} }}
               activities={activities}
               detectionSummary={detectionSummary ?? { total: 0, by_state: {}, open_by_severity: {} }}
+              deployments={deployments}
               onOpenAsset={(id) => openDrawer("asset", id)}
               onOpenIssue={(id) => openDrawer("issue", id)}
               onViewInventory={openInventory}
@@ -757,6 +758,7 @@ function Dashboard({
   activitySummary,
   activities,
   detectionSummary,
+  deployments,
   onOpenAsset,
   onOpenIssue,
   onViewInventory,
@@ -772,6 +774,7 @@ function Dashboard({
   activitySummary: RuntimeActivitySummary;
   activities: RuntimeActivity[];
   detectionSummary: RuntimeDetectionSummary;
+  deployments: CodeToCloudDeployment[];
   onOpenAsset: (id: string) => void;
   onOpenIssue: (id: string) => void;
   onViewInventory: (kind?: string) => void;
@@ -816,6 +819,8 @@ function Dashboard({
         <strong>{freshest ? formatTime(freshest) : "Not collected"}</strong>
       </div>
       </section>
+
+      <GoldenPath deployments={deployments} onOpen={() => onNavigate("codeToCloud")} />
 
       <section className="command-grid">
         <section className="denali-brief">
@@ -929,6 +934,57 @@ function Dashboard({
       </section>
       <p className="fixture-note"><CircleHelp size={15} /> Counts describe retained evidence and declared collection planes. Absence of evidence is never presented as evidence of absence.</p>
     </div>
+  );
+}
+
+function GoldenPath({
+  deployments,
+  onOpen,
+}: {
+  deployments: CodeToCloudDeployment[];
+  onOpen: () => void;
+}) {
+  const ordered = [...deployments].sort((left, right) =>
+    left.workload_natural_key.localeCompare(right.workload_natural_key),
+  );
+  return (
+    <section className="golden-path-panel">
+      <div className="golden-path-head">
+        <div>
+          <span className="eyebrow"><Sparkles size={13} /> GOLDEN PATH</span>
+          <h3>Two applications. Two clouds. One reviewable story.</h3>
+          <p>Start with source, follow an exact deployment declaration, and land on a workload independently observed in its cloud control plane.</p>
+        </div>
+        <button onClick={onOpen}>Open code-to-cloud <ChevronRight size={16} /></button>
+      </div>
+      <div className="golden-path-apps">
+        {ordered.map((deployment, index) => {
+          const provider = deployment.workload_natural_key.startsWith("arn:aws:") ? "AWS" : "GCP";
+          const repositorySlug = deployment.repository_natural_key.split("/").at(-1) ?? deployment.repository_name;
+          const location = provider === "AWS"
+            ? deployment.workload_natural_key.split(":")[3]
+            : deployment.workload_natural_key.match(/\/locations\/([^/]+)/)?.[1];
+          return (
+            <button className="golden-path-app" key={deployment.id} onClick={onOpen}>
+              <span className={`golden-path-number ${provider.toLowerCase()}`}>{String(index + 1).padStart(2, "0")}</span>
+              <span className="golden-path-copy">
+                <small>{provider} · {location ?? "cloud runtime"}</small>
+                <strong>{titleCase(repositorySlug.replaceAll("-", " "))}</strong>
+                <code>{deployment.repository_natural_key}</code>
+              </span>
+              <span className="golden-path-link"><GitBranch size={15} /><i /><ShieldCheck size={15} /></span>
+              <span className="golden-path-runtime">
+                <small>PROVEN RUNTIME</small>
+                <strong>{deployment.workload_name}</strong>
+                <em>{deployment.code_findings.length} source finding{deployment.code_findings.length === 1 ? "" : "s"} · {deployment.identity ? "identity observed" : "identity unavailable"}</em>
+              </span>
+              <ChevronRight size={18} />
+            </button>
+          );
+        })}
+      </div>
+      <div className="golden-path-proof"><ShieldCheck size={16} /><span><strong>{deployments.length} exact source-to-runtime links</strong> retained from immutable GitHub revisions and independent AWS/GCP observations.</span></div>
+    </section>
   );
 }
 

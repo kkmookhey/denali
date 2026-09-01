@@ -1,0 +1,61 @@
+version: 1
+name: anna-aws-and-summit-gcp
+connections:
+  - id: 6fafaba8-d019-4978-a6ee-70f7a0022de8
+    provider: github
+    display_name: Golden Path GitHub
+    declared_scopes:
+      - github.repository_metadata
+      - github.repository_contents
+      - github.actions_workflows
+    boundary:
+      repositories:
+        - kkmookhey/anna-the-sales-agent
+        - kkmookhey/denali-gemini-demo
+  - id: fd48da13-ed53-43d9-b832-af7cdae48aa4
+    provider: aws
+    display_name: Sara Sales AWS Code-to-Cloud Acceptance
+    declared_scopes:
+      - aws.code_to_cloud
+    boundary:
+      account_id: "331145994818"
+      regions:
+        - ap-south-1
+  - id: 5aec018a-9bc9-46f3-9b3d-b8895f855e6e
+    provider: gcp
+    display_name: Summit GCP
+    declared_scopes:
+      - gcp.code_to_cloud
+      - gcp.ai_activity
+    boundary:
+      projects:
+        - vertex-api-502308
+      resource_names:
+        - //run.googleapis.com/projects/vertex-api-502308/locations/us-central1/services/denali-gemini-demo
+expected:
+  repositories:
+    - github.com/kkmookhey/anna-the-sales-agent
+    - github.com/kkmookhey/denali-gemini-demo
+  ai_workloads:
+    - arn:aws:ecs:ap-south-1:331145994818:task-definition/NiSalesAgentStackProposalWorkerTaskC2F0F9A1:20
+    - arn:aws:lambda:ap-south-1:331145994818:function:ni-sales-agent
+    - //run.googleapis.com/projects/vertex-api-502308/locations/us-central1/services/denali-gemini-demo
+  deployed_by:
+    - workload: arn:aws:lambda:ap-south-1:331145994818:function:ni-sales-agent
+      repository: github.com/kkmookhey/anna-the-sales-agent
+    - workload: //run.googleapis.com/projects/vertex-api-502308/locations/us-central1/services/denali-gemini-demo
+      repository: github.com/kkmookhey/denali-gemini-demo
+forbidden_connectors:
+  - denali.demo
+  - denali.entra_ai
+  - denali.grype
+  - denali.kubernetes
+  - denali.syft
+budgets:
+  assets: 40
+  findings: 12
+  issues: 12
+  activities: 20
+  vulnerabilities: 0
+  detections: 5
+  collection_runs: 20
