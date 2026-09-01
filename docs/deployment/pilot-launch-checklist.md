@@ -105,6 +105,7 @@ If the secret is not named `denali-production`, also export its name as
 export DENALI_MODAL_REGION=<modal-region>
 export DENALI_MODAL_SECRET_NAME=denali-production
 modal run modal_app.py::migrate_database
+modal run modal_app.py::database_status
 modal deploy modal_app.py
 ```
 

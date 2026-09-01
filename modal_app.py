@@ -116,3 +116,24 @@ def migrate_database() -> None:
 
     dsn = os.environ.get("DENALI_MIGRATION_DSN") or os.environ["DENALI_DSN"]
     migrate(dsn)
+
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    timeout=60,
+    **_region_options(),
+)
+def database_status() -> None:
+    """Print non-sensitive migration state for deployment verification."""
+
+    import psycopg
+
+    dsn = os.environ.get("DENALI_MIGRATION_DSN") or os.environ["DENALI_DSN"]
+    with psycopg.connect(dsn) as connection:
+        database_name = connection.execute("SELECT current_database()").fetchone()[0]
+        rows = connection.execute(
+            "SELECT version FROM schema_migration ORDER BY version"
+        ).fetchall()
+    latest = rows[-1][0] if rows else "none"
+    print(f"database={database_name} migrations={len(rows)} latest={latest}")
