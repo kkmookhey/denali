@@ -9,10 +9,12 @@ input to Clerk and provider callbacks, and the Modal URL is an input to Vercel.
 - [x] The configured Clerk development publishable key resolves to a live Clerk JWKS endpoint.
 - [ ] Select the permanent production URL. `https://denali.example.com` is still a placeholder.
 - [ ] Add the Clerk backend key material and finish the production Clerk configuration.
-- [ ] Provision Neon and create separate runtime and migration connection strings.
-- [ ] Create the `denali-production` Modal secret.
-- [ ] Run migrations and deploy the Modal API/worker application.
-- [ ] Create and deploy the Vercel project. Vercel has not been deployed yet.
+- [x] Provision Neon database `denali`; pooled/direct connection strings are stored in Modal.
+- [x] Apply all 12 migrations through `012_tenant_connection_constraints.sql`.
+- [x] Create Modal environment `denali-prod` and its current `custom-secret`.
+- [ ] Add the production origin settings to `custom-secret`, then deploy the Modal API/worker.
+- [x] Create Vercel project `transilience/denali`.
+- [ ] Configure and deploy the Vercel project. It has not been deployed yet.
 - [ ] Complete two-organization Clerk acceptance.
 - [ ] Configure and accept AWS, Azure, GCP, and GitHub individually.
 
