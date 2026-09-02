@@ -186,6 +186,9 @@ The latest acceptance records are the
 
 Start with the product and evidence boundaries, then follow only the slice being evaluated:
 
+- [Codebase and system map](docs/architecture/codebase-and-system-map.md) for the repository
+  layout, end-to-end data flow, local and hosted topology, persistence, frontend, connectors,
+  evaluation engines, security boundaries, tests, and safe change recipes
 - [Standalone product](docs/architecture/0001-standalone-product.md) and
   [OCSF boundary](docs/architecture/0002-ocsf-boundary.md)
 - [Hosted multi-tenant runtime](docs/architecture/0028-hosted-multi-tenant-runtime.md) for the
