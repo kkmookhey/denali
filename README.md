@@ -33,7 +33,7 @@ Status terms in this README are deliberately independent:
 | AWS Lambda, ECS, EKS, and SageMaker code-to-cloud correlation | **Shipped** | **Locally accepted** against exact live account/Region validation and eight independent deployment collection planes |
 | Shared EKS, GKE, and AKS workload correlation | **Shipped** | **Locally accepted** through a live, control-plane-only EKS fixture with exact workload UID/revision, service-account, image-digest, negative-case, persistence, API, and teardown evidence; GKE and AKS workload identities remain covered by automated contract tests |
 | GitHub source-to-cloud correlation | **Shipped** | **Locally accepted** against two immutable GitHub revisions, with all source/inventory/posture/correlation planes complete and two independently observed runtime links proven |
-| Two-application code-to-cloud Golden Path | **Shipped** | Anna on AWS and Summit on GCP are bounded by a versioned reset/verify manifest with two live, exact source-to-runtime links and a dedicated dashboard story |
+| Two-application code-to-cloud Golden Path | **Shipped** | Anna on AWS and Summit on GCP are bounded by a versioned reset/verify manifest with exact source-to-runtime links, declared model/tool/action context, real Vertex activity, Entra discovery context, three image vulnerabilities, two correlated governance issues, and a dedicated dashboard story |
 
 These connection statuses describe onboarding and access validation. They do **not** mean
 that provider collection ran or that inventory, findings, or a security verdict exist.
